@@ -6,6 +6,8 @@
 
 #![cfg_attr(not(test), forbid(clippy::unwrap_used))]
 
+mod alignment;
 mod error;
 
+pub use alignment::{is_aligned, is_page_aligned, page_size};
 pub use error::BufferError;

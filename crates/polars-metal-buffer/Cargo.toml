@@ -16,6 +16,7 @@ objc2 = "0.5"
 objc2-metal = { version = "0.2", features = ["MTLDevice", "MTLBuffer", "MTLResource"] }
 objc2-foundation = "0.2"
 thiserror = "1"
+libc = "0.2"
 
 [dev-dependencies]
 proptest = "1"
