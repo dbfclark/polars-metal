@@ -30,8 +30,8 @@ impl MetalDevice {
         // SAFETY: If non-null, the pointer is a valid +1 Objective-C object
         // returned by a function whose name begins with "Create" (CF ownership
         // convention), which objc2's Retained takes ownership of.
-        let inner = unsafe { Retained::from_raw(raw) }
-            .ok_or(BufferError::AllocationFailed { bytes: 0 })?;
+        let inner =
+            unsafe { Retained::from_raw(raw) }.ok_or(BufferError::AllocationFailed { bytes: 0 })?;
         Ok(Self { inner })
     }
 
@@ -83,7 +83,13 @@ mod tests {
         let device =
             MetalDevice::system_default().expect("Metal-capable hardware required for this test");
         let debug_str = format!("{device:?}");
-        assert!(debug_str.contains("MetalDevice"), "debug should contain type name");
-        assert!(debug_str.contains("name"), "debug should contain field name");
+        assert!(
+            debug_str.contains("MetalDevice"),
+            "debug should contain type name"
+        );
+        assert!(
+            debug_str.contains("name"),
+            "debug should contain field name"
+        );
     }
 }

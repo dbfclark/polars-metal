@@ -88,12 +88,14 @@ impl MetalBuffer {
         // - We never mutate through the Rust `&[u8]` slice and Metal accesses
         //   the buffer only via GPU commands submitted after construction.
         let inner = unsafe {
-            device.raw().newBufferWithBytesNoCopy_length_options_deallocator(
-                ptr,
-                len,
-                MTLResourceOptions::MTLResourceStorageModeShared,
-                Some(&deallocator),
-            )
+            device
+                .raw()
+                .newBufferWithBytesNoCopy_length_options_deallocator(
+                    ptr,
+                    len,
+                    MTLResourceOptions::MTLResourceStorageModeShared,
+                    Some(&deallocator),
+                )
         }
         .ok_or(BufferError::AllocationFailed { bytes: len })?;
 

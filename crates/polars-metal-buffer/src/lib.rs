@@ -16,4 +16,4 @@ pub use alignment::{is_aligned, is_page_aligned, page_size};
 pub use bridge::MetalBuffer;
 pub use device::MetalDevice;
 pub use error::BufferError;
-pub use null_bitmap::{validity_bytes, get_valid, set_valid, count_valid, load_chunk_8};
+pub use null_bitmap::{count_valid, get_valid, load_chunk_8, set_valid, validity_bytes};

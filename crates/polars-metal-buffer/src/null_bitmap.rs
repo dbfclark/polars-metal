@@ -40,7 +40,10 @@ pub fn set_valid(bitmap: &mut [u8], row: usize, valid: bool) {
 pub fn count_valid(bitmap: &[u8], row_count: usize) -> usize {
     let full_bytes = row_count / 8;
     let trailing_bits = row_count % 8;
-    let mut sum: usize = bitmap[..full_bytes].iter().map(|b| b.count_ones() as usize).sum();
+    let mut sum: usize = bitmap[..full_bytes]
+        .iter()
+        .map(|b| b.count_ones() as usize)
+        .sum();
     if trailing_bits > 0 {
         let mask: u8 = (1u8 << trailing_bits) - 1;
         sum += (bitmap[full_bytes] & mask).count_ones() as usize;
