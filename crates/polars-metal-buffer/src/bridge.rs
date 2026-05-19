@@ -268,4 +268,18 @@ mod tests {
             unsafe { libc::munmap(self.ptr, self.len) };
         }
     }
+
+    // ── Proptest round-trip tests ────────────────────────────────────────
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn arrow_to_metal_round_trip(bytes in proptest::collection::vec(any::<u8>(), 1..4096)) {
+            let device = device();
+            let arrow = Arc::new(ArrowBuffer::from_vec(bytes.clone()));
+            let metal = MetalBuffer::from_arrow(&device, arrow).expect("allocation must succeed");
+            prop_assert_eq!(metal.as_slice(), bytes.as_slice());
+        }
+    }
 }
