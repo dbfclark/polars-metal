@@ -41,9 +41,12 @@ Three layers:
 
 ## Key references (read these first)
 
-- **`rapidsai/cudf` → `python/cudf_polars/`** — the structural template. Read `_dask.py`, `dsl/`, and the IR-node dispatch before writing any engine code. Our adapter is shape-isomorphic to this.
-- **`pola-rs/polars` → `crates/polars-plan/`** — defines the IR node types we must handle. The `IR` enum is the spec.
-- **`pola-rs/polars` → `crates/polars-core/src/chunked_array/`** — Polars' columnar layout. Our buffers must round-trip through this.
+Both cuDF and Polars are checked out locally under `references/` (gitignored, refreshed via `scripts/refresh-references.sh`). Read with `Read`/`Grep`/`Glob` — no need to WebFetch.
+
+- **`references/cudf/python/cudf_polars/`** — the structural template. Read `_dask.py`, `dsl/`, and the IR-node dispatch before writing any engine code. Our adapter is shape-isomorphic to this.
+- **`references/cudf/cpp/src/`** — CUDA kernel sources. Read the matching kernel before writing the MSL port (per "Working with Claude Code in this repo" below).
+- **`references/polars/crates/polars-plan/`** — defines the IR node types we must handle. The `IR` enum is the spec.
+- **`references/polars/crates/polars-core/src/chunked_array/`** — Polars' columnar layout. Our buffers must round-trip through this.
 - **MLX docs** — `ml-explore/mlx`, especially the C++ API and the `mlx::core::array` memory model. We mostly use the C++ side from Rust.
 - **Apple Metal Shading Language spec** — for the custom kernels. The MSL 3.x feature set is our floor.
 - **Apache Arrow columnar format spec** — the source of truth for null semantics and layout.
