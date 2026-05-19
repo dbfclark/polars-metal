@@ -48,6 +48,19 @@ pub fn count_valid(bitmap: &[u8], row_count: usize) -> usize {
     sum
 }
 
+/// Loads 8 rows of validity, starting at `row_start`, as a single `u8`.
+/// Bit `i` of the returned byte corresponds to row `row_start + i`.
+///
+/// `row_start` must be a multiple of 8 — call sites doing arbitrary offsets
+/// should pad the bitmap first.
+///
+/// Rows past the end of `bitmap` are treated as invalid (bit = 0).
+pub fn load_chunk_8(bitmap: &[u8], row_start: usize) -> u8 {
+    debug_assert_eq!(row_start % 8, 0, "row_start must be a multiple of 8");
+    let byte_idx = row_start / 8;
+    bitmap.get(byte_idx).copied().unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +102,20 @@ mod tests {
                 set_valid(&mut bm, r, valid);
             }
             prop_assert_eq!(count_valid(&bm, row_count), naive_count_valid(&bm, row_count));
+        }
+
+        #[test]
+        fn load_chunk_8_matches_individual_gets(
+            bytes in proptest::collection::vec(any::<u8>(), 0..128),
+            chunk in 0usize..128,
+        ) {
+            let row_start = chunk * 8;
+            let chunk_byte = load_chunk_8(&bytes, row_start);
+            for i in 0..8 {
+                let from_individual = get_valid(&bytes, row_start + i);
+                let from_chunk = (chunk_byte >> i) & 1 == 1;
+                prop_assert_eq!(from_individual, from_chunk);
+            }
         }
     }
 }
