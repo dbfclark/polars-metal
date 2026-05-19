@@ -281,5 +281,27 @@ mod tests {
             let metal = MetalBuffer::from_arrow(&device, arrow).expect("allocation must succeed");
             prop_assert_eq!(metal.as_slice(), bytes.as_slice());
         }
+
+        #[test]
+        fn validity_buffer_round_trip(
+            row_count in 1usize..4096,
+            seed in any::<u64>(),
+        ) {
+            use crate::null_bitmap::{set_valid, validity_bytes, get_valid};
+
+            let mut bm = vec![0u8; validity_bytes(row_count)];
+            for r in 0..row_count {
+                set_valid(&mut bm, r, ((seed.rotate_left(r as u32 & 63)) & 1) == 1);
+            }
+
+            let device = device();
+            let arrow = Arc::new(ArrowBuffer::from_vec(bm.clone()));
+            let metal = MetalBuffer::from_arrow(&device, arrow).expect("allocation must succeed");
+            let round_tripped: &[u8] = metal.as_slice();
+
+            for r in 0..row_count {
+                prop_assert_eq!(get_valid(&bm, r), get_valid(round_tripped, r));
+            }
+        }
     }
 }
