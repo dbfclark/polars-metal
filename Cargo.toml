@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/polars-metal-kernels"]
+members = ["crates/polars-metal-buffer", "crates/polars-metal-kernels"]
 
 [workspace.package]
 edition = "2021"
