@@ -303,5 +303,20 @@ mod tests {
                 prop_assert_eq!(get_valid(&bm, r), get_valid(round_tripped, r));
             }
         }
+
+        #[test]
+        fn offset_buffer_i32_round_trip(values in proptest::collection::vec(0i32..=1_000_000, 1..256)) {
+            let mut offsets = vec![0i32];
+            let mut running = 0i32;
+            for v in &values {
+                running = running.saturating_add(*v);
+                offsets.push(running);
+            }
+            let bytes: Vec<u8> = offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
+            let device = device();
+            let arrow = Arc::new(ArrowBuffer::from_vec(bytes.clone()));
+            let metal = MetalBuffer::from_arrow(&device, arrow).expect("allocation must succeed");
+            prop_assert_eq!(metal.as_slice(), bytes.as_slice());
+        }
     }
 }
