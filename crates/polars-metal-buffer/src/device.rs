@@ -43,9 +43,6 @@ impl MetalDevice {
 
     /// Raw borrow of the underlying `MTLDevice` protocol object, for use by
     /// sibling modules in this crate (e.g. `bridge`).
-    // Allow dead_code: this method is consumed by bridge.rs (T13) and will
-    // no longer be unused once that module exists.
-    #[allow(dead_code)]
     pub(crate) fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {
         &self.inner
     }
