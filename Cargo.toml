@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/polars-metal-buffer", "crates/polars-metal-kernels"]
+members = [
+    "crates/polars-metal-buffer",
+    "crates/polars-metal-kernels",
+    "crates/polars-metal-mlx-sys",
+]
 
 [workspace.package]
 edition = "2021"
