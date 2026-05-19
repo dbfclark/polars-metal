@@ -318,5 +318,32 @@ mod tests {
             let metal = MetalBuffer::from_arrow(&device, arrow).expect("allocation must succeed");
             prop_assert_eq!(metal.as_slice(), bytes.as_slice());
         }
+
+        #[test]
+        fn dictionary_column_round_trip(
+            dict_values in proptest::collection::vec(any::<u8>(), 1..64),
+            index_count in 1usize..256,
+        ) {
+            let dict_bytes: Vec<u8> = dict_values.clone();
+            let indices: Vec<u32> = (0..index_count as u32)
+                .map(|i| i % dict_values.len() as u32)
+                .collect();
+            let idx_bytes: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+
+            let device = device();
+            let dict_metal = MetalBuffer::from_arrow(
+                &device,
+                Arc::new(ArrowBuffer::from_vec(dict_bytes.clone())),
+            )
+            .expect("allocation must succeed");
+            let idx_metal = MetalBuffer::from_arrow(
+                &device,
+                Arc::new(ArrowBuffer::from_vec(idx_bytes.clone())),
+            )
+            .expect("allocation must succeed");
+
+            prop_assert_eq!(dict_metal.as_slice(), dict_bytes.as_slice());
+            prop_assert_eq!(idx_metal.as_slice(), idx_bytes.as_slice());
+        }
     }
 }
