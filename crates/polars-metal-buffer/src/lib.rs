@@ -5,3 +5,7 @@
 //! - Copy fallback otherwise.
 
 #![cfg_attr(not(test), forbid(clippy::unwrap_used))]
+
+mod error;
+
+pub use error::BufferError;
