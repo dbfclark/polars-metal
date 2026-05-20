@@ -128,3 +128,58 @@ kernel void filter_scatter_f64(
         set_valid_atomic_or(dst_valid, out_idx);
     }
 }
+
+// Bool scatter: the source data is bit-packed (one bit per row, Arrow
+// layout), AND the destination data is also bit-packed. This is the
+// only scatter variant where the data buffer has the multi-thread-same-
+// byte race that the validity buffer always has — 8 surviving rows
+// share a byte in the output data buffer, and each of those rows is
+// written by a distinct thread. The non-atomic `set_valid_nonatomic`
+// would race; we use `set_valid_atomic_or` for the data buffer for the
+// same reason we use it for the validity buffer.
+//
+// Caller contract for BOTH `dst_data` and `dst_valid`:
+//   - Allocated as a multiple of 4 bytes (for the u32 atomic cast).
+//   - Zero-initialised before dispatch (atomic OR is append-only).
+//
+// There is NO sentinel slot for the data buffer. Every bit value is a
+// legitimate data value (0 or 1), so we cannot reserve a "this means
+// overrun" pattern. The host instead pre-verifies the prefix-sum
+// invariant `prefix_sum[n_rows - 1] == n_out` before dispatch; if the
+// invariant holds, no thread can compute `out_idx >= n_out`. The
+// `out_idx >= n_out` check below is a defensive early-return — it
+// never writes a sentinel, and it never fires under a valid prefix
+// sum.
+kernel void filter_scatter_bool(
+    device const uint8_t*     src_data         [[buffer(0)]],  // bit-packed
+    device const uint8_t*     src_valid        [[buffer(1)]],  // bit-packed
+    device const uint8_t*     keep             [[buffer(2)]],
+    device const uint32_t*    prefix_sum       [[buffer(3)]],
+    device       atomic_uint* dst_data         [[buffer(4)]],  // bit-packed, atomic
+    device       atomic_uint* dst_valid        [[buffer(5)]],  // bit-packed, atomic
+    constant     uint32_t&    n_rows           [[buffer(6)]],
+    constant     uint32_t&    n_out            [[buffer(7)]],
+    uint                      gid              [[thread_position_in_grid]])
+{
+    if (gid >= n_rows) return;
+    if (keep[gid] == 0u) return;
+
+    uint32_t out_idx = prefix_sum[gid] - 1u;
+    if (out_idx >= n_out) {
+        // Defensive: host pre-verifies `prefix_sum[n_rows - 1] == n_out`
+        // before dispatch, so this branch should be unreachable. There
+        // is no sentinel to write (every bit value is legitimate);
+        // early-return silently and rely on the host-side invariant
+        // check for safety.
+        return;
+    }
+
+    // Set output data bit iff source data bit is set.
+    if (get_valid(src_data, gid)) {
+        set_valid_atomic_or(dst_data, out_idx);
+    }
+    // Set output validity bit iff source validity bit is set.
+    if (get_valid(src_valid, gid)) {
+        set_valid_atomic_or(dst_valid, out_idx);
+    }
+}

@@ -90,6 +90,27 @@ pub enum FilterError {
     /// well-aligned.
     #[error("dst_valid too small: got {got} bytes, expected at least {expected} (4-byte aligned)")]
     DstValidTooSmall { got: usize, expected: usize },
+    /// `filter_scatter_bool` requires `dst_data` to be at least
+    /// `ceil(n_out / 8)` bytes rounded up to 4-byte alignment (for the
+    /// u32 atomic cast). The bool scatter has NO sentinel slot (every
+    /// bit value is legitimate), so the allocation requirement is
+    /// `dst_valid_min_bytes(n_out)` instead of `(n_out + 1) * sizeof(T)`.
+    #[error("dst_data (bool, bit-packed) too small: got {got} bytes, expected at least {expected} (4-byte aligned)")]
+    DstDataBoolTooSmall { got: usize, expected: usize },
+    /// Host-side prefix-sum invariant tripped: `prefix_sum[n_rows - 1]`
+    /// must equal `n_out` (the prefix sum is inclusive over the dense
+    /// keep flags, so its final element is the total number of
+    /// survivors). When this invariant holds, the kernel can never
+    /// compute `out_idx >= n_out`, which is the only safety net the
+    /// bool scatter has (it cannot write a sentinel because every bit
+    /// is a legitimate data value). If this fires, the caller's
+    /// compaction pipeline produced inconsistent state — most often a
+    /// mis-sized `n_out` or a buggy cumsum.
+    #[error(
+        "prefix-sum invariant violated: last_prefix={last_prefix} but n_out={n_out}; \
+         scatter would risk silent corruption"
+    )]
+    ScatterPrefixSumMismatch { last_prefix: u32, n_out: usize },
 }
 
 /// Dispatch `filter_predicate_to_u8` — pass 1 of the filter compaction
@@ -534,6 +555,191 @@ pub fn dispatch_scatter_f64(
     if dst_data[n_out].to_bits() == SCATTER_SENTINEL_F64_BITS {
         return Err(FilterError::ScatterOverrun);
     }
+
+    Ok(())
+}
+
+/// Dispatch `filter_scatter_bool` — pass 3 of the filter compaction
+/// pipeline, bool variant.
+///
+/// Bool is unique among the scatter variants: BOTH the data buffer and
+/// the validity buffer are bit-packed (one bit per row, 8 rows per
+/// byte). Multiple surviving rows therefore race the same data byte
+/// just as they race the same validity byte. The kernel uses
+/// `set_valid_atomic_or` for both buffers; the host enforces the
+/// same caller contract on `dst_data` as on `dst_valid` (4-byte
+/// alignment, zero-initialised).
+///
+/// There is NO sentinel slot for `dst_data`. Every bit pattern is a
+/// legitimate bool value (0 or 1), so we cannot reserve a "this means
+/// overrun" sentinel as we do for the i64/f64 variants. The safety net
+/// is instead the host-side prefix-sum invariant
+/// `prefix_sum[n_rows - 1] == n_out`: if this holds, the kernel's
+/// `out_idx = prefix_sum[gid] - 1` can never exceed `n_out - 1`. The
+/// dispatcher checks the invariant before binding any buffers; a
+/// violation raises [`FilterError::ScatterPrefixSumMismatch`] instead
+/// of risking silent corruption.
+///
+/// Because the bit-packed bytes do not carry a row count, `n_rows`
+/// is passed explicitly (e.g. 13 rows fit in 2 bytes with 3 padding
+/// bits).
+///
+/// Caller contract:
+///   - `keep.len() == prefix_sum.len() == n_rows`.
+///   - `src_data.len() >= ceil(n_rows / 8)`.
+///   - `src_valid.len() >= ceil(n_rows / 8)`.
+///   - `dst_data.len() >= dst_valid_min_bytes(n_out)` (4-byte aligned,
+///     minimum 4 bytes).
+///   - `dst_valid.len() >= dst_valid_min_bytes(n_out)`.
+///   - If `n_rows > 0`, `prefix_sum[n_rows - 1]` must equal `n_out`.
+///   - The dispatcher zero-initialises both `dst_data` and `dst_valid`
+///     on the device side (the kernel's atomic OR never clears bits);
+///     the caller's slices are filled with the device-side values on
+///     return.
+///
+/// `n_rows == 0` is a no-op (Metal rejects zero-byte buffers and
+/// zero-grid dispatches; both are caught here). `n_out == 0` is allowed
+/// for non-empty inputs: the kernel runs but never writes (every thread
+/// short-circuits on `keep[gid] == 0`).
+// 10 arguments mirror the i64/f64 dispatchers but with an explicit
+// `n_rows` (bit-packed bytes don't encode row count). A struct wrapper
+// would not improve readability — every argument is a distinct kernel
+// binding or a host-side safety check input — and would obscure the
+// 1:1 mapping to the MSL kernel's argument list.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_scatter_bool(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    src_data: &[u8],
+    src_valid: &[u8],
+    keep: &[u8],
+    prefix_sum: &[u32],
+    n_rows: usize,
+    n_out: usize,
+    dst_data: &mut [u8],
+    dst_valid: &mut [u8],
+) -> Result<(), FilterError> {
+    if keep.len() != n_rows {
+        return Err(FilterError::OutputLengthMismatch {
+            got: keep.len(),
+            expected: n_rows,
+        });
+    }
+    if prefix_sum.len() != n_rows {
+        return Err(FilterError::OutputLengthMismatch {
+            got: prefix_sum.len(),
+            expected: n_rows,
+        });
+    }
+    let min_src_bytes = (n_rows + 7) / 8;
+    if src_data.len() < min_src_bytes {
+        return Err(FilterError::InputLengthMismatch {
+            pred_bytes: src_data.len(),
+            min_bytes: min_src_bytes,
+            n_rows,
+        });
+    }
+    if src_valid.len() < min_src_bytes {
+        return Err(FilterError::InputLengthMismatch {
+            pred_bytes: src_valid.len(),
+            min_bytes: min_src_bytes,
+            n_rows,
+        });
+    }
+    let min_out_bytes = dst_valid_min_bytes(n_out);
+    if dst_data.len() < min_out_bytes {
+        return Err(FilterError::DstDataBoolTooSmall {
+            got: dst_data.len(),
+            expected: min_out_bytes,
+        });
+    }
+    if dst_valid.len() < min_out_bytes {
+        return Err(FilterError::DstValidTooSmall {
+            got: dst_valid.len(),
+            expected: min_out_bytes,
+        });
+    }
+
+    // Host-side prefix-sum invariant. The bool scatter has no sentinel
+    // overrun guard on the data buffer — every bit value is a
+    // legitimate bool — so we must catch a mismatched (prefix_sum,
+    // n_out) pair before any thread writes to a bit-packed buffer that
+    // we cannot post-hoc audit. If `n_rows > 0`, the last element of
+    // the inclusive prefix sum is the total survivor count, which the
+    // caller has told us is `n_out`. A discrepancy means the caller's
+    // compaction pipeline (predicate kernel or cumsum) is producing
+    // inconsistent state — fail loudly here rather than producing
+    // silently-corrupt output.
+    if n_rows > 0 {
+        let last_prefix = prefix_sum[n_rows - 1];
+        let n_out_u32 =
+            u32::try_from(n_out).map_err(|_| FilterError::RowCountOverflow { n_rows: n_out })?;
+        if last_prefix != n_out_u32 {
+            return Err(FilterError::ScatterPrefixSumMismatch { last_prefix, n_out });
+        }
+    }
+
+    if n_rows == 0 {
+        // Mirror the i64/f64 dispatchers: zero rows is a no-op. The
+        // caller's `dst_data` / `dst_valid` are not touched.
+        return Ok(());
+    }
+
+    let n_rows_u32 = u32::try_from(n_rows).map_err(|_| FilterError::RowCountOverflow { n_rows })?;
+    let n_out_u32 =
+        u32::try_from(n_out).map_err(|_| FilterError::RowCountOverflow { n_rows: n_out })?;
+
+    let lib = shared_library(device)?;
+    let pso = lib.pipeline("filter_scatter_bool")?;
+
+    // `src_data` and `src_valid` are already `&[u8]`; pass the
+    // exact `min_src_bytes`-prefix so the device-side allocation
+    // matches the kernel's read pattern.
+    let src_data_buf = device.new_buffer_from_bytes(&src_data[..min_src_bytes])?;
+    let src_valid_buf = device.new_buffer_from_bytes(&src_valid[..min_src_bytes])?;
+    let keep_buf = device.new_buffer_from_bytes(keep)?;
+
+    // SAFETY: `u32` has no invalid bit patterns; reinterpreting a
+    // `&[u32]` as `&[u8]` is sound. `new_buffer_from_bytes` copies the
+    // bytes into a freshly allocated MTLBuffer synchronously, so the
+    // slice does not need to live past the call.
+    let prefix_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            prefix_sum.as_ptr() as *const u8,
+            std::mem::size_of_val(prefix_sum),
+        )
+    };
+    let prefix_buf = device.new_buffer_from_bytes(prefix_bytes)?;
+
+    // BOTH dst buffers are zero-initialised and 4-byte aligned (the
+    // kernel binds them as `device atomic_uint*`). The atomic OR is
+    // append-only; bits left at 0 stay 0.
+    let dst_data_buf = device.new_buffer_zeroed(min_out_bytes)?;
+    let dst_valid_buf = device.new_buffer_zeroed(min_out_bytes)?;
+
+    let n_rows_buf = device.new_buffer_from_bytes(&n_rows_u32.to_le_bytes())?;
+    let n_out_buf = device.new_buffer_from_bytes(&n_out_u32.to_le_bytes())?;
+
+    queue.dispatch_1d(
+        &pso,
+        &[
+            &src_data_buf,
+            &src_valid_buf,
+            &keep_buf,
+            &prefix_buf,
+            &dst_data_buf,
+            &dst_valid_buf,
+            &n_rows_buf,
+            &n_out_buf,
+        ],
+        n_rows,
+    )?;
+    queue.wait_until_complete()?;
+
+    // Copy the bit-packed outputs back. Both buffers are exactly
+    // `min_out_bytes` long; copy that prefix into the caller's slices.
+    dst_data[..min_out_bytes].copy_from_slice(&dst_data_buf.as_slice()[..min_out_bytes]);
+    dst_valid[..min_out_bytes].copy_from_slice(&dst_valid_buf.as_slice()[..min_out_bytes]);
 
     Ok(())
 }
