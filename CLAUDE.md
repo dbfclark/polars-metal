@@ -88,31 +88,37 @@ docs/
 
 ```bash
 # build everything
-cargo build --release --workspace
+make build
 
 # build the Python wheel and install in editable mode
-maturin develop --release -m python/polars_metal/Cargo.toml
+make wheel    # equivalent to: maturin develop --release
 
 # unit tests
-cargo test --workspace
+make test-unit
 
-# kernel correctness tests (compiles MSL, runs on actual GPU)
-cargo test -p polars-metal-kernels --features=gpu-tests
+# kernel correctness tests (M0 is a placeholder; real kernels arrive in M1)
+make test-kernel
 
-# conformance: run Polars' own test suite with engine="metal"
-pytest tests/conformance -k "not skip_metal"
+# conformance: Polars-shaped tests with engine=MetalEngine()
+make test-conformance
+
+# differential: random small DataFrames, our engine vs CPU
+make test-diff
 
 # benchmarks
-cargo bench --workspace
-pytest tests/bench --benchmark-only
+make bench
 
-# lint
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --check
-ruff check python/
+# lint (clippy, fmt, ruff)
+make lint
+
+# everything (the gate)
+make gate
+
+# refresh local reference clones (cuDF, Polars) — needed only after a rev bump
+make refresh-refs
 ```
 
-**Always run `cargo clippy` and `cargo fmt --check` before declaring a task done.** CI will reject otherwise.
+**Always run `make lint` (or `make gate` for the full check) before declaring a task done.** CI will reject otherwise (when CI exists; currently lint runs locally).
 
 ## Roadmap (work in this order)
 
