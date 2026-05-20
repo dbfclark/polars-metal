@@ -28,4 +28,8 @@ We committed to `cxx` for M0 based on a weak prior. If friction emerges before M
 
 ## MLX install path
 
-Choose between git submodule, Homebrew, or build-from-source for the MLX C++ dependency. *Owner:* M0's implementation plan (Task 19).
+Resolved in T19: git submodule under `vendor/mlx`, pinned to v0.22.0, built via cmake. *Owner:* M0 (resolved). Refresh via standalone cmake invocation, not via `scripts/refresh-references.sh` (which is for read-only references, not build deps).
+
+## Metal toolchain unavailable on dev host
+
+T19 built MLX with `-DMLX_BUILD_METAL=OFF` because the host's Metal shader compiler is missing (macOS 26.5 beta + Xcode toolchain ABI mismatch surfaced by `xcodebuild -downloadComponent MetalToolchain`). MLX runs on CPU/Accelerate. For M0 this is fine — M0 falls back to CPU on every IR node and the MLX bridge is only tested in isolation, where CPU MLX is sufficient for FFI correctness. **Must be resolved before M1 begins**, since M1's first GPU kernel (filter) needs real Metal dispatch. Resolution path: install an Xcode version compatible with the host macOS, then rebuild MLX with `-DMLX_BUILD_METAL=ON` and switch `build.rs` to `cargo:rustc-link-lib=dylib=mlx`. *Owner:* pre-M1.
