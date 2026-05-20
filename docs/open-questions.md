@@ -4,7 +4,13 @@ Questions and risks that don't block current work but warrant tracking. Each ent
 
 ## Monkey-patch coupling
 
-We monkey-patch `polars.lazyframe.frame._gpu_engine_callback`. The patch site is asserted at import time, but the callback signature could shift under us. *Owner:* M0 (patch-site assertion test). *Resolution path:* upstream a proper engine-registration hook to Polars; replace the patch with the hook once it lands.
+The M0 patch turned out to need two sites, not one:
+1. `polars.lazyframe.frame._gpu_engine_callback` — defensive wrap so MetalEngine reaching this function returns our callback rather than raising on the engine-string allow-list.
+2. `polars.lazyframe.frame.LazyFrame.collect` — primary intercept. Polars 1.40+ routes `engine=` straight to Rust's `ldf.collect()`, which only accepts strings, so we short-circuit at the Python level: when `engine=MetalEngine()`, call `original_collect(self, engine="cpu", post_opt_callback=cb)` with our callback. `post_opt_callback` is an internal/test-only Polars hook.
+
+Only site 1's signature is asserted at import time. Site 2 (`LazyFrame.collect`) is not yet asserted — if its signature changes (e.g., `post_opt_callback` is removed/renamed), our patch silently breaks. *Follow-up:* add a signature assertion for `LazyFrame.collect` and a smoke test that asserts `post_opt_callback` exists. *Owner:* M0 follow-up / pre-M1.
+
+The real fix is an upstream engine-registration hook in Polars; once that lands, both patches retire. *Owner:* see `docs/upstream-polars-engine-hook.md` (drafted in T37).
 
 ## MLX null story
 
