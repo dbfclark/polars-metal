@@ -6,9 +6,9 @@ extern "C" {}
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
+use objc2_metal::{MTLBuffer as _, MTLCreateSystemDefaultDevice, MTLDevice, MTLResourceOptions};
 
-use crate::BufferError;
+use crate::{BufferError, MetalBuffer};
 
 /// A handle to an `MTLDevice`. Constructed once per process; cloning is cheap
 /// (it bumps an Objective-C refcount).
@@ -41,6 +41,51 @@ impl MetalDevice {
         self.inner.name().to_string()
     }
 
+    /// Allocate a new shared-storage `MTLBuffer` of the given length, zeroed.
+    ///
+    /// Metal does not specify the initial contents of a freshly allocated
+    /// `newBufferWithLength:options:` buffer, so we explicitly zero the
+    /// shared-memory region before returning. Allocation is via
+    /// `MTLResourceStorageModeShared`, which on Apple Silicon means the
+    /// buffer lives in unified memory and is directly CPU-addressable.
+    ///
+    /// Returns `BufferError::AllocationFailed` when `bytes == 0` (Metal
+    /// rejects zero-byte allocations) or when Metal otherwise refuses to
+    /// allocate (e.g. process memory exhaustion).
+    pub fn new_buffer_zeroed(&self, bytes: usize) -> Result<MetalBuffer, BufferError> {
+        if bytes == 0 {
+            return Err(BufferError::AllocationFailed { bytes: 0 });
+        }
+        // `newBufferWithLength:options:` is a safe fn in `objc2-metal` 0.2
+        // (no raw pointers in or out). It returns `None` if Metal refuses
+        // the allocation, which we map to `AllocationFailed`.
+        let inner = self
+            .inner
+            .newBufferWithLength_options(bytes, MTLResourceOptions::MTLResourceStorageModeShared)
+            .ok_or(BufferError::AllocationFailed { bytes })?;
+
+        // Freshly allocated MTLBuffer contents are implementation-defined;
+        // zero them via the StorageModeShared CPU mapping so callers can
+        // rely on a known initial state.
+        //
+        // `contents()` returns `NonNull<c_void>` pointing at the unified-
+        // memory backing store. We have just allocated this buffer, so no
+        // GPU command is in-flight against it: writing from the CPU is
+        // safe without an explicit synchronization barrier.
+        let ptr = inner.contents().cast::<u8>();
+        // SAFETY:
+        // - `ptr` is non-null (NonNull invariant from `contents()`).
+        // - The buffer is `bytes` long and StorageModeShared, so the entire
+        //   range is CPU-addressable.
+        // - No other thread or GPU command holds a reference to this buffer
+        //   yet (we just allocated it), so there is no concurrent access.
+        unsafe {
+            std::ptr::write_bytes(ptr.as_ptr(), 0u8, bytes);
+        }
+
+        Ok(MetalBuffer::from_metal_owned(inner))
+    }
+
     /// Raw borrow of the underlying `MTLDevice` protocol object.
     ///
     /// Exposed to sibling crates (`polars-metal-kernels`,
@@ -64,7 +109,7 @@ impl std::fmt::Debug for MetalDevice {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -83,6 +128,49 @@ mod tests {
             MetalDevice::system_default().expect("Metal-capable hardware required for this test");
         let clone = device.clone();
         assert_eq!(device.name(), clone.name());
+    }
+
+    #[test]
+    fn new_buffer_zeroed_allocates_and_zeroes() {
+        let device =
+            MetalDevice::system_default().expect("Metal-capable hardware required for this test");
+        let buf = device.new_buffer_zeroed(256).expect("allocation succeeds");
+        assert_eq!(buf.len(), 256);
+        assert!(
+            buf.as_slice().iter().all(|b| *b == 0),
+            "newly-allocated buffer should be all zero"
+        );
+    }
+
+    #[test]
+    fn new_buffer_zeroed_rejects_zero_length() {
+        let device =
+            MetalDevice::system_default().expect("Metal-capable hardware required for this test");
+        match device.new_buffer_zeroed(0) {
+            Ok(_) => panic!("zero-byte allocation must error"),
+            Err(BufferError::AllocationFailed { bytes: 0 }) => {}
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_buffer_zeroed_is_cpu_writable() {
+        // Sanity check that StorageModeShared lets us mutate the buffer from
+        // the CPU side after construction. This is the contract dispatch
+        // tests rely on for asserting kernel outputs.
+        let device =
+            MetalDevice::system_default().expect("Metal-capable hardware required for this test");
+        let buf = device.new_buffer_zeroed(8).expect("allocation succeeds");
+        // SAFETY: `as_slice` exposes the shared-memory mapping; we cast to
+        // `*mut u8` to scribble bytes the same way a kernel later would.
+        // No GPU work is in flight, so the write is race-free.
+        unsafe {
+            let p = buf.as_slice().as_ptr() as *mut u8;
+            for i in 0..8 {
+                *p.add(i) = (i as u8) + 1;
+            }
+        }
+        assert_eq!(buf.as_slice(), &[1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]

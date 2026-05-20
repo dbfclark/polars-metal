@@ -150,6 +150,31 @@ impl MetalBuffer {
         self.len() == 0
     }
 
+    /// Construct a `MetalBuffer` from an already-allocated MTLBuffer that
+    /// Metal owns outright (no Arrow backing).
+    ///
+    /// Used by [`MetalDevice::new_buffer_zeroed`] and any future allocator
+    /// that hands out fresh GPU-resident buffers. Crate-private so external
+    /// code goes through the typed constructors above.
+    pub(crate) fn from_metal_owned(inner: Retained<ProtocolObject<dyn MTLBuffer>>) -> Self {
+        Self {
+            inner,
+            _owner: None,
+        }
+    }
+
+    /// Raw borrow of the underlying `MTLBuffer` protocol object.
+    ///
+    /// Exposed to sibling crates (`polars-metal-kernels`,
+    /// `polars-metal-core`) so they can bind buffers into compute encoders
+    /// via `setBuffer:offset:atIndex:` without re-implementing the buffer
+    /// handle. Mirrors `MetalDevice::raw()`; callers invoking unsafe
+    /// `objc2-metal` APIs through this accessor must add the usual
+    /// `// SAFETY:` comment.
+    pub fn raw(&self) -> &Retained<ProtocolObject<dyn MTLBuffer>> {
+        &self.inner
+    }
+
     /// View the buffer's contents as a byte slice.
     ///
     /// Valid as long as `self` is alive and no GPU writes are in-flight.
