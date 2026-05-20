@@ -1,2 +1,6 @@
-//
-// Custom MSL kernel wrappers. Empty in M0 — first kernel arrives with M1 (filter).
+//! Custom MSL kernel wrappers.
+//!
+//! M1 introduces the shader build/load pipeline (`shader_lib`); individual
+//! kernel modules (filter, comparison, logical) land in subsequent tasks.
+
+pub mod shader_lib;

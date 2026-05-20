@@ -41,9 +41,16 @@ impl MetalDevice {
         self.inner.name().to_string()
     }
 
-    /// Raw borrow of the underlying `MTLDevice` protocol object, for use by
-    /// sibling modules in this crate (e.g. `bridge`).
-    pub(crate) fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {
+    /// Raw borrow of the underlying `MTLDevice` protocol object.
+    ///
+    /// Exposed to sibling crates (`polars-metal-kernels`,
+    /// `polars-metal-core`) so they can call Metal APIs such as
+    /// `newLibraryWithURL`, `newCommandQueue`, and
+    /// `newComputePipelineStateWithFunction` without re-implementing the
+    /// device handle. Most of those calls are `unsafe fn`s in
+    /// `objc2-metal`; callers must add a `// SAFETY:` comment per workspace
+    /// convention.
+    pub fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {
         &self.inner
     }
 }

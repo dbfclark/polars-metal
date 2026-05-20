@@ -750,6 +750,13 @@ dependencies = [
 [[package]]
 name = "polars-metal-kernels"
 version = "0.0.0"
+dependencies = [
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+ "polars-metal-buffer",
+ "thiserror",
+]
 
 [[package]]
 name = "polars-metal-mlx-sys"
