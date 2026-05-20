@@ -22,3 +22,19 @@ target
 
 # Local reference clones (cuDF, Polars) — see scripts/refresh-references.sh
 /references/
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.hypothesis/
+
+# maturin-built native extension (rebuilt by `make wheel`)
+python/polars_metal/_native*.so
+python/polars_metal/_native*.dylib
+python/polars_metal/_native*.pyd
+
+# Build deps under vendor (the source tree itself is a submodule)
+vendor/mlx/build/
