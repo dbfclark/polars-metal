@@ -69,15 +69,22 @@ impl MetalBuffer {
         let ptr = NonNull::new(arrow.as_ptr() as *mut std::ffi::c_void)
             .ok_or(BufferError::AllocationFailed { bytes: len })?;
 
-        // Clone the Arc into the block so it's dropped when Metal deallocates
-        // the buffer (i.e., when the MTLBuffer is released).
+        // Capture an Arc<ArrowBuffer> in the deallocator block. The Arc is owned
+        // by the block; when Metal eventually releases the block (after the
+        // MTLBuffer is freed), the Arc drops, dropping the ArrowBuffer if no
+        // other references remain.
+        //
+        // The block body itself is a no-op. The block is `Fn` (RcBlock requires
+        // it), so we cannot move-consume the captured Arc inside the body; the
+        // release happens via block lifecycle, not via explicit drop here.
         let owner_for_dealloc = arrow.clone();
         // The deallocator block signature is `(NonNull<c_void>, NSUInteger) -> ()`.
-        // We ignore both arguments because we're dropping via Arc, not by freeing
-        // the pointer directly.
         let deallocator: RcBlock<dyn Fn(NonNull<std::ffi::c_void>, usize)> =
             RcBlock::new(move |_ptr, _len| {
-                drop(owner_for_dealloc.clone());
+                // Keep `owner_for_dealloc` alive by referencing it here. The
+                // compiler would otherwise be free to drop captures it sees as
+                // unused.
+                let _keep_alive = &owner_for_dealloc;
             });
 
         // SAFETY:

@@ -28,6 +28,10 @@ M2 Ultra has plenty of memory; M1 (8 GB) does not. We don't plan spill-to-CPU in
 
 We assume Arrow `Buffer`s sometimes arrive page-aligned and sometimes don't. The bridge handles both via two regimes. If profiling shows we're nearly always in the copy regime, we may want to influence Arrow allocations to land page-aligned. *Owner:* future, after M1 perf data.
 
+## EngineError surfaces as PyRuntimeError, not polars.exceptions.ComputeError
+
+`crates/polars-metal-core/src/error.rs` converts `EngineError` to `PyRuntimeError("polars-metal: ...")`. The spec wanted errors to surface as `polars.exceptions.ComputeError` so they look native to Polars users. The current behaviour is dormant in M0 (the callback never raises), but M1+ kernels can fail and users will see the wrong exception type. *Follow-up:* convert to `polars.exceptions.ComputeError` directly via PyO3 type lookup, and add a Python integration test asserting `pl.exceptions.ComputeError` is what callers catch. *Owner:* pre-M1.
+
 ## FFI choice (cxx)
 
 We committed to `cxx` for M0 based on a weak prior. If friction emerges before M2, switch to hand-written C shim + `bindgen`. *Owner:* M0 (revisit at M2's design).
