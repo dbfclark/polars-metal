@@ -9,9 +9,11 @@
 mod arena;
 mod error;
 pub mod plan;
+mod udf;
 
 pub use arena::{BumpArena, ScratchArena, StubArena};
 pub use error::EngineError;
+pub use udf::execute_plan;
 
 use polars_metal_buffer::MetalDevice;
 use pyo3::prelude::*;
@@ -48,5 +50,6 @@ fn polars_metal_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add_function(wrap_pyfunction!(version_string, m)?)?;
     m.add_function(wrap_pyfunction!(device_name, m)?)?;
     m.add_function(wrap_pyfunction!(add_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(udf::execute_plan, m)?)?;
     Ok(())
 }
