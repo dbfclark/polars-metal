@@ -116,8 +116,14 @@ def test_filter_f64_col_lt_col() -> None:
     assert_frame_equal(cpu, metal)
 
 
-def test_filter_compound_predicate_falls_back_to_phase_7() -> None:
-    """AND/OR enable in Task 20; today, fall back cleanly via CPU path."""
+def test_filter_compound_predicate_now_runs_on_gpu() -> None:
+    """Compound AND/OR predicates landed in Task 20 (see test_filter_compound.py).
+
+    Phase 6 used to fall back on this shape; Phase 7 dispatches it to
+    the ``bool_and`` / ``bool_or`` kernels. We keep the (now-passing)
+    test here as a regression pin against the Phase 6 codepath
+    accidentally re-rejecting compound predicates.
+    """
     df = pl.DataFrame({"a": [1, 2, 3, 4], "b": [10, 20, 30, 40]})
     cpu = df.lazy().filter((pl.col("a") > 1) & (pl.col("b") < 40)).collect()
     metal = (

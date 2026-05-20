@@ -27,6 +27,7 @@ use polars_metal_kernels::cmp::{
     dispatch_cmp_f64, dispatch_cmp_f64_scalar, dispatch_cmp_i64, dispatch_cmp_i64_scalar, CompareOp,
 };
 use polars_metal_kernels::command::CommandQueue;
+use polars_metal_kernels::logical::{dispatch_bool_and, dispatch_bool_or};
 use polars_metal_kernels::pipeline::{compact_bool, compact_f64, compact_i64};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -499,7 +500,30 @@ fn deserialize_predicate(dict: &Bound<PyDict>) -> PyResult<PredicateAst> {
                 rhs,
             })
         }
-        // And/Or land in Task 20 alongside the 3-valued logical_bool kernel.
+        "And" | "Or" => {
+            // Filter dispatch flows entirely through the Python UDF in
+            // M1; the Rust `execute_plan` Filter branch raises
+            // NotImplementedError before ever reaching the AST. We
+            // still accept the AND/OR shape here so the parse step
+            // doesn't fail if a Filter plan ever round-trips through
+            // `execute_plan` (e.g. a future test or a debug-print
+            // path).
+            let lhs_obj = dict
+                .get_item("lhs")?
+                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("And/Or missing 'lhs'"))?;
+            let lhs_dict: Bound<PyDict> = lhs_obj.downcast_into()?;
+            let lhs = Box::new(deserialize_predicate(&lhs_dict)?);
+            let rhs_obj = dict
+                .get_item("rhs")?
+                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("And/Or missing 'rhs'"))?;
+            let rhs_dict: Bound<PyDict> = rhs_obj.downcast_into()?;
+            let rhs = Box::new(deserialize_predicate(&rhs_dict)?);
+            if kind == "And" {
+                Ok(PredicateAst::And(lhs, rhs))
+            } else {
+                Ok(PredicateAst::Or(lhs, rhs))
+            }
+        }
         other => Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
             "polars_metal: predicate kind {other:?} lands in a later phase"
         ))),
@@ -804,4 +828,133 @@ fn check_numeric_buffers(
         )));
     }
     Ok(())
+}
+
+/// Length-check a bit-packed bool buffer (data or validity) for an
+/// `n_rows`-long input to the `bool_and` / `bool_or` kernels.
+fn check_bitpacked_buffer(buf: &[u8], n_rows: usize, label: &str) -> PyResult<()> {
+    let min_bytes = (n_rows + 7) / 8;
+    if buf.len() < min_bytes {
+        return Err(PyValueError::new_err(format!(
+            "polars_metal: {label} buffer is {got} B, need at least {expected} B for {n} rows",
+            label = label,
+            got = buf.len(),
+            expected = min_bytes,
+            n = n_rows,
+        )));
+    }
+    Ok(())
+}
+
+/// PyO3 entry point exposed as `polars_metal._native.bool_and_dispatch`.
+///
+/// Combines two bit-packed nullable Boolean predicates with Polars'
+/// 3-valued AND (false dominates; otherwise null propagates) and
+/// returns a fresh `(data, valid)` byte-pair. The Python UDF calls
+/// this when the walker emits a `BinaryExpr(Operator.And, ...)` whose
+/// operands both resolve to Bool — the recursive ``_evaluate_predicate``
+/// in ``_udf.py`` materialises the two sub-predicate bitmaps and hands
+/// them here.
+///
+/// All four input buffers must be at least ``ceil(n_rows / 8)`` bytes;
+/// the kernel padding (4-byte alignment for `device atomic_uint`) is
+/// handled inside the dispatcher.
+#[pyfunction]
+pub fn bool_and_dispatch<'py>(
+    py: Python<'py>,
+    lhs_data: &Bound<'py, PyBytes>,
+    lhs_valid: &Bound<'py, PyBytes>,
+    rhs_data: &Bound<'py, PyBytes>,
+    rhs_valid: &Bound<'py, PyBytes>,
+    n_rows: usize,
+) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+    dispatch_logical_py(
+        py, lhs_data, lhs_valid, rhs_data, rhs_valid, n_rows, /*is_and=*/ true,
+    )
+}
+
+/// PyO3 entry point exposed as `polars_metal._native.bool_or_dispatch`.
+///
+/// 3-valued OR mirror of [`bool_and_dispatch`] — true dominates,
+/// otherwise null propagates.
+#[pyfunction]
+pub fn bool_or_dispatch<'py>(
+    py: Python<'py>,
+    lhs_data: &Bound<'py, PyBytes>,
+    lhs_valid: &Bound<'py, PyBytes>,
+    rhs_data: &Bound<'py, PyBytes>,
+    rhs_valid: &Bound<'py, PyBytes>,
+    n_rows: usize,
+) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+    dispatch_logical_py(
+        py, lhs_data, lhs_valid, rhs_data, rhs_valid, n_rows, /*is_and=*/ false,
+    )
+}
+
+/// Shared dispatch body for [`bool_and_dispatch`] and [`bool_or_dispatch`].
+///
+/// The two pyfunctions have identical input/output shapes — they differ
+/// only in the kernel called inside `polars_metal_kernels::logical`.
+/// Keeping the wrapper monomorphic on a boolean flag (rather than a
+/// function pointer) keeps `cargo expand` output readable and gives
+/// the rust optimizer a clean inline target.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_logical_py<'py>(
+    py: Python<'py>,
+    lhs_data: &Bound<'py, PyBytes>,
+    lhs_valid: &Bound<'py, PyBytes>,
+    rhs_data: &Bound<'py, PyBytes>,
+    rhs_valid: &Bound<'py, PyBytes>,
+    n_rows: usize,
+    is_and: bool,
+) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+    let lhs_data_b = lhs_data.as_bytes();
+    let lhs_valid_b = lhs_valid.as_bytes();
+    let rhs_data_b = rhs_data.as_bytes();
+    let rhs_valid_b = rhs_valid.as_bytes();
+    check_bitpacked_buffer(lhs_data_b, n_rows, "lhs_data")?;
+    check_bitpacked_buffer(lhs_valid_b, n_rows, "lhs_valid")?;
+    check_bitpacked_buffer(rhs_data_b, n_rows, "rhs_data")?;
+    check_bitpacked_buffer(rhs_valid_b, n_rows, "rhs_valid")?;
+
+    let (device, mut queue) = new_device_and_queue()?;
+    let min_out = cmp_out_min_bytes(n_rows);
+    let mut out_data = vec![0u8; min_out];
+    let mut out_valid = vec![0u8; min_out];
+
+    let kernel_name = if is_and { "bool_and" } else { "bool_or" };
+    let result = if is_and {
+        dispatch_bool_and(
+            &device,
+            &mut queue,
+            lhs_data_b,
+            lhs_valid_b,
+            rhs_data_b,
+            rhs_valid_b,
+            n_rows,
+            &mut out_data,
+            &mut out_valid,
+        )
+    } else {
+        dispatch_bool_or(
+            &device,
+            &mut queue,
+            lhs_data_b,
+            lhs_valid_b,
+            rhs_data_b,
+            rhs_valid_b,
+            n_rows,
+            &mut out_data,
+            &mut out_valid,
+        )
+    };
+    result.map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "polars_metal: {kernel_name} dispatch failed: {e}"
+        ))
+    })?;
+    Ok((
+        PyBytes::new_bound(py, &out_data),
+        PyBytes::new_bound(py, &out_valid),
+    ))
 }

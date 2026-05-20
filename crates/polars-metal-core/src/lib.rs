@@ -14,8 +14,8 @@ mod udf;
 pub use arena::{BumpArena, ScratchArena, StubArena};
 pub use error::EngineError;
 pub use udf::{
-    cmp_f64_col_col, cmp_f64_col_scalar, cmp_i64_col_col, cmp_i64_col_scalar,
-    execute_filter_compact, execute_plan,
+    bool_and_dispatch, bool_or_dispatch, cmp_f64_col_col, cmp_f64_col_scalar, cmp_i64_col_col,
+    cmp_i64_col_scalar, execute_filter_compact, execute_plan,
 };
 
 use polars_metal_buffer::MetalDevice;
@@ -59,5 +59,7 @@ fn polars_metal_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add_function(wrap_pyfunction!(udf::cmp_i64_col_col, m)?)?;
     m.add_function(wrap_pyfunction!(udf::cmp_f64_col_scalar, m)?)?;
     m.add_function(wrap_pyfunction!(udf::cmp_f64_col_col, m)?)?;
+    m.add_function(wrap_pyfunction!(udf::bool_and_dispatch, m)?)?;
+    m.add_function(wrap_pyfunction!(udf::bool_or_dispatch, m)?)?;
     Ok(())
 }

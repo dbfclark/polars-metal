@@ -247,8 +247,13 @@ def _walk_filter(nt: Any, node: Any) -> WalkResult:
       operators and whose operands are each a ``Column(I64|F64)`` or a
       same-dtype ``Literal``: ``df.filter(pl.col("a") > 0)``,
       ``df.filter(pl.col("x") < pl.col("y"))``, etc.
+    - **Phase 7** — a ``BinaryExpr`` whose op is ``Operator.And`` or
+      ``Operator.Or`` and whose operands are each themselves any of the
+      shapes above (recursively): ``df.filter((pl.col("a") > 0) &
+      (pl.col("b") < pl.col("c")))``, mixed AND/OR, nested combinations,
+      etc.
 
-    Everything else (AND/OR — Task 20; arithmetic in the predicate — M2+;
+    Everything else (NOT via ``.not_()``, arithmetic in the predicate,
     casts, function calls, etc.) FallBacks so the CPU executor produces
     the correct result.
 
@@ -320,6 +325,16 @@ _CMP_OP_NAMES: dict[str, str] = {
     "Operator.GtEq": "Ge",
 }
 
+# Bool combinators: Polars' `Operator.{And, Or}` (the Python-level `&`/`|`
+# operators on Bool expressions). `LogicalAnd`/`LogicalOr` are the
+# short-circuiting variants used for non-Boolean lhs operands; we don't
+# encounter them in predicate position because the predicate must
+# evaluate to Boolean.
+_LOGICAL_OP_NAMES: dict[str, str] = {
+    "Operator.And": "And",
+    "Operator.Or": "Or",
+}
+
 
 def _walk_predicate(nt: Any, node_id: int) -> dict | None:
     """Walk an expression-node id into a predicate-AST dict, or None if rejected.
@@ -332,6 +347,9 @@ def _walk_predicate(nt: Any, node_id: int) -> dict | None:
     - ``{"kind": "LiteralBool", "value": bool}``
     - ``{"kind": "Compare", "op": "Eq|Ne|Lt|Le|Gt|Ge",
          "lhs": <predicate>, "rhs": <predicate>, "dtype": "I64"|"F64"}``
+    - ``{"kind": "And"|"Or", "lhs": <predicate>, "rhs": <predicate>}`` —
+      Phase 7 (Task 20). Both sides must resolve to Boolean output
+      (a ``Column(Bool)``, a ``Compare``, or another ``And``/``Or``).
 
     The dtype tag on ``Compare`` is the *operand* dtype (the dtype that
     drives kernel selection on the Rust side); both lhs and rhs must
@@ -372,18 +390,24 @@ def _walk_predicate(nt: Any, node_id: int) -> dict | None:
         return None
 
     if cls == "BinaryExpr":
-        op_tag = _CMP_OP_NAMES.get(str(expr.op))
+        op_str = str(expr.op)
+        if op_str in _LOGICAL_OP_NAMES:
+            return _walk_logical(nt, expr, _LOGICAL_OP_NAMES[op_str])
+        op_tag = _CMP_OP_NAMES.get(op_str)
         if op_tag is None:
-            # Operator.And/Or/Plus/etc. — not in this task's closed set.
+            # Operator.Plus/Minus/Xor/etc. — not in this task's closed set.
             return None
         lhs = _walk_predicate(nt, expr.left)
         rhs = _walk_predicate(nt, expr.right)
         if lhs is None or rhs is None:
             return None
-        # Nested comparisons (Compare-inside-Compare) aren't a Phase-6
-        # shape — those would be 3-valued bool combinators handled by
-        # And/Or in Phase 7. Reject defensively.
+        # A Compare always returns Bool, so a Compare-inside-Compare
+        # ("(a > 0) > 1") would be a type error in Polars itself; reject
+        # defensively rather than try to coerce. AND/OR combine Compares;
+        # they're handled by the _LOGICAL_OP_NAMES branch above.
         if lhs["kind"] == "Compare" or rhs["kind"] == "Compare":
+            return None
+        if lhs["kind"] in ("And", "Or") or rhs["kind"] in ("And", "Or"):
             return None
         lhs_dt = _leaf_dtype(lhs)
         rhs_dt = _leaf_dtype(rhs)
@@ -409,6 +433,50 @@ def _walk_predicate(nt: Any, node_id: int) -> dict | None:
             "dtype": lhs_dt,
         }
 
+    return None
+
+
+def _walk_logical(nt: Any, expr: Any, op_tag: str) -> dict | None:
+    """Walk a ``BinaryExpr(And|Or, lhs, rhs)`` into an AND/OR predicate dict.
+
+    Both sides must resolve to a Boolean-typed predicate — i.e. one of:
+    ``Column(Bool)``, ``Compare`` (always returns Bool), ``And``, or ``Or``.
+    ``LiteralBool`` is rejected for the same reason a bare literal is
+    rejected at the Filter root: Polars would broadcast a literal mask,
+    and we keep the closed set tight to avoid surprising shapes hitting
+    the kernel.
+    """
+    lhs = _walk_predicate(nt, expr.left)
+    rhs = _walk_predicate(nt, expr.right)
+    if lhs is None or rhs is None:
+        return None
+    if _result_dtype(lhs) != "Bool" or _result_dtype(rhs) != "Bool":
+        return None
+    # LiteralBool is a Bool-typed predicate but degenerate (constant mask);
+    # the optimizer should have collapsed it. Match the Filter-root rule
+    # rather than asking the kernel to broadcast a scalar bit-packed mask.
+    if lhs["kind"] == "LiteralBool" or rhs["kind"] == "LiteralBool":
+        return None
+    return {"kind": op_tag, "lhs": lhs, "rhs": rhs}
+
+
+def _result_dtype(pred: dict) -> str | None:
+    """Return the dtype tag of the *result* a predicate produces.
+
+    For leaves this is the column/literal dtype; for combinators
+    (``Compare``, ``And``, ``Or``) it is always ``"Bool"``.
+    """
+    k = pred["kind"]
+    if k == "Column":
+        return pred["dtype"]
+    if k == "LiteralI64":
+        return "I64"
+    if k == "LiteralF64":
+        return "F64"
+    if k == "LiteralBool":
+        return "Bool"
+    if k in ("Compare", "And", "Or"):
+        return "Bool"
     return None
 
 

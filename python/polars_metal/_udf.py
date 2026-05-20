@@ -28,7 +28,10 @@ walker-only side-channel keys on the Scan leaf:
   is one of:
     - ``{"kind": "Column", "name": ..., "dtype": "Bool"}`` (Phase 5),
     - ``{"kind": "Compare", "op": "Eq|Ne|Lt|Le|Gt|Ge", "lhs": <leaf>,
-       "rhs": <leaf>, "dtype": "I64"|"F64"}`` (Phase 6, Task 18).
+       "rhs": <leaf>, "dtype": "I64"|"F64"}`` (Phase 6, Task 18),
+    - ``{"kind": "And"|"Or", "lhs": <pred>, "rhs": <pred>}`` (Phase 7,
+       Task 20) — combinators over any Bool-typed sub-predicate, nested
+       arbitrarily.
   Leaves are ``Column`` (as above) or one of ``LiteralI64 | LiteralF64
   | LiteralBool`` with a ``value`` field.
 
@@ -192,6 +195,11 @@ def _evaluate_predicate(upstream: pl.DataFrame, pred: dict, n_rows: int) -> tupl
       each either ``Column(I64|F64)`` or matching-dtype ``Literal`` —
       Phase 6: dispatch the matching ``cmp_<dtype>_col_(col|scalar)``
       kernel against the upstream column buffers.
+    - ``And { lhs, rhs }`` / ``Or { lhs, rhs }`` — Phase 7 (Task 20):
+      recursively evaluate both sub-predicates, then combine via
+      ``bool_and_dispatch`` / ``bool_or_dispatch`` (3-valued AND/OR
+      against bit-packed bool + validity bitmaps). Arbitrary nesting
+      unfolds via the recursion.
 
     Returns bit-packed bytes (each at least ``ceil(n_rows / 8)`` bytes).
     """
@@ -207,7 +215,50 @@ def _evaluate_predicate(upstream: pl.DataFrame, pred: dict, n_rows: int) -> tupl
     if kind == "Compare":
         return _evaluate_compare(upstream, pred, n_rows)
 
+    if kind in ("And", "Or"):
+        return _evaluate_logical(upstream, pred, n_rows)
+
     raise RuntimeError(f"polars_metal: unsupported predicate kind {kind!r}")
+
+
+def _evaluate_logical(upstream: pl.DataFrame, pred: dict, n_rows: int) -> tuple[bytes, bytes]:
+    """Recursively evaluate both sub-predicates, then combine via the
+    matching ``bool_<and|or>_dispatch`` pyfunction.
+
+    ``bool_and`` / ``bool_or`` implement Polars' 3-valued (Kleene) logic:
+    AND is dominated by ``false`` (so ``false AND null = false``), OR is
+    dominated by ``true`` (so ``true OR null = true``); otherwise null
+    propagates. The kernels read both data and validity bitmaps for each
+    side and write a fresh ``(data, valid)`` pair for the combined
+    predicate.
+
+    The kernel input contract requires each bitmap to be at least
+    ``ceil(n_rows / 8)`` bytes; sub-predicate outputs may be 4-byte-
+    aligned padded (see ``cmp_out_min_bytes`` on the Rust side), which
+    already satisfies the minimum. We don't trim further: extra bytes
+    past row ``n_rows`` are read but ignored by the kernel.
+    """
+    lhs_data, lhs_valid = _evaluate_predicate(upstream, pred["lhs"], n_rows)
+    rhs_data, rhs_valid = _evaluate_predicate(upstream, pred["rhs"], n_rows)
+    min_bytes = (n_rows + 7) // 8
+    # Defensive pad — every evaluator above already produces at least
+    # `min_bytes` bytes, but keep the contract explicit so a future
+    # evaluator that returns a tighter buffer doesn't silently break the
+    # kernel's length check.
+    lhs_data = _pad_to(lhs_data, min_bytes)
+    lhs_valid = _pad_to(lhs_valid, min_bytes)
+    rhs_data = _pad_to(rhs_data, min_bytes)
+    rhs_valid = _pad_to(rhs_valid, min_bytes)
+    if pred["kind"] == "And":
+        return _native.bool_and_dispatch(lhs_data, lhs_valid, rhs_data, rhs_valid, n_rows)
+    return _native.bool_or_dispatch(lhs_data, lhs_valid, rhs_data, rhs_valid, n_rows)
+
+
+def _pad_to(buf: bytes, min_bytes: int) -> bytes:
+    """Right-pad ``buf`` with zero bytes to at least ``min_bytes``."""
+    if len(buf) >= min_bytes:
+        return buf
+    return buf + b"\x00" * (min_bytes - len(buf))
 
 
 def _evaluate_compare(upstream: pl.DataFrame, pred: dict, n_rows: int) -> tuple[bytes, bytes]:
