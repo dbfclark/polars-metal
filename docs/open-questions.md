@@ -8,7 +8,7 @@ The M0 patch turned out to need two sites, not one:
 1. `polars.lazyframe.frame._gpu_engine_callback` — defensive wrap so MetalEngine reaching this function returns our callback rather than raising on the engine-string allow-list.
 2. `polars.lazyframe.frame.LazyFrame.collect` — primary intercept. Polars 1.40+ routes `engine=` straight to Rust's `ldf.collect()`, which only accepts strings, so we short-circuit at the Python level: when `engine=MetalEngine()`, call `original_collect(self, engine="cpu", post_opt_callback=cb)` with our callback. `post_opt_callback` is an internal/test-only Polars hook.
 
-Only site 1's signature is asserted at import time. Site 2 (`LazyFrame.collect`) is not yet asserted — if its signature changes (e.g., `post_opt_callback` is removed/renamed), our patch silently breaks. *Follow-up:* add a signature assertion for `LazyFrame.collect` and a smoke test that asserts `post_opt_callback` exists. *Owner:* M0 follow-up / pre-M1.
+Both sites are now verified at import time. Site 1 checks the `_gpu_engine_callback` parameter set; Site 2 does a runtime probe call (`LazyFrame.collect(engine="cpu", post_opt_callback=lambda *a, **kw: None)` on a trivial frame) because `post_opt_callback` flows through Polars' `**_kwargs` catch-all and isn't visible to `inspect.signature`. If either check fails on a future Polars rev, `import polars_metal` raises with a clear message rather than letting the patch silently no-op.
 
 The real fix is an upstream engine-registration hook in Polars; once that lands, both patches retire. *Owner:* see `docs/upstream-polars-engine-hook.md` (drafted in T37).
 
@@ -62,9 +62,14 @@ Initially missing on the dev host: T19's MLX build had to use `-DMLX_BUILD_METAL
 - **Metal toolchain was missing.** Initially blocked GPU build; resolved by `sudo xcodebuild -runFirstLaunch` + `xcodebuild -downloadComponent MetalToolchain`. See dedicated entry above.
 - **The monkey-patch needed two sites, not one.** Polars 1.40+ routes `engine=` straight to Rust's `ldf.collect()`. The Python-side `_gpu_engine_callback` wrap is insufficient on its own; we also patch `LazyFrame.collect` and inject our callback via `post_opt_callback`. See dedicated entry above.
 
-**To revisit at M1:**
+**Resolved in PR #1 follow-up commits (kept M0 cohesive rather than queueing for a separate pre-M1 PR):**
 
-- Add a signature assertion test for the `LazyFrame.collect` patch site (open question above).
+- ~~Add a signature assertion test for the `LazyFrame.collect` patch site.~~ Done — `_verify_patch_site` now probes `post_opt_callback` at import time (commit `c6d9558`).
+- ~~`EngineError → PyErr` surfaces as `PyRuntimeError` rather than `polars.exceptions.ComputeError`.~~ Done — now uses `polars.exceptions.ComputeError` with `PyRuntimeError` fallback; new Rust test asserts the produced exception is a real `ComputeError` instance (commit `c6d9558`).
+- ~~MLX GPU dispatch isn't separately validated.~~ Done — `add_f32_on_gpu` forces `Device::gpu` via `mlx::core::StreamContext`, tested on a 4096-element array (commit `58e9fb5`). MLX throws if Metal is unavailable, so a passing test = working dispatch.
+
+**Still to revisit at M1 (not blockers):**
+
 - The portability gate (small M2, M1) is still a manual run-on-your-other-machine step. Document the procedure in `docs/` if we want subsequent milestones to enforce it more uniformly.
 - The `pyo3 0.22` macro emits `useless_conversion` clippy warnings in `polars-metal-core`; suppressed file-scoped with `#![allow(clippy::useless_conversion)]`. Revisit when pyo3 is upgraded.
-- MLX GPU dispatch isn't separately validated. The proptest in `polars-metal-mlx-sys` covers small f32 arrays (0–256 elements); at those sizes MLX likely stays on CPU/Accelerate even though Metal is linked. Add a larger-array benchmark with `MTL_DEBUG_LAYER=1` or instrumented dispatch counter to confirm Metal gets used before M1 ships its first GPU kernel.
+- The hypothesis differential harness in `tests/diff/` generates bare scans (no varied operations), so it's only really testing fallback parity. Add filter/select/groupby strategies once M1 has kernels producing real GPU output.
