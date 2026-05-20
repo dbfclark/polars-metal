@@ -7,5 +7,6 @@
 pub mod cmp;
 pub mod command;
 pub mod filter;
+pub mod logical;
 pub mod pipeline;
 pub mod shader_lib;
