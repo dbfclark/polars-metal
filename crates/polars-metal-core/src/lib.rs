@@ -8,6 +8,7 @@
 
 mod arena;
 mod error;
+pub mod plan;
 
 pub use arena::{BumpArena, ScratchArena, StubArena};
 pub use error::EngineError;
