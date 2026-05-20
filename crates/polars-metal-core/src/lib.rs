@@ -3,8 +3,10 @@
 // PyO3 entry point. Exports the `polars_metal_native` extension module
 // loaded by the Python package.
 
+mod arena;
 mod error;
 
+pub use arena::{ScratchArena, StubArena};
 pub use error::EngineError;
 
 use pyo3::prelude::*;
