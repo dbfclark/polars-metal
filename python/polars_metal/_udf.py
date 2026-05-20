@@ -2,13 +2,20 @@
 ``(with_columns, predicate, n_rows, should_time)`` once the optimized plan
 has decided our subtree is responsible for producing a DataFrame.
 
-In Task 8 (Phase 4) the UDF body delegates to Rust's
-``_native.execute_plan``, which interprets the plan and assembles the
-result via direct ``PyDataFrame.select`` calls. The Python side only
-performs the wire-format adaptation (separating the captured DataFrame
-from the rest of the plan dict, applying the optional ``projection`` as
-a synthetic ``Project`` wrapper) and the Polars-mandated UDF signature
-shim (``should_time``, ``n_rows`` slice).
+Task 8 (Phase 4) handles scan + project via Rust's ``_native.execute_plan``.
+Task 15 (Phase 5) extends the UDF body to handle Filter at the plan root:
+the Python side extracts Arrow buffers from the upstream DataFrame, hands
+the raw bytes to Rust's ``_native.execute_filter_compact`` for GPU
+compaction, then re-assembles a Polars DataFrame via
+``pyarrow.Array.from_buffers``.
+
+Why Python-side Arrow extraction?
+---------------------------------
+Polars + PyArrow + pyo3 interop is much simpler when the Arrow buffer
+extraction stays in Python. ``Series.to_arrow().buffers()`` returns
+``pyarrow.Buffer`` objects whose memory is directly addressable as
+``bytes(buf)`` — no pyo3 ChunkedArray plumbing required. The same path
+works in reverse for reassembly via ``pa.Array.from_buffers``.
 
 The plan-dict shape produced by ``_walker.walk()`` mirrors
 ``MetalPlanNode`` in ``crates/polars-metal-core/src/plan/mod.rs`` *plus*
@@ -17,12 +24,11 @@ walker-only side-channel keys on the Scan leaf:
 - ``{"kind": "Scan", "columns": [(name, dtype_tag), ...], "df": <PyDataFrame>,
    "projection": list[str] | None}``
 - ``{"kind": "Project", "input": <plan>, "columns": list[str]}``
-- ``{"kind": "Filter", "input": <plan>, ...}``  (Phase 5+)
+- ``{"kind": "Filter", "input": <plan>, "predicate":
+   {"kind": "Column", "name": ..., "dtype": "Bool"}}``
 
 ``df`` and ``projection`` are walker-only side channels; we strip them
-before handing the plan to Rust. ``execute_plan`` expects the
-``MetalPlanNode``-shaped wire format (``{"kind": "Scan", "n_rows": int,
-"columns": [...]}``) — no DataFrame embedded.
+before handing the plan to Rust.
 """
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ from __future__ import annotations
 from typing import Any
 
 import polars as pl
+import pyarrow as pa
 
 from polars_metal import _native
 
@@ -55,8 +62,7 @@ def build_udf(plan: dict) -> Any:
         n_rows: int | None,
         should_time: bool,
     ) -> Any:
-        result_pydf = _native.execute_plan(df_pydf, wire_plan)
-        df = pl.DataFrame._from_pydf(result_pydf)
+        df = _dispatch(df_pydf, wire_plan)
         # Apply Polars-requested slice if any. Defensive: in Phase 4 the
         # optimizer should not push a slice into us, but if it does we honor
         # it rather than silently producing a too-large frame.
@@ -67,6 +73,245 @@ def build_udf(plan: dict) -> Any:
         return df
 
     return udf
+
+
+def _dispatch(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
+    """Route the wire plan to the appropriate Rust entry point.
+
+    Filter at the plan root requires the dedicated compaction path
+    (raw Arrow bytes in, raw Arrow bytes out); everything else goes
+    through the generic ``execute_plan`` entry point.
+
+    Note: Filter is currently only recognised at the *root* of the wire
+    plan. Phase 5 emits plans of the form ``Filter(input=...)`` or
+    ``Project(input=Filter(...))`` — the latter is unwrapped here to
+    apply the post-filter projection.
+    """
+    if wire_plan["kind"] == "Filter":
+        return _dispatch_filter(df_pydf, wire_plan)
+    if wire_plan["kind"] == "Project" and wire_plan["input"]["kind"] == "Filter":
+        # Filter followed by a column re-selection: compact first, then
+        # project on the host (cheap synchronous DataFrame op).
+        filtered = _dispatch_filter(df_pydf, wire_plan["input"])
+        # CRITICAL: do not call `filtered.select(...)`; pl.DataFrame.select
+        # routes through LazyFrame.collect which our monkey-patch
+        # intercepts, causing infinite recursion. The underlying
+        # PyDataFrame.select is the sync escape hatch (see
+        # docs/open-questions.md, Walker / UDF integration #1).
+        return pl.DataFrame._from_pydf(filtered._df.select(list(wire_plan["columns"])))
+    result_pydf = _native.execute_plan(df_pydf, wire_plan)
+    return pl.DataFrame._from_pydf(result_pydf)
+
+
+def _dispatch_filter(df_pydf: Any, filter_plan: dict) -> pl.DataFrame:
+    """Run the GPU compaction pipeline against ``df_pydf`` and return a
+    Polars DataFrame containing the surviving rows of every input column.
+
+    The predicate is read from the same upstream DataFrame as the survivors
+    (it lives in the input subtree, which today is always a Scan/Project
+    that resolves to a contiguous slice of ``df_pydf``). The walker stamps
+    the predicate column name into ``filter_plan["predicate"]["name"]`` so
+    we can fetch it by name.
+    """
+    # Resolve the upstream DataFrame (after running scan/project nodes
+    # under the Filter). The Filter node's input plan is one of:
+    #   - Scan (the root): df_pydf is the underlying frame, no rewrite.
+    #   - Project(Scan): a column re-selection; route through execute_plan
+    #     to get the upstream DataFrame in its post-projection form.
+    upstream_plan = filter_plan["input"]
+    if upstream_plan["kind"] == "Scan":
+        upstream = pl.DataFrame._from_pydf(df_pydf)
+    else:
+        upstream_pydf = _native.execute_plan(df_pydf, upstream_plan)
+        upstream = pl.DataFrame._from_pydf(upstream_pydf)
+
+    pred_name = filter_plan["predicate"]["name"]
+    # Materialise Arrow with offset == 0 (slicing can leave a non-zero
+    # offset, which the kernels do not understand). PyArrow's
+    # combine_chunks materialises a fresh contiguous buffer at offset 0.
+    n_rows = upstream.height
+    pred_arr = _materialize_arrow(upstream.get_column(pred_name))
+    pred_data, pred_valid = _bitpacked_data_and_valid(pred_arr, n_rows)
+
+    # Build the column-input list. Polars semantics: ``df.filter(mask)``
+    # keeps the predicate column in the output (unless the caller
+    # explicitly drops/selects it later). Mirror that — include the
+    # predicate column in the survivor list too.
+    column_inputs: list[tuple[str, str, bytes, bytes]] = []
+    for col_name, dtype in upstream.schema.items():
+        dtype_tag = _DTYPE_TO_TAG.get(str(dtype))
+        if dtype_tag is None:
+            # Walker should have rejected this upstream; surface clearly
+            # rather than silently producing wrong output.
+            raise RuntimeError(
+                f"polars_metal: unsupported dtype {dtype!s} on column {col_name!r} "
+                f"(walker should have fallen back)"
+            )
+        col_arr = _materialize_arrow(upstream.get_column(col_name))
+        data_bytes, valid_bytes = _data_and_valid_for_dtype(col_arr, n_rows, dtype_tag)
+        column_inputs.append((col_name, dtype_tag, data_bytes, valid_bytes))
+
+    # Call into Rust. Returns one (data_bytes, valid_bytes, n_out) per input.
+    results = _native.execute_filter_compact(pred_data, pred_valid, n_rows, column_inputs)
+    if len(results) != len(column_inputs):
+        raise RuntimeError(
+            f"polars_metal: execute_filter_compact returned {len(results)} columns, "
+            f"expected {len(column_inputs)}"
+        )
+
+    # Reassemble. Every output column has the same n_out by construction;
+    # we read it from the first column and validate the rest match.
+    n_out = int(results[0][2])
+    series_list: list[pl.Series] = []
+    for (col_name, dtype_tag, _src_data, _src_valid), (out_data, out_valid, n_out_i) in zip(
+        column_inputs, results, strict=True
+    ):
+        n_out_i_int = int(n_out_i)
+        if n_out_i_int != n_out:
+            raise RuntimeError(
+                f"polars_metal: column {col_name!r} reports n_out={n_out_i_int}, "
+                f"expected {n_out} (other columns); compaction is inconsistent"
+            )
+        series_list.append(_assemble_series(col_name, dtype_tag, out_data, out_valid, n_out))
+
+    return pl.DataFrame(series_list)
+
+
+_DTYPE_TO_TAG: dict[str, str] = {
+    "Int64": "I64",
+    "Float64": "F64",
+    "Boolean": "Bool",
+}
+
+_TAG_TO_PA: dict[str, pa.DataType] = {
+    "I64": pa.int64(),
+    "F64": pa.float64(),
+    "Bool": pa.bool_(),
+}
+
+
+def _materialize_arrow(s: pl.Series) -> pa.Array:
+    """Return a PyArrow array for ``s`` with ``offset == 0`` and a single chunk.
+
+    Slicing a Polars frame produces Arrow arrays with a non-zero offset
+    whose buffers still cover the *parent* extent. The kernels don't
+    interpret offsets — they read from byte 0 — so we must materialise a
+    fresh contiguous array before extracting buffers.
+    ``pa.concat_arrays([arr])`` does this with a single copy when the
+    offset is non-zero and is a no-op when the offset is already 0.
+    """
+    arr = s.to_arrow()
+    if isinstance(arr, pa.ChunkedArray):
+        arr = arr.combine_chunks() if arr.num_chunks > 1 else arr.chunk(0)
+    if arr.offset != 0:
+        arr = pa.concat_arrays([arr])
+    return arr
+
+
+def _bitpacked_data_and_valid(arr: pa.Array, n_rows: int) -> tuple[bytes, bytes]:
+    """Extract bit-packed data + validity bytes from a Boolean Arrow array.
+
+    Arrow lays Boolean arrays out as ``[validity_bitmap, data_bitmap]``
+    (buffers[0], buffers[1]). When all rows are valid, ``buffers()[0]``
+    is ``None`` — materialise an all-ones bitmap so the Rust side always
+    sees a real buffer.
+
+    Returns ``(data, valid)`` each of length ``>= ceil(n_rows / 8)``.
+    """
+    bufs = arr.buffers()
+    # buffers[0] is validity; buffers[1] is data.
+    min_bytes = (n_rows + 7) // 8
+    valid_buf = bufs[0]
+    data_buf = bufs[1]
+    valid = bytes(valid_buf) if valid_buf is not None else _all_ones_bitmap(n_rows)
+    data = bytes(data_buf) if data_buf is not None else b""
+    # Pad to the kernel's minimum so the Rust-side length checks pass.
+    if len(valid) < min_bytes:
+        valid = valid + b"\x00" * (min_bytes - len(valid))
+    if len(data) < min_bytes:
+        data = data + b"\x00" * (min_bytes - len(data))
+    return data, valid
+
+
+def _data_and_valid_for_dtype(arr: pa.Array, n_rows: int, dtype_tag: str) -> tuple[bytes, bytes]:
+    """Extract ``(data, valid)`` bytes appropriate for ``dtype_tag``.
+
+    For I64/F64 the data is dense (``n_rows * 8`` bytes); for Bool it is
+    bit-packed (``ceil(n_rows / 8)`` bytes). Validity is always
+    bit-packed and materialised to all-ones when Arrow elided it.
+    """
+    bufs = arr.buffers()
+    valid_buf = bufs[0]
+    data_buf = bufs[1]
+    valid = bytes(valid_buf) if valid_buf is not None else _all_ones_bitmap(n_rows)
+    data = bytes(data_buf) if data_buf is not None else b""
+    min_valid_bytes = (n_rows + 7) // 8
+    if len(valid) < min_valid_bytes:
+        valid = valid + b"\x00" * (min_valid_bytes - len(valid))
+    if dtype_tag in ("I64", "F64"):
+        expected_data = n_rows * 8
+        if len(data) < expected_data:
+            data = data + b"\x00" * (expected_data - len(data))
+    elif dtype_tag == "Bool":
+        if len(data) < min_valid_bytes:
+            data = data + b"\x00" * (min_valid_bytes - len(data))
+    else:  # pragma: no cover — walker rejects other dtypes
+        raise RuntimeError(f"polars_metal: unexpected dtype_tag {dtype_tag!r}")
+    return data, valid
+
+
+def _all_ones_bitmap(n_rows: int) -> bytes:
+    """Bit-packed all-ones validity bitmap for ``n_rows`` rows.
+
+    The kernel checks ``valid[i / 8] & (1 << (i % 8))`` per row, so any
+    trailing bits past row ``n_rows`` are read but ignored — we can
+    safely set every bit in the last byte without affecting correctness.
+    """
+    n_bytes = (n_rows + 7) // 8
+    return b"\xff" * n_bytes
+
+
+def _assemble_series(name: str, dtype_tag: str, data: bytes, valid: bytes, n_out: int) -> pl.Series:
+    """Build a Polars Series from raw Arrow buffer bytes.
+
+    For I64/F64: ``data`` is ``n_out * 8`` bytes (dense), ``valid`` is
+    bit-packed at least ``ceil(n_out / 8)`` bytes (possibly 4-byte-aligned
+    padded by the kernel — we trim).
+
+    For Bool: both ``data`` and ``valid`` are bit-packed; same trim.
+
+    The validity buffer is always present (the kernel writes one); if the
+    column has no nulls we still hand a buffer to PyArrow rather than
+    None — PyArrow accepts that and reports the correct null_count via
+    ``null_count=-1`` (compute on demand).
+    """
+    pa_type = _TAG_TO_PA[dtype_tag]
+    min_valid_bytes = (n_out + 7) // 8
+    # The kernel pads valid (and bool data) to 4-byte alignment for the
+    # atomic_uint cast; trim to the Arrow-canonical minimum so PyArrow
+    # doesn't see trailing garbage as part of the buffer.
+    valid_trim = valid[:min_valid_bytes] if min_valid_bytes > 0 else b""
+    if dtype_tag == "Bool":
+        data_trim = data[:min_valid_bytes] if min_valid_bytes > 0 else b""
+    else:
+        # I64/F64: dense, exactly n_out * 8 bytes.
+        data_trim = data[: n_out * 8]
+
+    if n_out == 0:
+        # PyArrow accepts buffers of length 0 with size=0; pass empty data.
+        arr = pa.Array.from_buffers(
+            pa_type, 0, [pa.py_buffer(b""), pa.py_buffer(b"")], null_count=0
+        )
+    else:
+        arr = pa.Array.from_buffers(
+            pa_type,
+            n_out,
+            [pa.py_buffer(valid_trim), pa.py_buffer(data_trim)],
+            # null_count=-1 → recompute on demand (safe; we don't know it
+            # cheaply from the bit-packed bitmap on the Python side).
+            null_count=-1,
+        )
+    return pl.Series(name, arr)
 
 
 def _extract_scan_df_and_wire_plan(plan: dict) -> tuple[Any, dict]:
@@ -117,7 +362,6 @@ def _extract_scan_df_and_wire_plan(plan: dict) -> tuple[Any, dict]:
                 "input": rewrite(node["input"]),
             }
         if kind == "Filter":
-            # Pass through unchanged for now; Rust raises NotImplementedError.
             return {
                 "kind": "Filter",
                 "predicate": node["predicate"],

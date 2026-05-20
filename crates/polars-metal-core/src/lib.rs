@@ -13,7 +13,7 @@ mod udf;
 
 pub use arena::{BumpArena, ScratchArena, StubArena};
 pub use error::EngineError;
-pub use udf::execute_plan;
+pub use udf::{execute_filter_compact, execute_plan};
 
 use polars_metal_buffer::MetalDevice;
 use pyo3::prelude::*;
@@ -40,7 +40,7 @@ fn add_f32(a: Vec<f32>, b: Vec<f32>) -> PyResult<Vec<f32>> {
 /// This shim avoids `useless_conversion` lint warnings that arise when using
 /// `.map_err(Into::into)` in functions whose return type rustc cannot yet
 /// fully infer at the `map_err` call site.
-fn engine_err(e: EngineError) -> PyErr {
+pub(crate) fn engine_err(e: EngineError) -> PyErr {
     e.into()
 }
 
@@ -51,5 +51,6 @@ fn polars_metal_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add_function(wrap_pyfunction!(device_name, m)?)?;
     m.add_function(wrap_pyfunction!(add_f32, m)?)?;
     m.add_function(wrap_pyfunction!(udf::execute_plan, m)?)?;
+    m.add_function(wrap_pyfunction!(udf::execute_filter_compact, m)?)?;
     Ok(())
 }

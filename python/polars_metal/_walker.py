@@ -32,7 +32,15 @@ IR-node shapes for the nodes we touch in Phase 4 (from
 - ``SimpleProjection``: ``.input`` (int). Output columns come from
   ``nt.get_schema()`` while the node is current.
 - ``Select``: ``.input`` (int), ``.expr`` (list of PyExprIR), ``.should_broadcast``.
-- ``Filter``: ``.input`` (int), ``.predicate`` (PyExprIR). Falls back in Phase 4.
+- ``Filter``: ``.input`` (int), ``.predicate`` (PyExprIR). M1 Phase 5
+  (Task 15) accepts predicates that resolve to a single ``Column`` whose
+  dtype is Boolean; everything else falls back.
+
+PyExprIR shape (from ``polars-python/src/lazyframe/visit.rs``): ``.node``
+(usize into the expression arena) and ``.output_name`` (str). To inspect
+the underlying expression class we call ``nt.view_expression(node_id)``;
+to resolve its dtype against the current IR root we call
+``nt.get_dtype(node_id)``.
 
 Note: under default optimization, ``df.lazy().select([...])`` is collapsed
 into ``DataFrameScan.projection`` and no separate Projection node appears.
@@ -89,8 +97,7 @@ def _walk_at_current(nt: Any) -> WalkResult:
     if cls == "Select":
         return _walk_select(nt, node)
     if cls == "Filter":
-        # M1 Phase 5+ enables filter. For Phase 4, fall back.
-        return FallBack(reason="Filter handler not implemented yet (Phase 5+)")
+        return _walk_filter(nt, node)
     return FallBack(reason=f"unsupported IR node: {cls}")
 
 
@@ -216,6 +223,84 @@ def _walk_select(nt: Any, node: Any) -> WalkResult:
         return inner
 
     return Handled(plan={"kind": "Project", "input": inner.plan, "columns": columns})
+
+
+def _walk_filter(nt: Any, node: Any) -> WalkResult:
+    """Lower a Filter node iff its predicate is a single ``Column`` of Boolean dtype.
+
+    Phase 5 supports only the precomputed-mask shape:
+    ``df.filter(pl.col("mask"))``. Arithmetic / comparison / compound
+    predicates land in Phases 6+ (Tasks 16-20); for now they FallBack so
+    the CPU executor produces the correct result.
+
+    The plan we emit captures the predicate column name so the Rust UDF
+    can locate it in the upstream DataFrame at dispatch time.
+    """
+    pred_expr_ir = getattr(node, "predicate", None)
+    if pred_expr_ir is None:
+        return FallBack(reason="Filter node missing .predicate")
+
+    pred_node_id = getattr(pred_expr_ir, "node", None)
+    if pred_node_id is None:
+        return FallBack(reason="Filter predicate has no .node id")
+
+    # IMPORTANT: dtype must be resolved against the *input* schema (the
+    # Filter's child), not the post-Filter schema. The current node is
+    # still the Filter itself here, and Polars' get_dtype uses
+    # `self.root.schema()` which for a Filter is the input schema —
+    # confirmed in polars-python's visit.rs:get_dtype implementation.
+    try:
+        inner_expr = nt.view_expression(pred_node_id)
+    except Exception as ex:
+        return FallBack(reason=f"could not view filter predicate expression: {ex!r}")
+
+    inner_cls = type(inner_expr).__name__
+    if inner_cls != "Column":
+        return FallBack(
+            reason=f"Filter predicate is {inner_cls}; Phase 5 supports only Column(bool)"
+        )
+
+    pred_col_name = getattr(inner_expr, "name", None)
+    if pred_col_name is None:
+        return FallBack(reason="Column predicate missing .name")
+
+    # Resolve the column's dtype. Must be Boolean.
+    try:
+        pred_dtype = nt.get_dtype(pred_node_id)
+    except Exception as ex:
+        return FallBack(reason=f"could not resolve filter predicate dtype: {ex!r}")
+    if _map_dtype(pred_dtype) != "Bool":
+        return FallBack(
+            reason=f"Filter predicate dtype is {pred_dtype!s}; Phase 5 requires Boolean"
+        )
+
+    # Walk the input subtree. We re-validate the *output* schema dtypes
+    # for the surviving columns (the post-Filter schema is the same as
+    # the input schema, minus nothing — Filter doesn't drop columns).
+    out_schema = dict(nt.get_schema())
+    for name, dtype in out_schema.items():
+        if _map_dtype(dtype) is None:
+            return FallBack(reason=f"unsupported dtype {dtype!s} on column {name!r}")
+
+    inputs = nt.get_inputs()
+    if len(inputs) != 1:
+        return FallBack(reason=f"Filter expected 1 input, got {len(inputs)}")
+    nt.set_node(inputs[0])
+    inner = _walk_at_current(nt)
+    if isinstance(inner, FallBack):
+        return inner
+
+    return Handled(
+        plan={
+            "kind": "Filter",
+            "input": inner.plan,
+            "predicate": {
+                "kind": "Column",
+                "name": str(pred_col_name),
+                "dtype": "Bool",
+            },
+        }
+    )
 
 
 def _map_dtype(dt: Any) -> str | None:

@@ -22,8 +22,12 @@
 //! in-place column reorder/subset that bypasses the lazy plan entirely.
 
 use crate::plan::{MetalDtype, MetalPlanNode, PredicateAst};
+use polars_metal_buffer::MetalDevice;
+use polars_metal_kernels::command::CommandQueue;
+use polars_metal_kernels::pipeline::{compact_bool, compact_f64, compact_i64};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 
 /// PyO3 entry point exposed as `polars_metal._native.execute_plan`.
 ///
@@ -68,9 +72,269 @@ fn execute_node<'py>(
             let col_list = PyList::new_bound(py, columns.iter().map(|s| s.as_str()));
             upstream.call_method1("select", (col_list,))
         }
-        MetalPlanNode::Filter { .. } => Err(pyo3::exceptions::PyNotImplementedError::new_err(
-            "polars_metal: Filter dispatch lands in M1 Phase 5+ (compaction kernels)",
-        )),
+        MetalPlanNode::Filter { .. } => {
+            // Filter dispatch goes through `execute_filter_compact`, not
+            // `execute_plan`. The Python UDF detects the Filter at the plan
+            // root and routes through the dedicated entry point because
+            // compaction needs raw Arrow buffer bytes that are extracted
+            // Python-side (see `_udf.py::build_udf`). Reaching this branch
+            // means the walker emitted a Filter that the UDF didn't peel
+            // off — surface as a plain NotImplementedError rather than
+            // silently producing the wrong result.
+            Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                "polars_metal: Filter nodes must be dispatched via execute_filter_compact, \
+                 not execute_plan (the Python UDF handles the routing)",
+            ))
+        }
+    }
+}
+
+/// PyO3 entry point exposed as `polars_metal._native.execute_filter_compact`.
+///
+/// Phase 5 — the precomputed-boolean-mask filter path. The Python UDF
+/// extracts bit-packed Boolean predicate bytes and per-column data +
+/// validity bytes via `Series.to_arrow().buffers()`, then hands them
+/// here. Rust runs the three-pass compaction pipeline (predicate
+/// evaluation + MLX cumsum + scatter) for each surviving column and
+/// returns the compacted bytes to Python, which reassembles a Polars
+/// DataFrame via `pa.Array.from_buffers`.
+///
+/// # Arguments
+/// * `pred_data` — bit-packed predicate data buffer, at least
+///   `ceil(n_rows / 8)` bytes.
+/// * `pred_valid` — bit-packed predicate validity buffer, at least
+///   `ceil(n_rows / 8)` bytes. Pass an all-ones buffer if the predicate
+///   has no nulls (Arrow's null buffer is `None` in that case — the
+///   Python side materialises the all-ones bitmap).
+/// * `n_rows` — number of rows in every input.
+/// * `columns` — list of `(name, dtype_tag, data_bytes, valid_bytes)`
+///   tuples, one per surviving column. `dtype_tag` is `"I64"`, `"F64"`,
+///   or `"Bool"`. `valid_bytes` is at least `ceil(n_rows / 8)` bytes
+///   (the Python side materialises all-ones for no-null columns).
+///
+/// # Returns
+/// A list of `(data_bytes, valid_bytes, n_out)` tuples, one per input
+/// column in the same order. For i64/f64 the `data_bytes` length is
+/// `n_out * 8`; for bool it is bit-packed `ceil(n_out / 8)` bytes
+/// (potentially padded to 4-byte alignment by the kernel — the Python
+/// side trims to `ceil(n_out / 8)` before passing to PyArrow).
+#[pyfunction]
+pub fn execute_filter_compact<'py>(
+    py: Python<'py>,
+    pred_data: &Bound<'py, PyBytes>,
+    pred_valid: &Bound<'py, PyBytes>,
+    n_rows: usize,
+    columns: &Bound<'py, PyList>,
+) -> PyResult<Bound<'py, PyList>> {
+    let pred_data_bytes: &[u8] = pred_data.as_bytes();
+    let pred_valid_bytes: &[u8] = pred_valid.as_bytes();
+
+    let min_pred_bytes = (n_rows + 7) / 8;
+    if pred_data_bytes.len() < min_pred_bytes {
+        return Err(PyValueError::new_err(format!(
+            "polars_metal: pred_data is {got} B, need at least {expected} B for {n} rows",
+            got = pred_data_bytes.len(),
+            expected = min_pred_bytes,
+            n = n_rows,
+        )));
+    }
+    if pred_valid_bytes.len() < min_pred_bytes {
+        return Err(PyValueError::new_err(format!(
+            "polars_metal: pred_valid is {got} B, need at least {expected} B for {n} rows",
+            got = pred_valid_bytes.len(),
+            expected = min_pred_bytes,
+            n = n_rows,
+        )));
+    }
+
+    // One device + queue for the whole filter dispatch. Re-creating the
+    // queue per-column would force command-buffer serialisation we don't
+    // want; sharing the queue lets each column's three-pass pipeline run
+    // independently, with explicit waits at the end of each pass.
+    let device = MetalDevice::system_default()
+        .map_err(|e| crate::engine_err(crate::EngineError::Buffer(e)))?;
+    let mut queue = CommandQueue::new(&device)
+        .map_err(|e| crate::engine_err(crate::EngineError::Other(format!("command queue: {e}"))))?;
+
+    let results = PyList::empty_bound(py);
+
+    for (idx, entry) in columns.iter().enumerate() {
+        let tup: Bound<PyTuple> = entry.downcast_into().map_err(|_| {
+            PyValueError::new_err(format!("polars_metal: columns[{idx}] is not a tuple"))
+        })?;
+        if tup.len() != 4 {
+            return Err(PyValueError::new_err(format!(
+                "polars_metal: columns[{idx}] expected 4 elements (name, dtype, data, valid), got {n}",
+                n = tup.len(),
+            )));
+        }
+        let name: String = tup.get_item(0)?.extract()?;
+        let dtype_s: String = tup.get_item(1)?.extract()?;
+        let data_py: Bound<PyBytes> = tup.get_item(2)?.downcast_into().map_err(|_| {
+            PyValueError::new_err(format!(
+                "polars_metal: columns[{idx}].data ({name}) must be bytes"
+            ))
+        })?;
+        let valid_py: Bound<PyBytes> = tup.get_item(3)?.downcast_into().map_err(|_| {
+            PyValueError::new_err(format!(
+                "polars_metal: columns[{idx}].valid ({name}) must be bytes"
+            ))
+        })?;
+        let data_b: &[u8] = data_py.as_bytes();
+        let valid_b: &[u8] = valid_py.as_bytes();
+
+        let dtype = parse_dtype(&dtype_s)?;
+        let (out_data, out_valid, n_out) = compact_one_column(
+            &device,
+            &mut queue,
+            dtype,
+            n_rows,
+            data_b,
+            valid_b,
+            pred_data_bytes,
+            pred_valid_bytes,
+            &name,
+        )?;
+
+        let tup = PyTuple::new_bound(
+            py,
+            [
+                PyBytes::new_bound(py, &out_data).into_any(),
+                PyBytes::new_bound(py, &out_valid).into_any(),
+                n_out.into_py(py).into_bound(py),
+            ],
+        );
+        results.append(tup)?;
+    }
+
+    Ok(results)
+}
+
+/// Run the compaction pipeline on a single column and return its
+/// `(data_bytes, valid_bytes, n_out)` triple. Per-dtype branching is
+/// contained here so `execute_filter_compact`'s loop body stays
+/// dtype-agnostic.
+///
+/// `column_name` is used only for error messages.
+#[allow(clippy::too_many_arguments)]
+fn compact_one_column(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    dtype: MetalDtype,
+    n_rows: usize,
+    src_data: &[u8],
+    src_valid: &[u8],
+    pred_data: &[u8],
+    pred_valid: &[u8],
+    column_name: &str,
+) -> PyResult<(Vec<u8>, Vec<u8>, usize)> {
+    let min_valid_bytes = (n_rows + 7) / 8;
+    if src_valid.len() < min_valid_bytes {
+        return Err(PyValueError::new_err(format!(
+            "polars_metal: column {column_name:?} validity buffer is {got} B, need {expected} B for {n} rows",
+            got = src_valid.len(),
+            expected = min_valid_bytes,
+            n = n_rows,
+        )));
+    }
+
+    match dtype {
+        MetalDtype::I64 => {
+            let expected_data = n_rows * 8;
+            if src_data.len() < expected_data {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: column {column_name:?} (I64) data buffer is {got} B, need {expected} B",
+                    got = src_data.len(),
+                    expected = expected_data,
+                )));
+            }
+            // SAFETY: i64 has no invalid bit patterns; the slice is `expected_data`
+            // bytes long, which is exactly `n_rows` i64s. `from_arrow` Arrow
+            // buffers are 8-byte aligned (Arrow buffer alignment requirement
+            // is 64 bytes for primitive arrays), so the reinterpret is well-aligned.
+            let src_typed: &[i64] =
+                unsafe { std::slice::from_raw_parts(src_data.as_ptr() as *const i64, n_rows) };
+            let result = compact_i64(
+                device, queue, src_typed, src_valid, pred_data, pred_valid, n_rows,
+            )
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "polars_metal: compact_i64({column_name:?}) failed: {e}"
+                ))
+            })?;
+            // SAFETY: `result.data` is a `Vec<i64>` of `result.n_out` elements;
+            // reinterpret as bytes for the wire format. i64 has no invalid bit
+            // patterns and `from_raw_parts` length is exactly `n_out * 8`.
+            let data_bytes: Vec<u8> = {
+                let n_bytes = result.n_out * std::mem::size_of::<i64>();
+                let mut v = vec![0u8; n_bytes];
+                if n_bytes > 0 {
+                    let src_slice = unsafe {
+                        std::slice::from_raw_parts(result.data.as_ptr() as *const u8, n_bytes)
+                    };
+                    v.copy_from_slice(src_slice);
+                }
+                v
+            };
+            Ok((data_bytes, result.valid, result.n_out))
+        }
+        MetalDtype::F64 => {
+            let expected_data = n_rows * 8;
+            if src_data.len() < expected_data {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: column {column_name:?} (F64) data buffer is {got} B, need {expected} B",
+                    got = src_data.len(),
+                    expected = expected_data,
+                )));
+            }
+            // SAFETY: see I64 branch; f64 has no invalid bit patterns and the
+            // slice length is exactly `n_rows` f64s.
+            let src_typed: &[f64] =
+                unsafe { std::slice::from_raw_parts(src_data.as_ptr() as *const f64, n_rows) };
+            let result = compact_f64(
+                device, queue, src_typed, src_valid, pred_data, pred_valid, n_rows,
+            )
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "polars_metal: compact_f64({column_name:?}) failed: {e}"
+                ))
+            })?;
+            // SAFETY: see I64 branch; reinterpret f64 → u8.
+            let data_bytes: Vec<u8> = {
+                let n_bytes = result.n_out * std::mem::size_of::<f64>();
+                let mut v = vec![0u8; n_bytes];
+                if n_bytes > 0 {
+                    let src_slice = unsafe {
+                        std::slice::from_raw_parts(result.data.as_ptr() as *const u8, n_bytes)
+                    };
+                    v.copy_from_slice(src_slice);
+                }
+                v
+            };
+            Ok((data_bytes, result.valid, result.n_out))
+        }
+        MetalDtype::Bool => {
+            // Bool source data is bit-packed: at least `ceil(n_rows / 8)` bytes.
+            if src_data.len() < min_valid_bytes {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: column {column_name:?} (Bool) data buffer is {got} B, need {expected} B",
+                    got = src_data.len(),
+                    expected = min_valid_bytes,
+                )));
+            }
+            let result = compact_bool(
+                device, queue, src_data, src_valid, pred_data, pred_valid, n_rows,
+            )
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "polars_metal: compact_bool({column_name:?}) failed: {e}"
+                ))
+            })?;
+            // For bool, `result.data` is already bit-packed u8 (padded to
+            // 4-byte alignment by the kernel). The Python side will trim to
+            // `ceil(n_out / 8)` before calling PyArrow.
+            Ok((result.data, result.valid, result.n_out))
+        }
     }
 }
 
