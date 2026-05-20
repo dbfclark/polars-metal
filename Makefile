@@ -33,7 +33,7 @@ lint:
 	ruff check .
 	ruff format --check .
 
-gate: lint test-unit test-kernel test-conformance test-diff
+gate: lint test-unit test-kernel wheel test-conformance test-diff
 	@echo "M0 gate passed."
 
 refresh-refs:
