@@ -1,0 +1,7 @@
+# tests/conformance/_skips.toml
+#
+# Per-milestone xfail/skip registry. Adding an entry is a deliberate
+# decision documented in the milestone's PR. M0: empty.
+
+skips = []
+xfails = []

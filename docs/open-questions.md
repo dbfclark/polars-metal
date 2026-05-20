@@ -36,6 +36,10 @@ We committed to `cxx` for M0 based on a weak prior. If friction emerges before M
 
 Resolved in T19: git submodule under `vendor/mlx`, pinned to v0.22.0, built via cmake. *Owner:* M0 (resolved). Refresh via standalone cmake invocation, not via `scripts/refresh-references.sh` (which is for read-only references, not build deps).
 
+## Conformance harness scale
+
+`pytest tests/conformance` (14 tests, 7 operations × cpu+metal) ran in 0.461s wall-clock on an M-series Mac (measured T33, 2026-05-20). Will grow as M1+ ops land; keep an eye on suite time crossing 60s and add pytest-xdist parallelism if needed.
+
 ## Metal toolchain (resolved)
 
 Initially missing on the dev host: T19's MLX build had to use `-DMLX_BUILD_METAL=OFF` because the Metal shader compiler couldn't be invoked. Root cause was a stale x86_64 `CoreSimulator.framework` under `/Library/Developer/PrivateFrameworks/` blocking Xcode's plugin loading. Resolved 2026-05-20 by running `sudo xcodebuild -runFirstLaunch`, then `xcodebuild -downloadComponent MetalToolchain`. MLX rebuilt with `-DMLX_BUILD_METAL=ON`; `build.rs` now links `Metal`, `Foundation`, `QuartzCore`, `Accelerate` frameworks. *Owner:* M0 (resolved).

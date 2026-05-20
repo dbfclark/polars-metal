@@ -18,8 +18,7 @@ test-kernel:
 	cargo test -p polars-metal-kernels
 
 test-conformance:
-	@echo "test-conformance target lands in Task 33"
-	@false
+	pytest tests/conformance -k "not skip_metal"
 
 test-diff:
 	pytest tests/diff
