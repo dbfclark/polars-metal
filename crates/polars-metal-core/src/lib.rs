@@ -3,6 +3,10 @@
 // PyO3 entry point. Exports the `polars_metal_native` extension module
 // loaded by the Python package.
 
+mod error;
+
+pub use error::EngineError;
+
 use pyo3::prelude::*;
 
 /// Hello-world function called from the Python integration tests to
