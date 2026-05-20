@@ -23,6 +23,7 @@ mod ffi {
             a: &CxxVector<f32>,
             b: &CxxVector<f32>,
         ) -> Result<UniquePtr<CxxVector<f32>>>;
+        fn cumsum_u8_to_u32(input: &CxxVector<u8>) -> Result<UniquePtr<CxxVector<u32>>>;
     }
 }
 
@@ -73,6 +74,41 @@ pub fn add_f32(a: &[f32], b: &[f32]) -> Result<Vec<f32>, FfiError> {
     }
     let result = ffi::add_f32(&va, &vb).map_err(FfiError::from)?;
     Ok(result.iter().copied().collect())
+}
+
+/// Inclusive cumulative sum over a u8 keep-flag input, writing u32 offsets
+/// to `output`. The u32 codomain is wide enough for ~4B-row inputs.
+///
+/// Forces MLX onto `Device::gpu` via `StreamContext` on the C++ side. Empty
+/// input is short-circuited and never enters MLX. Input/output length must
+/// match or `FfiError::ShapeMismatch` is returned.
+///
+/// Used by the M1 filter compaction pipeline: bit-packed predicate column ->
+/// dense u8 keep-flags -> cumsum -> scatter indices.
+///
+/// Note: copy-in/copy-out via `CxxVector` is suboptimal — every u8 and every
+/// u32 crosses the FFI boundary by value. Acceptable for M1; M2's MLX-FFI
+/// revisit (see `docs/open-questions.md`) will reconsider direct
+/// MLX-over-MetalBuffer wiring to eliminate these copies.
+pub fn cumsum_u8_to_u32(input: &[u8], output: &mut [u32]) -> Result<(), FfiError> {
+    if input.len() != output.len() {
+        return Err(FfiError::ShapeMismatch {
+            lhs: input.len(),
+            rhs: output.len(),
+        });
+    }
+    if input.is_empty() {
+        return Ok(());
+    }
+    let mut cxx_in = cxx::CxxVector::<u8>::new();
+    for &b in input {
+        cxx_in.pin_mut().push(b);
+    }
+    let cxx_out = ffi::cumsum_u8_to_u32(&cxx_in).map_err(FfiError::from)?;
+    for (i, v) in cxx_out.iter().enumerate() {
+        output[i] = *v;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

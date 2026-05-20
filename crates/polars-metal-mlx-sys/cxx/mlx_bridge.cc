@@ -54,4 +54,25 @@ std::unique_ptr<std::vector<float>> add_f32_on_gpu(
     return std::make_unique<std::vector<float>>(data, data + n);
 }
 
+std::unique_ptr<std::vector<uint32_t>> cumsum_u8_to_u32(
+    const std::vector<uint8_t>& input) {
+    // Force execution on Metal GPU. See add_f32_on_gpu for the RAII pattern;
+    // brace-initialization avoids the most-vexing-parse ambiguity.
+    mlx::core::Device gpu_device{mlx::core::Device::gpu};
+    mlx::core::StreamContext gpu_ctx(gpu_device);
+
+    int32_t n = static_cast<int32_t>(input.size());
+    // Construct a uint8 MLX array over the input buffer, then cast to uint32
+    // before the scan so the running total has headroom (a 4B-row keep-all
+    // input would overflow uint8 immediately).
+    auto in_u8 = mlx::core::array(input.data(), {n}, mlx::core::uint8);
+    auto in_u32 = mlx::core::astype(in_u8, mlx::core::uint32);
+    // axis=0, reverse=false, inclusive=true: classic prefix-sum.
+    auto scanned = mlx::core::cumsum(in_u32, /*axis=*/0, /*reverse=*/false,
+                                     /*inclusive=*/true);
+    mlx::core::eval(scanned);
+    const uint32_t* data = scanned.data<uint32_t>();
+    return std::make_unique<std::vector<uint32_t>>(data, data + n);
+}
+
 }  // namespace polars_metal_mlx

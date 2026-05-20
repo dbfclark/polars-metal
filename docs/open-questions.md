@@ -36,6 +36,8 @@ We assume Arrow `Buffer`s sometimes arrive page-aligned and sometimes don't. The
 
 We committed to `cxx` for M0 based on a weak prior. If friction emerges before M2, switch to hand-written C shim + `bindgen`. *Owner:* M0 (revisit at M2's design).
 
+**M1 friction observation (T5, 2026-05-20):** the `cxx::CxxVector` push-in / iter-copy-out pattern forces a per-element copy across the FFI boundary for every binding (`add_f32`, `cumsum_u8_to_u32`). At M1 sizes this is invisible; at M2's groupby/join scale (10M+ rows, multi-column) the u32-per-row copy on cumsum alone will dominate. The fix is direct MLX-over-`MTLBuffer` wiring — construct `mlx::core::array` views over our already-allocated `MTLBuffer` and read the result back in place rather than via `std::vector`. This rules in favor of either (a) extending `cxx` with raw-pointer-plus-len shims, or (b) the hand-written C shim + `bindgen` route mentioned above. Decide at M2 design.
+
 ## MLX install path
 
 Resolved in T19: git submodule under `vendor/mlx`, pinned to v0.22.0, built via cmake. *Owner:* M0 (resolved). Refresh via standalone cmake invocation, not via `scripts/refresh-references.sh` (which is for read-only references, not build deps).

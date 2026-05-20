@@ -25,4 +25,15 @@ std::unique_ptr<std::vector<float>> add_f32(
 std::unique_ptr<std::vector<float>> add_f32_on_gpu(
     const std::vector<float>& a, const std::vector<float>& b);
 
+// Inclusive cumulative sum over a uint8 keep-flag column, producing uint32
+// output offsets. Forces execution on Device::gpu via StreamContext (same
+// pattern as add_f32_on_gpu). The u32 output domain is sized so that a
+// 4B-row input cannot overflow; callers in the filter compaction pipeline
+// can read the final element as the total kept-row count.
+//
+// Caller must ensure non-empty input. Empty input is short-circuited on the
+// Rust side and does not call into this function.
+std::unique_ptr<std::vector<uint32_t>> cumsum_u8_to_u32(
+    const std::vector<uint8_t>& input);
+
 }  // namespace polars_metal_mlx
