@@ -57,3 +57,31 @@ fn unknown_entry_point_is_error() {
         "error message should name the missing entry point, got: {msg}"
     );
 }
+
+/// Regression test for the TOCTOU race in the per-PID metallib temp path:
+/// many threads in the same process race to load the library. With the
+/// pre-fix per-call `File::create`+write+load sequence, thread B could
+/// truncate the file while thread A's Metal load read it, surfacing as a
+/// flaky "load library failed" error. The OnceLock-based materialisation
+/// must serialise these callers.
+#[test]
+fn shared_library_is_safe_under_concurrent_load() {
+    use std::thread;
+
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            thread::spawn(|| {
+                let device = MetalDevice::system_default().expect("Metal-capable hardware");
+                let lib = polars_metal_kernels::shader_lib::shared_library(&device)
+                    .expect("metallib must load");
+                let _ = lib
+                    .pipeline("hello_write_constant")
+                    .expect("entry point must exist");
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("worker thread panicked");
+    }
+}

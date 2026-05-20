@@ -7,21 +7,26 @@
 //! filesystem path.
 //!
 //! Loading flow:
-//! 1. First call to [`ShaderLibrary::load`] materialises the embedded bytes
-//!    into a per-process temp file (Metal's public Rust bindings on
-//!    `objc2-metal` 0.2 expose `newLibraryWithURL:error:` but not the
-//!    `dispatch_data_t`-based `newLibraryWithData:error:`; writing to disk
-//!    once at startup is acceptable because library load happens at most
-//!    once per process via [`shared_library`]).
+//! 1. The first call to [`ShaderLibrary::load`] in this process materialises
+//!    the embedded bytes to a per-PID temp file via a `OnceLock`, so the
+//!    write+load sequence is serialised even when several threads race to
+//!    construct libraries concurrently (e.g. parallel `cargo test`). Metal's
+//!    public Rust bindings on `objc2-metal` 0.2 expose
+//!    `newLibraryWithURL:error:` but not the `dispatch_data_t`-based
+//!    `newLibraryWithData:error:`, so a brief on-disk hop is required.
 //! 2. We construct an `NSURL` for that path and call
-//!    `device.raw().newLibraryWithURL_error_(url)`.
+//!    `device.raw().newLibraryWithURL_error_(url)`. `newLibraryWithURL:` reads
+//!    the metallib eagerly, so the file is no longer needed once the call
+//!    returns; the first successful loader removes it. Subsequent loaders see
+//!    the cached path from the `OnceLock` and skip both the write and the
+//!    delete.
 //! 3. Compute pipeline states are looked up lazily by entry point and
 //!    cached in a `Mutex<HashMap<…>>` so repeated `pipeline()` calls are
 //!    cheap.
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use objc2::rc::Retained;
@@ -78,8 +83,16 @@ impl ShaderLibrary {
     /// memoises the result for the process. `load` is exposed primarily so
     /// tests can construct a library against an arbitrary device.
     pub fn load(device: &MetalDevice) -> Result<Self, ShaderError> {
-        let metallib_path = write_metallib_to_temp()?;
-        let library = load_library_at_path(device, &metallib_path)?;
+        let metallib_path = materialize_metallib_once()?;
+        let library = load_library_at_path(device, metallib_path)?;
+        // The metallib has been read into `MTLLibrary` in-memory and the
+        // on-disk file is no longer needed. Removing it eagerly keeps
+        // `$TMPDIR` tidy across dev cycles. The remove is best-effort: a
+        // sibling thread that won the `OnceLock` race may have already
+        // unlinked it (or a previous `load` call did so), which is fine.
+        // Any other error here is non-fatal — the library load already
+        // succeeded — so we swallow it.
+        let _ = std::fs::remove_file(metallib_path);
         Ok(Self {
             library,
             psos: Mutex::new(HashMap::new()),
@@ -133,23 +146,39 @@ pub fn shared_library(device: &MetalDevice) -> Result<&'static ShaderLibrary, Sh
         .map_err(|msg| ShaderError::LibraryLoad(msg.clone()))
 }
 
-/// Write the embedded metallib bytes to a stable per-process temp path.
+/// Materialise the embedded metallib bytes to a per-PID temp path exactly
+/// once per process.
 ///
-/// Uses the PID to keep the path unique to this process; we overwrite the
-/// file on every call so concurrent tests in the same process simply race
-/// to write the same bytes. The metallib is small (well under 1 MiB even
-/// in worst case) so the write cost is negligible.
-fn write_metallib_to_temp() -> Result<PathBuf, ShaderError> {
-    let mut path = std::env::temp_dir();
-    path.push(format!("polars_metal_{}.metallib", std::process::id()));
+/// A `OnceLock` serialises the write+load sequence so concurrent callers
+/// (e.g. parallel `cargo test` workers in the same binary) cannot observe a
+/// half-written file. The first thread performs the write; later threads
+/// see the cached path (or the cached error) and skip the I/O entirely.
+///
+/// The outcome is stored as `Result<PathBuf, String>` rather than
+/// `Result<PathBuf, ShaderError>` because `ShaderError` is not `Clone` and
+/// callers need a fresh `Err` on every retrieval. The string is re-wrapped
+/// in `ShaderError::TempFile` here so the public surface is unchanged.
+fn materialize_metallib_once() -> Result<&'static Path, ShaderError> {
+    static TEMP_METALLIB: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
-    let mut file = std::fs::File::create(&path)
-        .map_err(|e| ShaderError::TempFile(format!("create({}): {e}", path.display())))?;
-    file.write_all(METALLIB_BYTES)
-        .map_err(|e| ShaderError::TempFile(format!("write({}): {e}", path.display())))?;
-    file.sync_all()
-        .map_err(|e| ShaderError::TempFile(format!("sync({}): {e}", path.display())))?;
-    Ok(path)
+    let outcome = TEMP_METALLIB.get_or_init(|| {
+        let mut path = std::env::temp_dir();
+        path.push(format!("polars_metal_{}.metallib", std::process::id()));
+
+        let mut file =
+            std::fs::File::create(&path).map_err(|e| format!("create({}): {e}", path.display()))?;
+        file.write_all(METALLIB_BYTES)
+            .map_err(|e| format!("write({}): {e}", path.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("sync({}): {e}", path.display()))?;
+        drop(file);
+        Ok(path)
+    });
+
+    match outcome {
+        Ok(path) => Ok(path.as_path()),
+        Err(msg) => Err(ShaderError::TempFile(msg.clone())),
+    }
 }
 
 /// Load a metallib from a filesystem path via `MTLDevice newLibraryWithURL`.
