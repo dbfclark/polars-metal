@@ -19,7 +19,7 @@ use arrow_buffer::Buffer as ArrowBuffer;
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLDevice as _, MTLResourceOptions};
+use objc2_metal::{MTLBuffer, MTLDevice as _, MTLResource as _, MTLResourceOptions};
 
 use crate::{is_page_aligned, BufferError, MetalDevice};
 
@@ -34,6 +34,10 @@ pub struct MetalBuffer {
     /// Keeps the source `ArrowBuffer` alive when we took the zero-copy path.
     /// `None` on the copy path (Metal owns its own allocation).
     _owner: Option<Arc<ArrowBuffer>>,
+    /// Keeps a parent `MetalBuffer` alive when this buffer is a view into a
+    /// larger arena-allocated buffer (see [`MetalBuffer::view_into`]). `None`
+    /// when this buffer owns its bytes outright.
+    _view_parent: Option<Arc<MetalBuffer>>,
 }
 
 // MTLBuffer is backed by shared memory and is used from a single thread
@@ -109,6 +113,7 @@ impl MetalBuffer {
         Ok(Self {
             inner,
             _owner: Some(arrow),
+            _view_parent: None,
         })
     }
 
@@ -137,6 +142,7 @@ impl MetalBuffer {
         Ok(Self {
             inner,
             _owner: None,
+            _view_parent: None,
         })
     }
 
@@ -160,6 +166,7 @@ impl MetalBuffer {
         Self {
             inner,
             _owner: None,
+            _view_parent: None,
         }
     }
 
@@ -173,6 +180,110 @@ impl MetalBuffer {
     /// `// SAFETY:` comment.
     pub fn raw(&self) -> &Retained<ProtocolObject<dyn MTLBuffer>> {
         &self.inner
+    }
+
+    /// Construct a view onto a sub-range of an existing `MetalBuffer`'s
+    /// contents.
+    ///
+    /// The view is realized as a *new* `MTLBuffer` produced via
+    /// `newBufferWithBytesNoCopy:length:options:deallocator:` over the
+    /// parent's shared-memory mapping at `parent_ptr + offset`, with length
+    /// `len`. The returned buffer therefore has its own MTLBuffer identity
+    /// (so dispatches see a buffer of exactly `len` bytes starting at the
+    /// view's base) while still sharing storage with the parent.
+    ///
+    /// The deallocator block captures a clone of `parent` so the parent
+    /// (and transitively any `_owner` / `_view_parent` keep-alives it
+    /// holds) outlives the view. The returned `MetalBuffer` also stashes
+    /// the same `Arc<MetalBuffer>` in `_view_parent` to make the lifetime
+    /// dependency explicit on the Rust side.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferError::AllocationFailed`] if `offset + len` overflows
+    /// or exceeds `parent.len()`, if `len == 0` (Metal rejects zero-byte
+    /// buffers), or if Metal otherwise refuses the no-copy allocation.
+    ///
+    /// # Safety
+    ///
+    /// - `offset + len` must be `<= parent.len()`. The function bounds-checks
+    ///   this before calling into Metal; the `unsafe` is for documenting that
+    ///   the caller is responsible for *semantic* aliasing: the view shares
+    ///   bytes with the parent and any other outstanding views on the same
+    ///   parent, so concurrent CPU/GPU writes that overlap are the caller's
+    ///   problem.
+    /// - The parent's MTLBuffer must outlive the view; this is enforced by
+    ///   the `Arc<MetalBuffer>` captured in the deallocator block and the
+    ///   `_view_parent` field.
+    /// - The view must not be used concurrently with a GPU command in flight
+    ///   that writes to the same byte range — standard MTLBuffer rule.
+    pub unsafe fn view_into(
+        parent: &Arc<MetalBuffer>,
+        offset: usize,
+        len: usize,
+    ) -> Result<MetalBuffer, BufferError> {
+        // Bounds check before any unsafe work. Reject zero-length views up
+        // front (Metal rejects zero-byte buffers).
+        if len == 0 {
+            return Err(BufferError::AllocationFailed { bytes: 0 });
+        }
+        let end = offset
+            .checked_add(len)
+            .ok_or(BufferError::AllocationFailed { bytes: len })?;
+        if end > parent.len() {
+            return Err(BufferError::AllocationFailed { bytes: len });
+        }
+
+        // Compute the start address inside the parent's shared-memory mapping.
+        // `parent.inner.contents()` returns NonNull<c_void> for the entire
+        // parent's backing store; the view sits at `+offset` into it.
+        let base = parent.inner.contents().as_ptr() as *mut u8;
+        // SAFETY: `offset` is `<= parent.len()` (bounds-checked above), so the
+        // resulting pointer is within the parent's allocation (one past the
+        // end is allowed for pointer arithmetic; we further restrict to
+        // `offset + len <= parent.len()` so `len` bytes from this pointer are
+        // valid).
+        let view_ptr = unsafe { base.add(offset) } as *mut std::ffi::c_void;
+        let view_ptr =
+            NonNull::new(view_ptr).ok_or(BufferError::AllocationFailed { bytes: len })?;
+
+        // Capture an Arc<MetalBuffer> clone in the deallocator block so the
+        // parent (and its owners) survive until Metal releases the view.
+        let parent_for_dealloc = parent.clone();
+        let deallocator: RcBlock<dyn Fn(NonNull<std::ffi::c_void>, usize)> =
+            RcBlock::new(move |_ptr, _len| {
+                // Reference the captured Arc so the compiler cannot drop it
+                // before block release. The actual `Arc::drop` runs when the
+                // block itself is dropped by Metal.
+                let _keep_alive = &parent_for_dealloc;
+            });
+
+        // The view inherits the parent's device; query it via MTLResource.
+        let device = parent.inner.device();
+
+        // SAFETY:
+        // - `view_ptr` is valid for `len` bytes (bounds-checked above) and the
+        //   parent's `Arc<MetalBuffer>` in `_view_parent`/deallocator keeps the
+        //   memory alive.
+        // - The parent was allocated `StorageModeShared`; the no-copy options
+        //   here match. We do not change storage modes mid-allocation.
+        // - Metal only accesses the buffer via GPU commands submitted later;
+        //   no concurrent access is happening at construction time.
+        let inner = unsafe {
+            device.newBufferWithBytesNoCopy_length_options_deallocator(
+                view_ptr,
+                len,
+                MTLResourceOptions::MTLResourceStorageModeShared,
+                Some(&deallocator),
+            )
+        }
+        .ok_or(BufferError::AllocationFailed { bytes: len })?;
+
+        Ok(Self {
+            inner,
+            _owner: None,
+            _view_parent: Some(parent.clone()),
+        })
     }
 
     /// View the buffer's contents as a byte slice.

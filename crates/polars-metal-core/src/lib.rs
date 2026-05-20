@@ -9,7 +9,7 @@
 mod arena;
 mod error;
 
-pub use arena::{ScratchArena, StubArena};
+pub use arena::{BumpArena, ScratchArena, StubArena};
 pub use error::EngineError;
 
 use polars_metal_buffer::MetalDevice;
