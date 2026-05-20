@@ -22,8 +22,7 @@ test-conformance:
 	@false
 
 test-diff:
-	@echo "test-diff target lands in Task 30"
-	@false
+	pytest tests/diff
 
 bench:
 	@echo "bench target lands in Task 32"
