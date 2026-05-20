@@ -38,6 +38,16 @@ We committed to `cxx` for M0 based on a weak prior. If friction emerges before M
 
 **M1 friction observation (T5, 2026-05-20):** the `cxx::CxxVector` push-in / iter-copy-out pattern forces a per-element copy across the FFI boundary for every binding (`add_f32`, `cumsum_u8_to_u32`). At M1 sizes this is invisible; at M2's groupby/join scale (10M+ rows, multi-column) the u32-per-row copy on cumsum alone will dominate. The fix is direct MLX-over-`MTLBuffer` wiring — construct `mlx::core::array` views over our already-allocated `MTLBuffer` and read the result back in place rather than via `std::vector`. This rules in favor of either (a) extending `cxx` with raw-pointer-plus-len shims, or (b) the hand-written C shim + `bindgen` route mentioned above. Decide at M2 design.
 
+## Walker / UDF integration with Polars internals (M1, T7 2026-05-20)
+
+Three friction points discovered while building the IR walker in Task 7. Each will affect every later task that touches the walker or the UDF path, so they live here rather than buried in T7's commit body.
+
+1. **UDF re-entry via `df.select`.** `pl.DataFrame.select` internally calls `lazy().collect()`. When `MetalEngine` is installed, our patched `LazyFrame.collect` intercepts that re-entrant call and dispatches *back* through the walker — infinite recursion. T7 mitigates by using `pl.DataFrame._from_pydf(df._df.select(list(names)))` (the underlying PyDataFrame's sync `select`, no LazyFrame round-trip). **Task 8's Rust dispatch will hit the same trap** the moment it constructs a result DataFrame from kernel outputs; any reassembly path that uses `df.select`/`df.with_columns` triggers re-entry. *Owner:* M1 (T8 onward — always use PyDataFrame internals when assembling UDF outputs).
+
+2. **Polars NodeTraverser version handshake.** T7 identifies IR nodes by `type(node).__name__` because the PyO3-generated IR classes in py-1.40.1 live in the unnamed `builtins` module. This is the canonical Polars-Python idiom for one pinned rev. cuDF-Polars guards against silent breakage on Polars version drift by asserting `(version := nt.version()) < (12, 1)` at walk entry. We don't have an equivalent guard. Adding one before any Polars rev bump (current pin: `py-1.40.1`) prevents silently wrong behavior when an IR class is renamed. *Owner:* M1 (T8 or first conformance regression on a rev bump).
+
+3. **`DataFrameScan.selection` predicate pushdown triggers M1 fallback.** Polars' optimizer can push a Filter predicate onto a DataFrameScan as a `.selection` attribute, eliminating the explicit Filter node. The walker currently rejects any DataFrameScan with a non-None `selection` (because we'd need to evaluate that predicate via the same kernels Filter uses). Once Phase 5+ Filter lands, the walker should lift these to GPU instead — otherwise many CSE-optimized queries fall back unnecessarily even when they're entirely within the M1 supported set. *Owner:* M1 (Phase 5+, T15+).
+
 ## MLX install path
 
 Resolved in T19: git submodule under `vendor/mlx`, pinned to v0.22.0, built via cmake. *Owner:* M0 (resolved). Refresh via standalone cmake invocation, not via `scripts/refresh-references.sh` (which is for read-only references, not build deps).
