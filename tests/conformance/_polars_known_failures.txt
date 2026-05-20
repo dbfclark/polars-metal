@@ -1,0 +1,21 @@
+# Known failures from `pytest references/polars/py-polars/tests/unit/lazyframe/`
+# that already fail on pure Polars (no polars_metal patch). They are
+# version-skew failures: tests written for newer Polars features or missing
+# optional deps not in the dev env.
+#
+# Re-capture with:
+#   cd references/polars/py-polars && \
+#     python3 -m pytest tests/unit/lazyframe/ --ignore=tests/unit/lazyframe/cuda/ \
+#       --no-header -q --tb=no 2>&1 \
+#       | grep '^FAILED' | sed 's/^FAILED //; s/ - .*//' | sort > \
+#       ../../../tests/conformance/_polars_known_failures.txt
+#   # then re-prepend this comment block
+#
+# When bumping the polars version, refresh this file. The conformance test
+# asserts (actual_failures - known_failures) is empty.
+#
+# Currently empty: with pyproject.toml's polars==1.40.1 pinned exactly and
+# references/polars submodule at the matching py-1.40.1 tag, AND with
+# cloudpickle installed (it's in [project.optional-dependencies].dev), the
+# Polars lazyframe suite shows 721 passed / 0 failed / 1 skipped under
+# engine=MetalEngine(). No known failures to suppress.

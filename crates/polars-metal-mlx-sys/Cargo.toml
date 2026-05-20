@@ -1,0 +1,25 @@
+# crates/polars-metal-mlx-sys/Cargo.toml
+[package]
+name = "polars-metal-mlx-sys"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+cxx = "1"
+thiserror = "1"
+
+[build-dependencies]
+cxx-build = "1"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true
