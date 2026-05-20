@@ -25,7 +25,8 @@ test-diff:
 	pytest tests/diff
 
 bench:
-	@echo "bench target lands in Task 32"
+	cargo bench --workspace
+	pytest tests/bench --benchmark-only
 
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
