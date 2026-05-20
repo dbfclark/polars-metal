@@ -86,8 +86,22 @@ def _patch_gpu_engine_callback() -> None:
     def collect_wrapper(self: Any, *, engine: Any = "auto", **kwargs: Any) -> Any:
         if isinstance(engine, MetalEngine):
             cb = partial(execute_with_metal, config=engine)
+            # If the caller already passed a post_opt_callback (Polars'
+            # internal hook), chain ours before theirs so both run on the
+            # same NodeTraverser. In M0 our callback never modifies the
+            # plan (it walks-and-falls-back), so theirs sees the same
+            # state Polars would have given them.
+            existing_cb = kwargs.pop("post_opt_callback", None)
+            if existing_cb is not None:
+                ours = cb
+
+                def chained(nt: Any, *args: Any, **kw: Any) -> Any:
+                    ours(nt, *args, **kw)
+                    return existing_cb(nt, *args, **kw)
+
+                cb = chained
             # post_opt_callback is an internal bypass that injects a callback
-            # directly, skipping _gpu_engine_callback.  We run the query on
+            # directly, skipping _gpu_engine_callback. We run the query on
             # the CPU engine; in M0 our callback falls through, so the result
             # is identical to plain engine="cpu".
             return original_collect(self, engine="cpu", post_opt_callback=cb, **kwargs)

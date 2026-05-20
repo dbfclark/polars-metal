@@ -8,7 +8,11 @@ version = "0.0.0"
 description = "Metal-backed execution engine for Polars on Apple Silicon"
 requires-python = ">=3.10"
 dependencies = [
-    "polars>=1.18,<2.0",
+    # Pinned exactly. Our monkey-patch is sensitive to Polars internals
+    # (LazyFrame.collect signature, _gpu_engine_callback shape, post_opt_callback
+    # behavior); bumping requires re-validation. The references/polars submodule
+    # is pinned to the matching py-1.40.1 tag — keep them aligned.
+    "polars==1.40.1",
 ]
 
 [project.optional-dependencies]
@@ -17,6 +21,10 @@ dev = [
     "pytest-benchmark>=4",
     "hypothesis>=6",
     "ruff>=0.6",
+    # pyarrow + cloudpickle are needed by Polars' own test suite when we run
+    # it through the conformance harness (tests/conformance/test_polars_suite.py).
+    "pyarrow>=18",
+    "cloudpickle>=3",
 ]
 
 [tool.maturin]

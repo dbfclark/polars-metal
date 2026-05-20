@@ -17,7 +17,7 @@ POLARS_REPO="https://github.com/pola-rs/polars.git"
 # Pinned commits. Update at milestone boundaries; cuDF when porting a new
 # kernel family, Polars whenever Cargo.toml's polars rev is bumped.
 CUDF_REF="f57751a743ccf6a1b693375eb089a5cf08723bef"  # main as of 2026-05-19
-POLARS_REF="9d8a77e9569779550405fd6ce7fecefcf58f5ca4"  # main as of 2026-05-19
+POLARS_REF="344a0ea39753771f893144939f2b70c3144f8ebf"  # py-1.40.1 tag, matches pyproject.toml's pin
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REFS_DIR="$REPO_ROOT/references"

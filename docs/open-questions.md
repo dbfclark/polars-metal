@@ -48,9 +48,11 @@ Resolved in T19: git submodule under `vendor/mlx`, pinned to v0.22.0, built via 
 
 Initially missing on the dev host: T19's MLX build had to use `-DMLX_BUILD_METAL=OFF` because the Metal shader compiler couldn't be invoked. Root cause was a stale x86_64 `CoreSimulator.framework` under `/Library/Developer/PrivateFrameworks/` blocking Xcode's plugin loading. Resolved 2026-05-20 by running `sudo xcodebuild -runFirstLaunch`, then `xcodebuild -downloadComponent MetalToolchain`. MLX rebuilt with `-DMLX_BUILD_METAL=ON`; `build.rs` now links `Metal`, `Foundation`, `QuartzCore`, `Accelerate` frameworks. *Owner:* M0 (resolved).
 
-## M0 retrospective (2026-05-20)
+## M0 retrospective (2026-05-20, updated with conformance findings)
 
 **Outcome.** `make gate` passes end-to-end on M2 Ultra in ~6s wall-clock. 30 Python tests + 20 Rust unit/proptest tests across the workspace, all green. `df.collect(engine=polars_metal.MetalEngine())` returns CPU-equivalent results on select/filter/group_by/join/sort/with_columns.
+
+**Conformance against Polars' own test suite.** A post-review investigation revealed M0 conformance is stronger than the original retrospective implied. `tests/conformance/test_polars_suite.py` now runs Polars' own `tests/unit/lazyframe/` (~722 tests) with `engine=MetalEngine()` forced via `polars_metal._pytest_plugin`. With the Polars wheel pinned exactly to 1.40.1, the references/polars submodule at the matching `py-1.40.1` tag, and `cloudpickle` in dev deps, the suite shows **721 passed / 0 failed / 1 skipped** under our engine. Same numbers as pure Polars baseline — our engine adds zero new failures. The 31 "failures" reported in earlier sessions were entirely version skew (tests for newer-Polars features absent in 1.40.1) plus missing optional deps; they fail in pure CPU runs too. The one real patch-induced bug — a `post_opt_callback` collision in `tests/unit/lazyframe/cuda/test_node_visitor.py` — was fixed by chaining caller-provided callbacks ahead of ours in `python/polars_metal/__init__.py`.
 
 **Surprises during execution (vs. the plan):**
 
@@ -65,3 +67,4 @@ Initially missing on the dev host: T19's MLX build had to use `-DMLX_BUILD_METAL
 - Add a signature assertion test for the `LazyFrame.collect` patch site (open question above).
 - The portability gate (small M2, M1) is still a manual run-on-your-other-machine step. Document the procedure in `docs/` if we want subsequent milestones to enforce it more uniformly.
 - The `pyo3 0.22` macro emits `useless_conversion` clippy warnings in `polars-metal-core`; suppressed file-scoped with `#![allow(clippy::useless_conversion)]`. Revisit when pyo3 is upgraded.
+- MLX GPU dispatch isn't separately validated. The proptest in `polars-metal-mlx-sys` covers small f32 arrays (0–256 elements); at those sizes MLX likely stays on CPU/Accelerate even though Metal is linked. Add a larger-array benchmark with `MTL_DEBUG_LAYER=1` or instrumented dispatch counter to confirm Metal gets used before M1 ships its first GPU kernel.
