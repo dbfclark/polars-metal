@@ -15,15 +15,20 @@ fn main() {
         .flag_if_supported("-std=c++17")
         .compile("polars_metal_mlx_bridge");
 
-    // Point the linker at the MLX build output.
-    // Built with -DMLX_BUILD_METAL=OFF (Metal toolchain absent on this host);
-    // produces libmlx.a (static). Switch back to dylib once Metal toolchain
-    // is available and MLX is rebuilt with -DMLX_BUILD_METAL=ON.
+    // Point the linker at the MLX build output. libmlx.a is the static
+    // archive produced by `cmake -DMLX_BUILD_METAL=ON` under vendor/mlx/build.
     println!("cargo:rustc-link-search=native={}", mlx_build.display());
     println!("cargo:rustc-link-lib=static=mlx");
 
-    // MLX (CPU backend) depends on Accelerate.
+    // Frameworks MLX requires (per vendor/mlx/CMakeLists.txt):
+    //  Accelerate — CPU/BLAS backend
+    //  Metal      — GPU dispatch (when MLX_BUILD_METAL=ON)
+    //  Foundation — NSString, NSData, basic Cocoa types used by metal-cpp
+    //  QuartzCore — CAMetalLayer and friends, transitively required by Metal
     println!("cargo:rustc-link-lib=framework=Accelerate");
+    println!("cargo:rustc-link-lib=framework=Metal");
+    println!("cargo:rustc-link-lib=framework=Foundation");
+    println!("cargo:rustc-link-lib=framework=QuartzCore");
 
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=cxx/mlx_bridge.h");
