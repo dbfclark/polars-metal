@@ -43,3 +43,21 @@ Resolved in T19: git submodule under `vendor/mlx`, pinned to v0.22.0, built via 
 ## Metal toolchain (resolved)
 
 Initially missing on the dev host: T19's MLX build had to use `-DMLX_BUILD_METAL=OFF` because the Metal shader compiler couldn't be invoked. Root cause was a stale x86_64 `CoreSimulator.framework` under `/Library/Developer/PrivateFrameworks/` blocking Xcode's plugin loading. Resolved 2026-05-20 by running `sudo xcodebuild -runFirstLaunch`, then `xcodebuild -downloadComponent MetalToolchain`. MLX rebuilt with `-DMLX_BUILD_METAL=ON`; `build.rs` now links `Metal`, `Foundation`, `QuartzCore`, `Accelerate` frameworks. *Owner:* M0 (resolved).
+
+## M0 retrospective (2026-05-20)
+
+**Outcome.** `make gate` passes end-to-end on M2 Ultra in ~6s wall-clock. 30 Python tests + 20 Rust unit/proptest tests across the workspace, all green. `df.collect(engine=polars_metal.MetalEngine())` returns CPU-equivalent results on select/filter/group_by/join/sort/with_columns.
+
+**Surprises during execution (vs. the plan):**
+
+- **Rust 1.81 was too old.** Proptest 1.x pulls `getrandom 0.4.2`, which needs the `edition2024` Cargo feature, stable starting Rust 1.85. Toolchain bumped to 1.85.0.
+- **objc2-metal API rough edges.** Plan's snippets needed several adjustments — `ProtocolObject` lives in `objc2::runtime`, `MTLCreateSystemDefaultDevice` returns a raw pointer, `MTLResourceOptions::MTLResourceStorageModeShared` is the actual constant name, and the deallocator block requires `block2::RcBlock::new` from the `block2 = "0.5"` crate (not `objc2::block`).
+- **MLX C++ API rough edges.** `eval` is in `transforms.h` (not `utils.h`); MLX `Shape` is `std::vector<int32_t>` (not int64). For cxx return-type interop, the C++ side returns `std::unique_ptr<std::vector<float>>`.
+- **Metal toolchain was missing.** Initially blocked GPU build; resolved by `sudo xcodebuild -runFirstLaunch` + `xcodebuild -downloadComponent MetalToolchain`. See dedicated entry above.
+- **The monkey-patch needed two sites, not one.** Polars 1.40+ routes `engine=` straight to Rust's `ldf.collect()`. The Python-side `_gpu_engine_callback` wrap is insufficient on its own; we also patch `LazyFrame.collect` and inject our callback via `post_opt_callback`. See dedicated entry above.
+
+**To revisit at M1:**
+
+- Add a signature assertion test for the `LazyFrame.collect` patch site (open question above).
+- The portability gate (small M2, M1) is still a manual run-on-your-other-machine step. Document the procedure in `docs/` if we want subsequent milestones to enforce it more uniformly.
+- The `pyo3 0.22` macro emits `useless_conversion` clippy warnings in `polars-metal-core`; suppressed file-scoped with `#![allow(clippy::useless_conversion)]`. Revisit when pyo3 is upgraded.
