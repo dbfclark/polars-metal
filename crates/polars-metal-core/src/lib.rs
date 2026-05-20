@@ -42,6 +42,7 @@ fn engine_err(e: EngineError) -> PyErr {
 }
 
 #[pymodule]
+#[pyo3(name = "_native")]
 fn polars_metal_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version_string, m)?)?;
     m.add_function(wrap_pyfunction!(device_name, m)?)?;

@@ -8,8 +8,7 @@ build:
 	cargo build --workspace --release
 
 wheel:
-	@echo "wheel target lands in Task 25"
-	@false
+	VIRTUAL_ENV=$$(python3 -c "import sys; print(sys.prefix)") maturin develop --release
 
 test-unit:
 	cargo test --workspace

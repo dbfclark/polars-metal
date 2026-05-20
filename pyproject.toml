@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "polars-metal"
+version = "0.0.0"
+description = "Metal-backed execution engine for Polars on Apple Silicon"
+requires-python = ">=3.10"
+dependencies = [
+    "polars>=1.18,<2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-benchmark>=4",
+    "hypothesis>=6",
+    "ruff>=0.6",
+]
+
+[tool.maturin]
+module-name = "polars_metal._native"
+python-source = "python"
+manifest-path = "crates/polars-metal-core/Cargo.toml"
+features = ["polars-metal-core/extension-module"]
