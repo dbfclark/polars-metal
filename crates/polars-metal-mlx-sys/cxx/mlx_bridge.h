@@ -17,4 +17,12 @@ int64_t add_one(int64_t x);
 std::unique_ptr<std::vector<float>> add_f32(
     const std::vector<float>& a, const std::vector<float>& b);
 
+// Same elementwise add as add_f32, but explicitly forces execution on the
+// Metal GPU device via StreamContext RAII. If Metal is unavailable on this
+// host (e.g. libmlx.a built without -DMLX_BUILD_METAL=ON), this throws
+// std::invalid_argument so the caller learns loudly rather than silently
+// falling back to CPU.
+std::unique_ptr<std::vector<float>> add_f32_on_gpu(
+    const std::vector<float>& a, const std::vector<float>& b);
+
 }  // namespace polars_metal_mlx
