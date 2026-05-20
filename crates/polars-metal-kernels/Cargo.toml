@@ -28,5 +28,8 @@ objc2-foundation = { version = "0.2", features = ["NSURL", "NSString", "NSError"
 polars-metal-buffer = { path = "../polars-metal-buffer" }
 thiserror = "1"
 
+[dev-dependencies]
+proptest = "1"
+
 [lints]
 workspace = true

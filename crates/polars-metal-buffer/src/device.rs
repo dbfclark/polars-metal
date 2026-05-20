@@ -86,6 +86,50 @@ impl MetalDevice {
         Ok(MetalBuffer::from_metal_owned(inner))
     }
 
+    /// Allocate a new shared-storage `MTLBuffer` and copy `bytes` into it.
+    ///
+    /// Mirrors [`new_buffer_zeroed`](Self::new_buffer_zeroed) but seeds the
+    /// freshly allocated buffer with caller-supplied contents in a single
+    /// `newBufferWithBytes:length:options:` call. Storage mode is
+    /// `MTLResourceStorageModeShared`, so on Apple Silicon the buffer lives
+    /// in unified memory and is directly CPU-addressable after construction.
+    ///
+    /// This is the standard kernel-input constructor: callers stage a
+    /// `Vec<u8>` (or any `&[u8]`) of predicate / validity / scalar bytes and
+    /// hand it off without a separate allocate-then-copy sequence.
+    ///
+    /// Returns `BufferError::AllocationFailed { bytes: 0 }` when `bytes` is
+    /// empty (Metal rejects zero-byte allocations) or `AllocationFailed
+    /// { bytes }` when Metal otherwise refuses to allocate.
+    pub fn new_buffer_from_bytes(&self, bytes: &[u8]) -> Result<MetalBuffer, BufferError> {
+        let len = bytes.len();
+        if len == 0 {
+            return Err(BufferError::AllocationFailed { bytes: 0 });
+        }
+        let ptr = std::ptr::NonNull::new(bytes.as_ptr() as *mut std::ffi::c_void)
+            .ok_or(BufferError::AllocationFailed { bytes: len })?;
+
+        // SAFETY:
+        // - `ptr` is valid for `len` bytes for the duration of this call
+        //   (the input slice is alive for the call's stack frame and Metal
+        //   copies the bytes synchronously into its own allocation).
+        // - `newBufferWithBytes:length:options:` performs an internal copy
+        //   into the new MTLBuffer; we do not retain `bytes` past the call.
+        // - StorageModeShared matches the rest of the buffer-bridge
+        //   allocator; the resulting buffer is CPU- and GPU-addressable in
+        //   unified memory.
+        let inner = unsafe {
+            self.inner.newBufferWithBytes_length_options(
+                ptr,
+                len,
+                MTLResourceOptions::MTLResourceStorageModeShared,
+            )
+        }
+        .ok_or(BufferError::AllocationFailed { bytes: len })?;
+
+        Ok(MetalBuffer::from_metal_owned(inner))
+    }
+
     /// Raw borrow of the underlying `MTLDevice` protocol object.
     ///
     /// Exposed to sibling crates (`polars-metal-kernels`,
@@ -171,6 +215,29 @@ mod tests {
             }
         }
         assert_eq!(buf.as_slice(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn new_buffer_from_bytes_copies_input() {
+        let device =
+            MetalDevice::system_default().expect("Metal-capable hardware required for this test");
+        let payload: [u8; 6] = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
+        let buf = device
+            .new_buffer_from_bytes(&payload)
+            .expect("allocation succeeds");
+        assert_eq!(buf.len(), payload.len());
+        assert_eq!(buf.as_slice(), &payload);
+    }
+
+    #[test]
+    fn new_buffer_from_bytes_rejects_empty_input() {
+        let device =
+            MetalDevice::system_default().expect("Metal-capable hardware required for this test");
+        match device.new_buffer_from_bytes(&[]) {
+            Ok(_) => panic!("empty-input allocation must error"),
+            Err(BufferError::AllocationFailed { bytes: 0 }) => {}
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
     }
 
     #[test]

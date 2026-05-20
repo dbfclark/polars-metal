@@ -5,4 +5,5 @@
 //! (filter, comparison, logical) land in subsequent tasks.
 
 pub mod command;
+pub mod filter;
 pub mod shader_lib;
