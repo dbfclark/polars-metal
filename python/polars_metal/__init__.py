@@ -21,9 +21,9 @@ _EXPECTED_PARAMS = {"engine", "streaming", "background", "new_streaming", "_eage
 
 
 def _verify_patch_site() -> None:
-    """Assert the Polars callback we're about to patch has the signature we expect.
+    """Assert both Polars functions we're about to patch have the signatures we expect.
 
-    If Polars refactors and renames or reorders parameters, the assertion fires
+    If Polars refactors and renames or reorders parameters, the assertions fire
     with a clear message rather than us silently failing to intercept anything.
     """
     fn = getattr(_plf, "_gpu_engine_callback", None)
@@ -40,6 +40,35 @@ def _verify_patch_site() -> None:
             f"Expected params {_EXPECTED_PARAMS}, got {actual_params}. "
             f"Pin to a supported Polars rev or update the patch."
         )
+
+    # LazyFrame.collect patch site: we rely on `post_opt_callback` being
+    # accepted (it flows through Polars' internal **_kwargs catch-all, not
+    # as a named parameter). Probe at import time by calling collect on a
+    # trivial frame with a no-op callback. If Polars renames or removes the
+    # internal hook, this raises with a clear message rather than letting
+    # our patch silently fail in production.
+    collect_fn = getattr(_plf.LazyFrame, "collect", None)
+    if collect_fn is None:
+        raise RuntimeError(
+            "polars_metal: polars.lazyframe.frame.LazyFrame.collect is missing. "
+            "Polars version may be unsupported."
+        )
+    import polars as _pl_top  # local import; avoid circulars at module load
+
+    try:
+        _pl_top.LazyFrame({"_pm_probe": [1]}).collect(
+            engine="cpu",
+            post_opt_callback=lambda *_a, **_kw: None,
+        )
+    except TypeError as e:
+        if "post_opt_callback" in str(e):
+            raise RuntimeError(
+                "polars_metal: LazyFrame.collect no longer accepts `post_opt_callback`. "
+                "Our patch uses this internal hook to inject the engine callback; "
+                "without it the patch can't dispatch to MetalEngine. "
+                "Pin to a supported Polars rev or rework the patch shape."
+            ) from e
+        raise
 
 
 def _patch_gpu_engine_callback() -> None:
