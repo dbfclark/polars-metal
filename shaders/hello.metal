@@ -1,4 +1,4 @@
-// shaders/_hello.metal
+// shaders/hello.metal
 //
 // Hello-world kernel used solely to validate the metallib build/load pipeline.
 // One thread per grid position writes a known constant; tests can assert the

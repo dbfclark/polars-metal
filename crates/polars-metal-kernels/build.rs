@@ -8,9 +8,10 @@
 // Build pipeline: `xcrun metal -c` produces a `.air` per source file, then
 // `xcrun metallib` links the AIR files into a single `.metallib`.
 //
-// Note: Task 2 compiles every `.metal` file unconditionally. The
-// leading-underscore "header-only" convention is introduced in Task 9; until
-// then `_hello.metal` is a kernel source.
+// File-naming convention: any `.metal` file whose stem starts with `_` is a
+// header-only file — it is `#include`d by other kernels and is NOT compiled
+// into the metallib on its own. The `-I <shaders_dir>` flag passed to
+// `xcrun metal` makes those includes resolve.
 //
 // Build scripts use panics as their failure mechanism (there is no recovery
 // path; aborting the build with a diagnostic is the desired behaviour).
@@ -36,18 +37,30 @@ fn main() {
         .unwrap_or_else(|e| panic!("shaders dir {} unreadable: {e}", shaders_dir.display()));
 
     // Collect .metal sources deterministically so the resulting metallib is
-    // reproducible across builds.
+    // reproducible across builds. Files whose stem starts with `_` are
+    // header-only (included by other kernels via #include) and must not be
+    // fed to `xcrun metal -c` directly.
     let mut metal_sources: Vec<PathBuf> = read_dir
         .filter_map(|entry| {
             let path = entry.ok()?.path();
-            (path.extension().and_then(|s| s.to_str()) == Some("metal")).then_some(path)
+            if path.extension().and_then(|s| s.to_str()) != Some("metal") {
+                return None;
+            }
+            let stem = path.file_stem()?.to_string_lossy().to_string();
+            if stem.starts_with('_') {
+                // Header-only file; re-run on edits but do not compile.
+                println!("cargo:rerun-if-changed={}", path.display());
+                return None;
+            }
+            Some(path)
         })
         .collect();
     metal_sources.sort();
 
     assert!(
         !metal_sources.is_empty(),
-        "no .metal sources found under {}",
+        "no compilable .metal sources found under {} (header-only files \
+         starting with `_` do not count)",
         shaders_dir.display()
     );
 
@@ -65,7 +78,9 @@ fn main() {
         let air_path = out_dir.join(format!("{stem}.air"));
 
         let status = Command::new("xcrun")
-            .args(["metal", "-c", "-frecord-sources", "-o"])
+            .args(["metal", "-c", "-frecord-sources", "-I"])
+            .arg(&shaders_dir)
+            .arg("-o")
             .arg(&air_path)
             .arg(source)
             .status()
