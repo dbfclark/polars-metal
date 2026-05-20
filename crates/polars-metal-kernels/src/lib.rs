@@ -6,4 +6,5 @@
 
 pub mod command;
 pub mod filter;
+pub mod pipeline;
 pub mod shader_lib;
