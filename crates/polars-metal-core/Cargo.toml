@@ -1,0 +1,29 @@
+[package]
+name = "polars-metal-core"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "polars_metal_native"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[features]
+# Enable when building the cdylib (maturin does this automatically).
+# Omit during `cargo test` so the test binary links against libpython.
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+polars-metal-buffer = { path = "../polars-metal-buffer" }
+polars-metal-mlx-sys = { path = "../polars-metal-mlx-sys" }
+polars-metal-kernels = { path = "../polars-metal-kernels" }
+arrow-buffer = "53"
+pyo3 = { version = "0.22", features = ["abi3-py310"] }
+thiserror = "1"
+
+[lints]
+workspace = true

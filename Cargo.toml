@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/polars-metal-buffer",
+    "crates/polars-metal-core",
     "crates/polars-metal-kernels",
     "crates/polars-metal-mlx-sys",
 ]
