@@ -41,6 +41,14 @@
 // in real data; the host checks for this exact value post-dispatch.
 constant int64_t SCATTER_SENTINEL_I64 = (int64_t)0xDEADBEEFCAFEBABEll;
 
+// f64 variant sentinel: an explicit NaN payload. NaN itself is a valid
+// f64 value (the host bit-compares against this exact pattern to
+// disambiguate "user's NaN" from "kernel overrun"). Apple Silicon MSL
+// does not support `double` in compute kernels, so the f64 scatter
+// treats each 8-byte slot as an opaque `ulong` — the sentinel is
+// therefore declared as a `ulong` bit pattern alongside its i64 sibling.
+constant ulong SCATTER_SENTINEL_F64_BITS = 0x7FFDEADBEEFCAFE0ull;
+
 kernel void filter_scatter_i64(
     device const int64_t*  src_data         [[buffer(0)]],
     device const uint8_t*  src_valid        [[buffer(1)]],
@@ -66,6 +74,55 @@ kernel void filter_scatter_i64(
         return;
     }
 
+    dst_data[out_idx] = src_data[gid];
+    if (get_valid(src_valid, gid)) {
+        set_valid_atomic_or(dst_valid, out_idx);
+    }
+}
+
+// f64 scatter: byte-identical to `filter_scatter_i64` except that the
+// source/destination type is f64. We bind these buffers as `device
+// const ulong*` / `device ulong*` for two reasons:
+//
+//   1. Apple Silicon MSL compute kernels do not support `double`. Any
+//      use of `double` would fail to compile (or worse, silently coerce
+//      to `float` on older toolchains). Treating each slot as an opaque
+//      8-byte `ulong` sidesteps the issue entirely.
+//   2. The kernel performs no arithmetic on the values — it just copies
+//      8 bytes from one location to another and writes a sentinel on
+//      overrun. Bit-identical copy preserves NaN payloads, ±Inf, ±0.0,
+//      subnormals, and everything else f64 can represent.
+//
+// The Rust host (`dispatch_scatter_f64`) casts its `&[f64]` slices to
+// byte slices before constructing the MTLBuffers; the GPU side reads
+// those bytes as `ulong`. Reinterpretation is a no-op at the buffer
+// level — the same eight bytes either way.
+kernel void filter_scatter_f64(
+    device const ulong*    src_data         [[buffer(0)]],
+    device const uint8_t*  src_valid        [[buffer(1)]],
+    device const uint8_t*  keep             [[buffer(2)]],
+    device const uint32_t* prefix_sum       [[buffer(3)]],
+    device       ulong*    dst_data         [[buffer(4)]],
+    device       atomic_uint* dst_valid     [[buffer(5)]],
+    constant     uint32_t& n_rows           [[buffer(6)]],
+    constant     uint32_t& n_out            [[buffer(7)]],
+    uint                   gid              [[thread_position_in_grid]])
+{
+    if (gid >= n_rows) return;
+    if (keep[gid] == 0u) return;
+
+    uint32_t out_idx = prefix_sum[gid] - 1u;
+
+    if (out_idx >= n_out) {
+        // Same overrun protocol as the i64 variant, but the sentinel is
+        // a NaN bit pattern interpreted as `ulong` on the GPU and bit-
+        // compared on the host (`f64::to_bits() == SCATTER_SENTINEL_F64_BITS`).
+        dst_data[n_out] = SCATTER_SENTINEL_F64_BITS;
+        return;
+    }
+
+    // Bit-identical copy: the 8-byte `ulong` is whatever the host wrote
+    // in (f64, including NaN payloads).
     dst_data[out_idx] = src_data[gid];
     if (get_valid(src_valid, gid)) {
         set_valid_atomic_or(dst_valid, out_idx);

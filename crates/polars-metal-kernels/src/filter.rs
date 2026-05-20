@@ -26,6 +26,23 @@ use polars_metal_buffer::{BufferError, MetalDevice};
 /// in `shaders/filter_scatter.metal`.
 pub const SCATTER_SENTINEL_I64: i64 = 0xDEADBEEFCAFEBABE_u64 as i64;
 
+/// f64 scatter overrun sentinel, expressed as raw bits. We expose the
+/// `u64` bit pattern (rather than an `f64` constant) because Rust does
+/// not permit floating-point bit-pattern equality at the type level —
+/// `f64` does not implement `Eq`, and two NaN values are never `==` even
+/// if their bit patterns match. Callers compare via
+/// `dst_data[n_out].to_bits() == SCATTER_SENTINEL_F64_BITS`.
+///
+/// The bit pattern is a NaN (exponent bits 52-62 all 1, non-zero
+/// mantissa containing the recognisable `DEADBEEFCAFE` marker) so it is
+/// distinguishable from every finite value the kernel could legitimately
+/// copy. NaN itself is a valid f64 value, hence the bit-level (rather
+/// than `is_nan`) comparison: users may have their own NaN payloads in
+/// the data; only this exact pattern means "kernel overrun". Kept in
+/// sync with the MSL constant of the same name in
+/// `shaders/filter_scatter.metal`.
+pub const SCATTER_SENTINEL_F64_BITS: u64 = 0x7FFD_EADB_EEFC_AFE0_u64;
+
 /// Errors raised by the filter-compaction kernel dispatchers.
 #[derive(Debug, thiserror::Error)]
 pub enum FilterError {
@@ -334,6 +351,187 @@ pub fn dispatch_scatter_i64(
     dst_valid[..min_valid].copy_from_slice(valid_out);
 
     if dst_data[n_out] == SCATTER_SENTINEL_I64 {
+        return Err(FilterError::ScatterOverrun);
+    }
+
+    Ok(())
+}
+
+/// Dispatch `filter_scatter_f64` — pass 3 of the filter compaction
+/// pipeline, f64 variant.
+///
+/// Shape-isomorphic to [`dispatch_scatter_i64`]: same buffer layout,
+/// same kernel arguments, same overrun-sentinel protocol. The only
+/// differences are the source/destination element type (`f64` instead
+/// of `i64`) and the sentinel value (a NaN bit pattern instead of an
+/// integer constant).
+///
+/// Internally, the kernel binds `dst_data` / `src_data` as `device
+/// ulong*` (8-byte opaque chunks) rather than `device double*`. Apple
+/// Silicon MSL compute kernels do not support `double`, but the scatter
+/// performs no floating-point arithmetic — it just copies 8-byte slots
+/// — so the `ulong` reinterpretation is bit-identical to an f64 copy.
+/// NaN payloads, ±Inf, ±0.0, subnormals, and ordinary finites all
+/// round-trip exactly.
+///
+/// Caller contract: identical to [`dispatch_scatter_i64`]. See that
+/// function's doc-comment for the full enumeration of length / alignment
+/// requirements.
+///
+/// On overrun the host compares
+/// `dst_data[n_out].to_bits() == SCATTER_SENTINEL_F64_BITS`. The
+/// bit-level comparison is required because two NaN values are never
+/// `==` in IEEE 754, and we also need to distinguish the sentinel's
+/// exact bit pattern from any other NaN that may appear in user data.
+// 9 arguments mirror `dispatch_scatter_i64`; see that function for the
+// rationale for not packaging them into a struct.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_scatter_f64(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    src_data: &[f64],
+    src_valid: &[u8],
+    keep: &[u8],
+    prefix_sum: &[u32],
+    n_out: usize,
+    dst_data: &mut [f64],
+    dst_valid: &mut [u8],
+) -> Result<(), FilterError> {
+    let n_rows = src_data.len();
+    if keep.len() != n_rows {
+        return Err(FilterError::OutputLengthMismatch {
+            got: keep.len(),
+            expected: n_rows,
+        });
+    }
+    if prefix_sum.len() != n_rows {
+        return Err(FilterError::OutputLengthMismatch {
+            got: prefix_sum.len(),
+            expected: n_rows,
+        });
+    }
+    let expected_dst = n_out
+        .checked_add(1)
+        .ok_or(FilterError::RowCountOverflow { n_rows: n_out })?;
+    if dst_data.len() < expected_dst {
+        return Err(FilterError::DstDataTooSmall {
+            got: dst_data.len(),
+            expected: expected_dst,
+        });
+    }
+    let min_valid = dst_valid_min_bytes(n_out);
+    if dst_valid.len() < min_valid {
+        return Err(FilterError::DstValidTooSmall {
+            got: dst_valid.len(),
+            expected: min_valid,
+        });
+    }
+    let min_src_valid = (n_rows + 7) / 8;
+    if src_valid.len() < min_src_valid {
+        return Err(FilterError::InputLengthMismatch {
+            pred_bytes: src_valid.len(),
+            min_bytes: min_src_valid,
+            n_rows,
+        });
+    }
+    if n_rows == 0 {
+        return Ok(());
+    }
+
+    let n_rows_u32 = u32::try_from(n_rows).map_err(|_| FilterError::RowCountOverflow { n_rows })?;
+    let n_out_u32 =
+        u32::try_from(n_out).map_err(|_| FilterError::RowCountOverflow { n_rows: n_out })?;
+
+    let lib = shared_library(device)?;
+    let pso = lib.pipeline("filter_scatter_f64")?;
+
+    // Reinterpret typed slices as byte slices for the buffer
+    // constructors. `f64` has well-defined byte representations for
+    // every bit pattern (including NaN payloads, ±Inf, ±0.0,
+    // subnormals), so the host-side reinterpret is bit-identical with
+    // the `ulong` view the GPU takes. We avoid the bytemuck dep per the
+    // workspace "no new dependency without justification" rule.
+    //
+    // SAFETY: `src_data` is alive for the duration of this call; its
+    // pointer is non-null and the byte length `src_data.len() * 8` fits
+    // in usize on all supported targets (we just bounds-checked n_rows
+    // against u32::MAX above). `f64` has no invalid bit patterns, so
+    // reinterpreting as `[u8]` is sound. `new_buffer_from_bytes` copies
+    // the bytes into a freshly allocated MTLBuffer synchronously, so
+    // the slice does not need to live past the call.
+    let src_data_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            src_data.as_ptr() as *const u8,
+            std::mem::size_of_val(src_data),
+        )
+    };
+    // SAFETY: identical reasoning to `src_data_bytes`; `u32` has no
+    // invalid bit patterns.
+    let prefix_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            prefix_sum.as_ptr() as *const u8,
+            std::mem::size_of_val(prefix_sum),
+        )
+    };
+
+    let src_data_buf = device.new_buffer_from_bytes(src_data_bytes)?;
+    let src_valid_buf = device.new_buffer_from_bytes(&src_valid[..min_src_valid])?;
+    let keep_buf = device.new_buffer_from_bytes(keep)?;
+    let prefix_buf = device.new_buffer_from_bytes(prefix_bytes)?;
+
+    // `dst_data` is allocated as `n_out + 1` slots; the extra slot is
+    // the sentinel guard. `new_buffer_zeroed` zero-fills, so the
+    // sentinel starts at +0.0 (bit pattern 0) and only the kernel can
+    // write the SCATTER_SENTINEL_F64_BITS NaN to it.
+    let dst_data_buf = device.new_buffer_zeroed(expected_dst * std::mem::size_of::<f64>())?;
+    // `dst_valid` is zero-initialised by `new_buffer_zeroed`, satisfying
+    // the atomic-OR-only contract documented in `_validity.metal`.
+    let dst_valid_buf = device.new_buffer_zeroed(min_valid)?;
+
+    let n_rows_buf = device.new_buffer_from_bytes(&n_rows_u32.to_le_bytes())?;
+    let n_out_buf = device.new_buffer_from_bytes(&n_out_u32.to_le_bytes())?;
+
+    queue.dispatch_1d(
+        &pso,
+        &[
+            &src_data_buf,
+            &src_valid_buf,
+            &keep_buf,
+            &prefix_buf,
+            &dst_data_buf,
+            &dst_valid_buf,
+            &n_rows_buf,
+            &n_out_buf,
+        ],
+        n_rows,
+    )?;
+    queue.wait_until_complete()?;
+
+    // Copy outputs back. `dst_data` is `expected_dst = n_out + 1` slots
+    // (including the sentinel slot); we copy all of them so callers can
+    // inspect the sentinel if they wish, then re-verify it here.
+    let dst_data_bytes_out = &dst_data_buf.as_slice()[..expected_dst * std::mem::size_of::<f64>()];
+    // SAFETY: `dst_data_bytes_out` lives in the shared-memory MTLBuffer
+    // we just allocated; its length is exactly `expected_dst * 8`,
+    // which is `expected_dst` valid f64s. `f64` has no invalid bit
+    // patterns (every 64-bit value is some f64, including NaN with any
+    // payload, ±Inf, subnormals, etc.) and the source pointer is
+    // aligned because `MTLBuffer::contents()` is always aligned to at
+    // least 256 bytes on Apple Silicon (Metal resource alignment
+    // guarantee).
+    let dst_data_typed: &[f64] = unsafe {
+        std::slice::from_raw_parts(dst_data_bytes_out.as_ptr() as *const f64, expected_dst)
+    };
+    dst_data[..expected_dst].copy_from_slice(dst_data_typed);
+
+    let valid_out = &dst_valid_buf.as_slice()[..min_valid];
+    dst_valid[..min_valid].copy_from_slice(valid_out);
+
+    // Bit-level comparison: NaN != NaN under IEEE 754, so we cannot
+    // use `==` on the f64 directly. The exact bit pattern check also
+    // distinguishes the sentinel from any user-supplied NaN payload
+    // that may legitimately appear in `src_data`.
+    if dst_data[n_out].to_bits() == SCATTER_SENTINEL_F64_BITS {
         return Err(FilterError::ScatterOverrun);
     }
 
