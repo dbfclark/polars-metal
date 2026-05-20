@@ -34,13 +34,25 @@ IR-node shapes for the nodes we touch in Phase 4 (from
 - ``Select``: ``.input`` (int), ``.expr`` (list of PyExprIR), ``.should_broadcast``.
 - ``Filter``: ``.input`` (int), ``.predicate`` (PyExprIR). M1 Phase 5
   (Task 15) accepts predicates that resolve to a single ``Column`` whose
-  dtype is Boolean; everything else falls back.
+  dtype is Boolean. Phase 6 (Task 18) additionally accepts a
+  ``BinaryExpr`` whose op is one of ``Operator.{Eq,NotEq,Lt,LtEq,Gt,GtEq}``
+  and whose operands are each either a ``Column(I64|F64)`` or a
+  matching-dtype ``Literal``. Compound predicates (AND/OR) and arithmetic
+  inside the predicate land in later tasks.
 
 PyExprIR shape (from ``polars-python/src/lazyframe/visit.rs``): ``.node``
 (usize into the expression arena) and ``.output_name`` (str). To inspect
 the underlying expression class we call ``nt.view_expression(node_id)``;
 to resolve its dtype against the current IR root we call
 ``nt.get_dtype(node_id)``.
+
+Expression-node shapes used in Phase 6 (from
+``polars-python/src/lazyframe/visitor/expr_nodes.rs``):
+
+- ``Column``: ``.name`` (str).
+- ``Literal``: ``.value`` (Python int/float/bool) and ``.dtype`` (Polars dtype).
+- ``BinaryExpr``: ``.left`` (int node id), ``.op`` (``builtins.Operator``
+  enum — comparable via ``str(op) == "Operator.Gt"``), ``.right`` (int node id).
 
 Note: under default optimization, ``df.lazy().select([...])`` is collapsed
 into ``DataFrameScan.projection`` and no separate Projection node appears.
@@ -226,15 +238,22 @@ def _walk_select(nt: Any, node: Any) -> WalkResult:
 
 
 def _walk_filter(nt: Any, node: Any) -> WalkResult:
-    """Lower a Filter node iff its predicate is a single ``Column`` of Boolean dtype.
+    """Lower a Filter node iff its predicate is in the M1 closed set.
 
-    Phase 5 supports only the precomputed-mask shape:
-    ``df.filter(pl.col("mask"))``. Arithmetic / comparison / compound
-    predicates land in Phases 6+ (Tasks 16-20); for now they FallBack so
-    the CPU executor produces the correct result.
+    Accepted shapes:
+    - **Phase 5** — a single ``Column`` of Boolean dtype:
+      ``df.filter(pl.col("mask"))``.
+    - **Phase 6** — a ``BinaryExpr`` whose op is one of the six comparison
+      operators and whose operands are each a ``Column(I64|F64)`` or a
+      same-dtype ``Literal``: ``df.filter(pl.col("a") > 0)``,
+      ``df.filter(pl.col("x") < pl.col("y"))``, etc.
 
-    The plan we emit captures the predicate column name so the Rust UDF
-    can locate it in the upstream DataFrame at dispatch time.
+    Everything else (AND/OR — Task 20; arithmetic in the predicate — M2+;
+    casts, function calls, etc.) FallBacks so the CPU executor produces
+    the correct result.
+
+    The plan we emit serialises the predicate AST; the Rust UDF walks it
+    at dispatch time.
     """
     pred_expr_ir = getattr(node, "predicate", None)
     if pred_expr_ir is None:
@@ -244,39 +263,31 @@ def _walk_filter(nt: Any, node: Any) -> WalkResult:
     if pred_node_id is None:
         return FallBack(reason="Filter predicate has no .node id")
 
-    # IMPORTANT: dtype must be resolved against the *input* schema (the
+    # IMPORTANT: dtypes must be resolved against the *input* schema (the
     # Filter's child), not the post-Filter schema. The current node is
     # still the Filter itself here, and Polars' get_dtype uses
     # `self.root.schema()` which for a Filter is the input schema —
     # confirmed in polars-python's visit.rs:get_dtype implementation.
-    try:
-        inner_expr = nt.view_expression(pred_node_id)
-    except Exception as ex:
-        return FallBack(reason=f"could not view filter predicate expression: {ex!r}")
+    pred_dict = _walk_predicate(nt, pred_node_id)
+    if pred_dict is None:
+        return FallBack(reason="Filter predicate not in M1 closed set")
 
-    inner_cls = type(inner_expr).__name__
-    if inner_cls != "Column":
+    # Predicates must resolve to a Boolean column for `df.filter` to make
+    # sense. For a Column leaf this means the column itself is Bool; for
+    # a Compare it's implicit (every comparison produces a Bool). Reject
+    # bare-Column leaves of non-Bool dtype the way Phase 5 always has.
+    if pred_dict["kind"] == "Column" and pred_dict["dtype"] != "Bool":
         return FallBack(
-            reason=f"Filter predicate is {inner_cls}; Phase 5 supports only Column(bool)"
+            reason=f"Filter predicate is Column of dtype {pred_dict['dtype']}; M1 requires Boolean"
         )
-
-    pred_col_name = getattr(inner_expr, "name", None)
-    if pred_col_name is None:
-        return FallBack(reason="Column predicate missing .name")
-
-    # Resolve the column's dtype. Must be Boolean.
-    try:
-        pred_dtype = nt.get_dtype(pred_node_id)
-    except Exception as ex:
-        return FallBack(reason=f"could not resolve filter predicate dtype: {ex!r}")
-    if _map_dtype(pred_dtype) != "Bool":
-        return FallBack(
-            reason=f"Filter predicate dtype is {pred_dtype!s}; Phase 5 requires Boolean"
-        )
+    # A bare Literal at the filter root isn't meaningful as a predicate
+    # (Polars would broadcast it). Fall back to keep the closed set tight.
+    if pred_dict["kind"] in ("LiteralI64", "LiteralF64", "LiteralBool"):
+        return FallBack(reason="Filter predicate is a bare literal")
 
     # Walk the input subtree. We re-validate the *output* schema dtypes
     # for the surviving columns (the post-Filter schema is the same as
-    # the input schema, minus nothing — Filter doesn't drop columns).
+    # the input schema — Filter doesn't drop columns).
     out_schema = dict(nt.get_schema())
     for name, dtype in out_schema.items():
         if _map_dtype(dtype) is None:
@@ -294,13 +305,129 @@ def _walk_filter(nt: Any, node: Any) -> WalkResult:
         plan={
             "kind": "Filter",
             "input": inner.plan,
-            "predicate": {
-                "kind": "Column",
-                "name": str(pred_col_name),
-                "dtype": "Bool",
-            },
+            "predicate": pred_dict,
         }
     )
+
+
+_CMP_OP_NAMES: dict[str, str] = {
+    # Polars' Operator enum's `str(op)` form → our MetalDtype-side op tag.
+    "Operator.Eq": "Eq",
+    "Operator.NotEq": "Ne",
+    "Operator.Lt": "Lt",
+    "Operator.LtEq": "Le",
+    "Operator.Gt": "Gt",
+    "Operator.GtEq": "Ge",
+}
+
+
+def _walk_predicate(nt: Any, node_id: int) -> dict | None:
+    """Walk an expression-node id into a predicate-AST dict, or None if rejected.
+
+    The dict shape mirrors ``crates/polars-metal-core/src/plan/mod.rs::PredicateAst``:
+
+    - ``{"kind": "Column", "name": str, "dtype": "I64"|"F64"|"Bool"}``
+    - ``{"kind": "LiteralI64", "value": int}``
+    - ``{"kind": "LiteralF64", "value": float}``
+    - ``{"kind": "LiteralBool", "value": bool}``
+    - ``{"kind": "Compare", "op": "Eq|Ne|Lt|Le|Gt|Ge",
+         "lhs": <predicate>, "rhs": <predicate>, "dtype": "I64"|"F64"}``
+
+    The dtype tag on ``Compare`` is the *operand* dtype (the dtype that
+    drives kernel selection on the Rust side); both lhs and rhs must
+    resolve to the same dtype.
+    """
+    try:
+        expr = nt.view_expression(node_id)
+    except Exception:
+        return None
+    cls = type(expr).__name__
+
+    if cls == "Column":
+        name = getattr(expr, "name", None)
+        if name is None:
+            return None
+        try:
+            dtype = nt.get_dtype(node_id)
+        except Exception:
+            return None
+        m1_dtype = _map_dtype(dtype)
+        if m1_dtype is None:
+            return None
+        return {"kind": "Column", "name": str(name), "dtype": m1_dtype}
+
+    if cls == "Literal":
+        value = getattr(expr, "value", None)
+        if value is None:
+            # Polars' typed-null literal — we don't have a representation
+            # for "null literal" in our closed AST yet; fall back.
+            return None
+        # `bool` is a subclass of `int`; check bool first.
+        if isinstance(value, bool):
+            return {"kind": "LiteralBool", "value": bool(value)}
+        if isinstance(value, int):
+            return {"kind": "LiteralI64", "value": int(value)}
+        if isinstance(value, float):
+            return {"kind": "LiteralF64", "value": float(value)}
+        return None
+
+    if cls == "BinaryExpr":
+        op_tag = _CMP_OP_NAMES.get(str(expr.op))
+        if op_tag is None:
+            # Operator.And/Or/Plus/etc. — not in this task's closed set.
+            return None
+        lhs = _walk_predicate(nt, expr.left)
+        rhs = _walk_predicate(nt, expr.right)
+        if lhs is None or rhs is None:
+            return None
+        # Nested comparisons (Compare-inside-Compare) aren't a Phase-6
+        # shape — those would be 3-valued bool combinators handled by
+        # And/Or in Phase 7. Reject defensively.
+        if lhs["kind"] == "Compare" or rhs["kind"] == "Compare":
+            return None
+        lhs_dt = _leaf_dtype(lhs)
+        rhs_dt = _leaf_dtype(rhs)
+        # The cmp kernels operate on a single numeric dtype; both sides
+        # must agree. Polars inserts an explicit Cast when types differ
+        # (we'd see a Cast node and fail to walk it).
+        if lhs_dt is None or rhs_dt is None or lhs_dt != rhs_dt:
+            return None
+        # Only numeric (I64/F64) operand dtypes are wired today; Bool-Bool
+        # comparison isn't a Phase-6 shape (use the bool column directly).
+        if lhs_dt not in ("I64", "F64"):
+            return None
+        # Both leaves can't be literals — that's a constant-folded predicate
+        # the optimizer should have collapsed; reject to keep the dispatcher
+        # contract (at least one Column reference) clean.
+        if lhs["kind"].startswith("Literal") and rhs["kind"].startswith("Literal"):
+            return None
+        return {
+            "kind": "Compare",
+            "op": op_tag,
+            "lhs": lhs,
+            "rhs": rhs,
+            "dtype": lhs_dt,
+        }
+
+    return None
+
+
+def _leaf_dtype(pred: dict) -> str | None:
+    """Return the operand-side dtype tag for a leaf predicate dict.
+
+    For ``Column`` it's the column dtype; for the literal variants we
+    map the Python value class onto the matching dtype tag.
+    """
+    k = pred["kind"]
+    if k == "Column":
+        return pred["dtype"]
+    if k == "LiteralI64":
+        return "I64"
+    if k == "LiteralF64":
+        return "F64"
+    if k == "LiteralBool":
+        return "Bool"
+    return None
 
 
 def _map_dtype(dt: Any) -> str | None:

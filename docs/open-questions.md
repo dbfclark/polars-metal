@@ -48,6 +48,23 @@ Three friction points discovered while building the IR walker in Task 7. Each wi
 
 3. **`DataFrameScan.selection` predicate pushdown triggers M1 fallback.** Polars' optimizer can push a Filter predicate onto a DataFrameScan as a `.selection` attribute, eliminating the explicit Filter node. The walker currently rejects any DataFrameScan with a non-None `selection` (because we'd need to evaluate that predicate via the same kernels Filter uses). Once Phase 5+ Filter lands, the walker should lift these to GPU instead — otherwise many CSE-optimized queries fall back unnecessarily even when they're entirely within the M1 supported set. *Owner:* M1 (Phase 5+, T15+).
 
+## cmp_f64 NaN semantics: IEEE 754 vs Polars TotalOrd (M1, T18 2026-05-20)
+
+`shaders/cmp_f64.metal` (Task 17) implements IEEE 754 ordered comparison: `NaN OP x` is `false` for `==, <, <=, >, >=` and `true` only for `!=`. Polars CPU implements `TotalOrd` semantics for these ops — NaN is treated as **greater than any non-NaN** value, so `NaN > 0 = true`, `NaN > NaN = false` (per total ordering), `NaN == NaN = true`.
+
+Concrete check (`py-1.40.1`):
+
+```
+pl.Series([1.0, NaN, 3.0]) > 0  →  [True, True, True]
+pl.Series([1.0, NaN, 3.0]) == pl.Series([1.0, NaN, 3.0])  →  [True, True, True]
+```
+
+Discovered while landing the Task 18 end-to-end filter+comparison wiring. The integer path (`cmp_i64.metal`) is unaffected. T18 marks the failing test (`test_filter_with_nan_f64_total_ord`) `xfail(strict=True)` so when the kernel is fixed, the strict-xfail will flip and force us to drop the marker.
+
+**Fix sketch:** rework the six `f64_<op>` helpers in `cmp_f64.metal` to short-circuit NaN-presence into the matching TotalOrd outcome. `f64_eq` returns true when both inputs are NaN; the order helpers (`<, <=, >, >=`) treat NaN as larger than any non-NaN value. `f64_total_order_key` is already nearly the right primitive — it just needs to map NaN consistently above ±Inf.
+
+*Owner:* M1 (post-T18 follow-up alongside Task 21's hypothesis differential strategies, which would have caught this immediately).
+
 ## MLX install path
 
 Resolved in T19: git submodule under `vendor/mlx`, pinned to v0.22.0, built via cmake. *Owner:* M0 (resolved). Refresh via standalone cmake invocation, not via `scripts/refresh-references.sh` (which is for read-only references, not build deps).

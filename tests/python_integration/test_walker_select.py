@@ -91,11 +91,19 @@ def test_walker_falls_back_for_unsupported_dtype(caplog) -> None:
     assert not any("installed UDF" in m for m in msgs), msgs
 
 
-def test_walker_falls_back_for_filter(caplog) -> None:
-    """Filter is explicitly not supported in Phase 4; walker must FallBack."""
+def test_walker_falls_back_for_filter_with_unsupported_predicate(caplog) -> None:
+    """A Filter predicate outside the M1 closed set must FallBack.
+
+    As of Task 18 (Phase 6) the walker accepts comparison ``BinaryExpr``
+    predicates on i64/f64 columns. So we exercise the unsupported shape:
+    arithmetic in the predicate (``pl.col('a') + 1 > 0``), which Polars
+    encodes as ``BinaryExpr(Gt, BinaryExpr(Plus, ...), Literal)``. The
+    inner arithmetic BinaryExpr fails the comparison-op check and the
+    whole predicate falls back.
+    """
     caplog.set_level(logging.DEBUG, logger="polars_metal")
     df = pl.DataFrame({"a": [1, 2, 3, 4], "b": [10.0, 20.0, 30.0, 40.0]})
-    _ = df.lazy().filter(pl.col("a") > 2).collect(engine=polars_metal.MetalEngine(debug=True))
+    _ = df.lazy().filter(pl.col("a") + 1 > 2).collect(engine=polars_metal.MetalEngine(debug=True))
     msgs = [r.getMessage() for r in caplog.records if r.name == "polars_metal"]
     assert any("falling back" in m for m in msgs), msgs
     assert not any("installed UDF" in m for m in msgs), msgs

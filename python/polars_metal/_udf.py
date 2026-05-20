@@ -24,8 +24,13 @@ walker-only side-channel keys on the Scan leaf:
 - ``{"kind": "Scan", "columns": [(name, dtype_tag), ...], "df": <PyDataFrame>,
    "projection": list[str] | None}``
 - ``{"kind": "Project", "input": <plan>, "columns": list[str]}``
-- ``{"kind": "Filter", "input": <plan>, "predicate":
-   {"kind": "Column", "name": ..., "dtype": "Bool"}}``
+- ``{"kind": "Filter", "input": <plan>, "predicate": <pred>}`` where ``<pred>``
+  is one of:
+    - ``{"kind": "Column", "name": ..., "dtype": "Bool"}`` (Phase 5),
+    - ``{"kind": "Compare", "op": "Eq|Ne|Lt|Le|Gt|Ge", "lhs": <leaf>,
+       "rhs": <leaf>, "dtype": "I64"|"F64"}`` (Phase 6, Task 18).
+  Leaves are ``Column`` (as above) or one of ``LiteralI64 | LiteralF64
+  | LiteralBool`` with a ``value`` field.
 
 ``df`` and ``projection`` are walker-only side channels; we strip them
 before handing the plan to Rust.
@@ -110,8 +115,12 @@ def _dispatch_filter(df_pydf: Any, filter_plan: dict) -> pl.DataFrame:
     The predicate is read from the same upstream DataFrame as the survivors
     (it lives in the input subtree, which today is always a Scan/Project
     that resolves to a contiguous slice of ``df_pydf``). The walker stamps
-    the predicate column name into ``filter_plan["predicate"]["name"]`` so
-    we can fetch it by name.
+    the predicate AST into ``filter_plan["predicate"]``; we evaluate it
+    here:
+    - ``Column(bool)`` (Phase 5) — read the precomputed bool column.
+    - ``Compare`` (Phase 6, Task 18) — dispatch the matching ``cmp_*``
+      kernel against the upstream column buffers, producing a fresh
+      bool predicate (bit-packed data + validity).
     """
     # Resolve the upstream DataFrame (after running scan/project nodes
     # under the Filter). The Filter node's input plan is one of:
@@ -125,13 +134,8 @@ def _dispatch_filter(df_pydf: Any, filter_plan: dict) -> pl.DataFrame:
         upstream_pydf = _native.execute_plan(df_pydf, upstream_plan)
         upstream = pl.DataFrame._from_pydf(upstream_pydf)
 
-    pred_name = filter_plan["predicate"]["name"]
-    # Materialise Arrow with offset == 0 (slicing can leave a non-zero
-    # offset, which the kernels do not understand). PyArrow's
-    # combine_chunks materialises a fresh contiguous buffer at offset 0.
     n_rows = upstream.height
-    pred_arr = _materialize_arrow(upstream.get_column(pred_name))
-    pred_data, pred_valid = _bitpacked_data_and_valid(pred_arr, n_rows)
+    pred_data, pred_valid = _evaluate_predicate(upstream, filter_plan["predicate"], n_rows)
 
     # Build the column-input list. Polars semantics: ``df.filter(mask)``
     # keeps the predicate column in the output (unless the caller
@@ -175,6 +179,104 @@ def _dispatch_filter(df_pydf: Any, filter_plan: dict) -> pl.DataFrame:
         series_list.append(_assemble_series(col_name, dtype_tag, out_data, out_valid, n_out))
 
     return pl.DataFrame(series_list)
+
+
+def _evaluate_predicate(upstream: pl.DataFrame, pred: dict, n_rows: int) -> tuple[bytes, bytes]:
+    """Evaluate a serialized predicate AST into a bit-packed ``(data, valid)`` pair.
+
+    Supported shapes (walker's closed set):
+
+    - ``Column(name, dtype="Bool")`` — Phase 5: read the precomputed bool
+      column straight off the upstream frame.
+    - ``Compare { op, lhs, rhs, dtype }`` where ``lhs`` and ``rhs`` are
+      each either ``Column(I64|F64)`` or matching-dtype ``Literal`` —
+      Phase 6: dispatch the matching ``cmp_<dtype>_col_(col|scalar)``
+      kernel against the upstream column buffers.
+
+    Returns bit-packed bytes (each at least ``ceil(n_rows / 8)`` bytes).
+    """
+    kind = pred["kind"]
+    if kind == "Column":
+        if pred.get("dtype") != "Bool":
+            raise RuntimeError(
+                f"polars_metal: bare Column predicate must be Bool, got {pred.get('dtype')!r}"
+            )
+        pred_arr = _materialize_arrow(upstream.get_column(pred["name"]))
+        return _bitpacked_data_and_valid(pred_arr, n_rows)
+
+    if kind == "Compare":
+        return _evaluate_compare(upstream, pred, n_rows)
+
+    raise RuntimeError(f"polars_metal: unsupported predicate kind {kind!r}")
+
+
+def _evaluate_compare(upstream: pl.DataFrame, pred: dict, n_rows: int) -> tuple[bytes, bytes]:
+    """Dispatch one of the four ``cmp_*`` pyfunctions based on the
+    operand dtype and which side is a literal vs a column.
+
+    The walker has already verified both leaves share an operand dtype
+    (``Compare["dtype"]``). We additionally fast-path the
+    ``column op scalar`` and ``column op column`` shapes — the walker
+    rejects literal-vs-literal at validation time, so we don't see it
+    here. Scalar-vs-column ``(literal op column)`` is rewritten into
+    the canonical ``(column op_swap literal)`` form to hit the scalar
+    kernel; the op must be swapped to preserve semantics
+    (e.g. ``5 < a`` becomes ``a > 5``).
+    """
+    op = pred["op"]
+    dtype = pred["dtype"]
+    lhs = pred["lhs"]
+    rhs = pred["rhs"]
+
+    # Canonicalise so the Column is always on the LHS for scalar variants.
+    if lhs["kind"].startswith("Literal") and rhs["kind"] == "Column":
+        lhs, rhs = rhs, lhs
+        op = _SWAP_COMPARE_OP[op]
+
+    if lhs["kind"] != "Column":
+        # Walker should reject; defensive check matches the cmp kernel
+        # input contract (LHS is always a column).
+        raise RuntimeError(f"polars_metal: cmp predicate LHS must be Column, got {lhs['kind']!r}")
+
+    lhs_arr = _materialize_arrow(upstream.get_column(lhs["name"]))
+    lhs_data, lhs_valid = _data_and_valid_for_dtype(lhs_arr, n_rows, dtype)
+
+    if rhs["kind"] == "Column":
+        rhs_arr = _materialize_arrow(upstream.get_column(rhs["name"]))
+        rhs_data, rhs_valid = _data_and_valid_for_dtype(rhs_arr, n_rows, dtype)
+        if dtype == "I64":
+            return _native.cmp_i64_col_col(lhs_data, lhs_valid, rhs_data, rhs_valid, op, n_rows)
+        if dtype == "F64":
+            return _native.cmp_f64_col_col(lhs_data, lhs_valid, rhs_data, rhs_valid, op, n_rows)
+        raise RuntimeError(f"polars_metal: cmp dtype {dtype!r} not wired")
+
+    # rhs is a Literal — call the matching scalar variant.
+    if dtype == "I64":
+        if rhs["kind"] != "LiteralI64":
+            raise RuntimeError(
+                f"polars_metal: dtype I64 cmp expected LiteralI64 RHS, got {rhs['kind']!r}"
+            )
+        return _native.cmp_i64_col_scalar(lhs_data, lhs_valid, int(rhs["value"]), op, n_rows)
+    if dtype == "F64":
+        if rhs["kind"] != "LiteralF64":
+            raise RuntimeError(
+                f"polars_metal: dtype F64 cmp expected LiteralF64 RHS, got {rhs['kind']!r}"
+            )
+        return _native.cmp_f64_col_scalar(lhs_data, lhs_valid, float(rhs["value"]), op, n_rows)
+    raise RuntimeError(f"polars_metal: cmp dtype {dtype!r} not wired")
+
+
+# Op tags swapped when we canonicalise ``literal OP column`` into
+# ``column OP_swap literal``. Eq and Ne are symmetric; the four inequality
+# ops swap to their reflection (``a < b`` ↔ ``b > a``).
+_SWAP_COMPARE_OP: dict[str, str] = {
+    "Eq": "Eq",
+    "Ne": "Ne",
+    "Lt": "Gt",
+    "Le": "Ge",
+    "Gt": "Lt",
+    "Ge": "Le",
+}
 
 
 _DTYPE_TO_TAG: dict[str, str] = {

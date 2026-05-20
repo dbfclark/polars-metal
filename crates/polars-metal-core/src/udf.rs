@@ -23,6 +23,9 @@
 
 use crate::plan::{MetalDtype, MetalPlanNode, PredicateAst};
 use polars_metal_buffer::MetalDevice;
+use polars_metal_kernels::cmp::{
+    dispatch_cmp_f64, dispatch_cmp_f64_scalar, dispatch_cmp_i64, dispatch_cmp_i64_scalar, CompareOp,
+};
 use polars_metal_kernels::command::CommandQueue;
 use polars_metal_kernels::pipeline::{compact_bool, compact_f64, compact_i64};
 use pyo3::exceptions::PyValueError;
@@ -444,11 +447,61 @@ fn deserialize_predicate(dict: &Bound<PyDict>) -> PyResult<PredicateAst> {
                 dtype: parse_dtype(&dtype_s)?,
             })
         }
-        // Other predicate variants (Compare, And, Or, literals) land in
-        // Phases 6/7 when the walker actually produces them. Be strict — any
-        // unknown kind today is a bug in the walker, not a fallback case.
+        "LiteralI64" => {
+            let v: i64 = dict
+                .get_item("value")?
+                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("LiteralI64 missing 'value'"))?
+                .extract()?;
+            Ok(PredicateAst::LiteralI64(v))
+        }
+        "LiteralF64" => {
+            let v: f64 = dict
+                .get_item("value")?
+                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("LiteralF64 missing 'value'"))?
+                .extract()?;
+            Ok(PredicateAst::LiteralF64(v))
+        }
+        "LiteralBool" => {
+            let v: bool = dict
+                .get_item("value")?
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyKeyError::new_err("LiteralBool missing 'value'")
+                })?
+                .extract()?;
+            Ok(PredicateAst::LiteralBool(v))
+        }
+        "Compare" => {
+            let op_s: String = dict
+                .get_item("op")?
+                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Compare missing 'op'"))?
+                .extract()?;
+            let op = parse_compare_op(&op_s)?;
+            let lhs_obj = dict
+                .get_item("lhs")?
+                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Compare missing 'lhs'"))?;
+            let lhs_dict: Bound<PyDict> = lhs_obj.downcast_into()?;
+            let lhs = Box::new(deserialize_predicate(&lhs_dict)?);
+            let rhs_obj = dict
+                .get_item("rhs")?
+                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Compare missing 'rhs'"))?;
+            let rhs_dict: Bound<PyDict> = rhs_obj.downcast_into()?;
+            let rhs = Box::new(deserialize_predicate(&rhs_dict)?);
+            Ok(PredicateAst::Compare {
+                op: match op {
+                    CompareOp::Eq => crate::plan::CompareOp::Eq,
+                    CompareOp::Ne => crate::plan::CompareOp::Ne,
+                    CompareOp::Lt => crate::plan::CompareOp::Lt,
+                    CompareOp::Le => crate::plan::CompareOp::Le,
+                    CompareOp::Gt => crate::plan::CompareOp::Gt,
+                    CompareOp::Ge => crate::plan::CompareOp::Ge,
+                },
+                lhs,
+                rhs,
+            })
+        }
+        // And/Or land in Task 20 alongside the 3-valued logical_bool kernel.
         other => Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
-            "polars_metal: predicate kind {other:?} lands in M1 Phase 6+"
+            "polars_metal: predicate kind {other:?} lands in a later phase"
         ))),
     }
 }
@@ -462,4 +515,293 @@ fn parse_dtype(s: &str) -> PyResult<MetalDtype> {
             "polars_metal: unknown MetalDtype tag {other:?}"
         ))),
     }
+}
+
+/// Parse the wire-format op tag (matching `CompareOp::Eq/Ne/Lt/Le/Gt/Ge`)
+/// into the kernel-side `CompareOp`. Used both at predicate-AST
+/// deserialization time and by the `cmp_*` pyfunctions below.
+fn parse_compare_op(s: &str) -> PyResult<CompareOp> {
+    match s {
+        "Eq" => Ok(CompareOp::Eq),
+        "Ne" => Ok(CompareOp::Ne),
+        "Lt" => Ok(CompareOp::Lt),
+        "Le" => Ok(CompareOp::Le),
+        "Gt" => Ok(CompareOp::Gt),
+        "Ge" => Ok(CompareOp::Ge),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "polars_metal: unknown CompareOp tag {other:?}"
+        ))),
+    }
+}
+
+/// Minimum bytes for a bit-packed output bitmap of `n_rows` rows, mirroring
+/// the kernel-side ``out_min_bytes`` (4-byte-aligned for atomic_uint, min 4).
+fn cmp_out_min_bytes(n_rows: usize) -> usize {
+    let raw = (n_rows + 7) / 8;
+    let padded = (raw + 3) & !3;
+    padded.max(4)
+}
+
+/// PyO3 entry point exposed as `polars_metal._native.cmp_i64_col_scalar`.
+///
+/// Evaluates a single column-vs-scalar i64 comparison and returns the
+/// bit-packed bool predicate `(data, valid)`. The Python UDF calls this
+/// when the walker emits a `Compare { lhs: Column(I64), rhs: LiteralI64 }`
+/// (and similarly for the other three column-vs-leaf combinations); the
+/// resulting predicate bytes feed straight into
+/// [`execute_filter_compact`].
+///
+/// Arguments mirror [`dispatch_cmp_i64_scalar`]; bytes are zero-copied
+/// into Metal device buffers inside the dispatcher.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn cmp_i64_col_scalar<'py>(
+    py: Python<'py>,
+    lhs_data: &Bound<'py, PyBytes>,
+    lhs_valid: &Bound<'py, PyBytes>,
+    rhs: i64,
+    op: &str,
+    n_rows: usize,
+) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+    let op_enum = parse_compare_op(op)?;
+    let lhs_data_bytes = lhs_data.as_bytes();
+    let lhs_valid_bytes = lhs_valid.as_bytes();
+    check_numeric_buffers(lhs_data_bytes, lhs_valid_bytes, n_rows, 8)?;
+
+    // SAFETY: i64 has no invalid bit patterns; `lhs_data_bytes` length is
+    // at least `n_rows * 8` (checked above). The Arrow buffer Python hands
+    // us is 64-byte-aligned (Arrow alignment requirement), so the reinterpret
+    // is well-aligned.
+    let lhs_slice: &[i64] =
+        unsafe { std::slice::from_raw_parts(lhs_data_bytes.as_ptr() as *const i64, n_rows) };
+
+    let (device, mut queue) = new_device_and_queue()?;
+    let min_out = cmp_out_min_bytes(n_rows);
+    let mut out_data = vec![0u8; min_out];
+    let mut out_valid = vec![0u8; min_out];
+    dispatch_cmp_i64_scalar(
+        &device,
+        &mut queue,
+        lhs_slice,
+        lhs_valid_bytes,
+        rhs,
+        n_rows,
+        op_enum,
+        &mut out_data,
+        &mut out_valid,
+    )
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "polars_metal: cmp_i64_col_scalar dispatch failed: {e}"
+        ))
+    })?;
+    Ok((
+        PyBytes::new_bound(py, &out_data),
+        PyBytes::new_bound(py, &out_valid),
+    ))
+}
+
+/// PyO3 entry point exposed as `polars_metal._native.cmp_i64_col_col`.
+///
+/// Evaluates a column-vs-column i64 comparison. See [`cmp_i64_col_scalar`]
+/// for the bigger picture; this variant just feeds two columns to
+/// [`dispatch_cmp_i64`] instead of `(col, scalar)`.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn cmp_i64_col_col<'py>(
+    py: Python<'py>,
+    lhs_data: &Bound<'py, PyBytes>,
+    lhs_valid: &Bound<'py, PyBytes>,
+    rhs_data: &Bound<'py, PyBytes>,
+    rhs_valid: &Bound<'py, PyBytes>,
+    op: &str,
+    n_rows: usize,
+) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+    let op_enum = parse_compare_op(op)?;
+    let lhs_data_bytes = lhs_data.as_bytes();
+    let lhs_valid_bytes = lhs_valid.as_bytes();
+    let rhs_data_bytes = rhs_data.as_bytes();
+    let rhs_valid_bytes = rhs_valid.as_bytes();
+    check_numeric_buffers(lhs_data_bytes, lhs_valid_bytes, n_rows, 8)?;
+    check_numeric_buffers(rhs_data_bytes, rhs_valid_bytes, n_rows, 8)?;
+
+    // SAFETY: see `cmp_i64_col_scalar`; both slices are at least n_rows*8
+    // bytes and 64-byte aligned by Arrow.
+    let lhs_slice: &[i64] =
+        unsafe { std::slice::from_raw_parts(lhs_data_bytes.as_ptr() as *const i64, n_rows) };
+    let rhs_slice: &[i64] =
+        unsafe { std::slice::from_raw_parts(rhs_data_bytes.as_ptr() as *const i64, n_rows) };
+
+    let (device, mut queue) = new_device_and_queue()?;
+    let min_out = cmp_out_min_bytes(n_rows);
+    let mut out_data = vec![0u8; min_out];
+    let mut out_valid = vec![0u8; min_out];
+    dispatch_cmp_i64(
+        &device,
+        &mut queue,
+        lhs_slice,
+        lhs_valid_bytes,
+        rhs_slice,
+        rhs_valid_bytes,
+        n_rows,
+        op_enum,
+        &mut out_data,
+        &mut out_valid,
+    )
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "polars_metal: cmp_i64_col_col dispatch failed: {e}"
+        ))
+    })?;
+    Ok((
+        PyBytes::new_bound(py, &out_data),
+        PyBytes::new_bound(py, &out_valid),
+    ))
+}
+
+/// PyO3 entry point exposed as `polars_metal._native.cmp_f64_col_scalar`.
+///
+/// f64 mirror of [`cmp_i64_col_scalar`]. Polars/IEEE 754 NaN semantics
+/// are implemented inside the kernel (see `cmp_f64.metal`); the wrapper
+/// is dtype-agnostic otherwise.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn cmp_f64_col_scalar<'py>(
+    py: Python<'py>,
+    lhs_data: &Bound<'py, PyBytes>,
+    lhs_valid: &Bound<'py, PyBytes>,
+    rhs: f64,
+    op: &str,
+    n_rows: usize,
+) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+    let op_enum = parse_compare_op(op)?;
+    let lhs_data_bytes = lhs_data.as_bytes();
+    let lhs_valid_bytes = lhs_valid.as_bytes();
+    check_numeric_buffers(lhs_data_bytes, lhs_valid_bytes, n_rows, 8)?;
+
+    // SAFETY: f64 has no invalid bit patterns (every 8-byte sequence is a
+    // legitimate f64 — including NaN payloads). Length and alignment are
+    // the same as the i64 path.
+    let lhs_slice: &[f64] =
+        unsafe { std::slice::from_raw_parts(lhs_data_bytes.as_ptr() as *const f64, n_rows) };
+
+    let (device, mut queue) = new_device_and_queue()?;
+    let min_out = cmp_out_min_bytes(n_rows);
+    let mut out_data = vec![0u8; min_out];
+    let mut out_valid = vec![0u8; min_out];
+    dispatch_cmp_f64_scalar(
+        &device,
+        &mut queue,
+        lhs_slice,
+        lhs_valid_bytes,
+        rhs,
+        n_rows,
+        op_enum,
+        &mut out_data,
+        &mut out_valid,
+    )
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "polars_metal: cmp_f64_col_scalar dispatch failed: {e}"
+        ))
+    })?;
+    Ok((
+        PyBytes::new_bound(py, &out_data),
+        PyBytes::new_bound(py, &out_valid),
+    ))
+}
+
+/// PyO3 entry point exposed as `polars_metal._native.cmp_f64_col_col`.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn cmp_f64_col_col<'py>(
+    py: Python<'py>,
+    lhs_data: &Bound<'py, PyBytes>,
+    lhs_valid: &Bound<'py, PyBytes>,
+    rhs_data: &Bound<'py, PyBytes>,
+    rhs_valid: &Bound<'py, PyBytes>,
+    op: &str,
+    n_rows: usize,
+) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+    let op_enum = parse_compare_op(op)?;
+    let lhs_data_bytes = lhs_data.as_bytes();
+    let lhs_valid_bytes = lhs_valid.as_bytes();
+    let rhs_data_bytes = rhs_data.as_bytes();
+    let rhs_valid_bytes = rhs_valid.as_bytes();
+    check_numeric_buffers(lhs_data_bytes, lhs_valid_bytes, n_rows, 8)?;
+    check_numeric_buffers(rhs_data_bytes, rhs_valid_bytes, n_rows, 8)?;
+
+    // SAFETY: see `cmp_f64_col_scalar`.
+    let lhs_slice: &[f64] =
+        unsafe { std::slice::from_raw_parts(lhs_data_bytes.as_ptr() as *const f64, n_rows) };
+    let rhs_slice: &[f64] =
+        unsafe { std::slice::from_raw_parts(rhs_data_bytes.as_ptr() as *const f64, n_rows) };
+
+    let (device, mut queue) = new_device_and_queue()?;
+    let min_out = cmp_out_min_bytes(n_rows);
+    let mut out_data = vec![0u8; min_out];
+    let mut out_valid = vec![0u8; min_out];
+    dispatch_cmp_f64(
+        &device,
+        &mut queue,
+        lhs_slice,
+        lhs_valid_bytes,
+        rhs_slice,
+        rhs_valid_bytes,
+        n_rows,
+        op_enum,
+        &mut out_data,
+        &mut out_valid,
+    )
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "polars_metal: cmp_f64_col_col dispatch failed: {e}"
+        ))
+    })?;
+    Ok((
+        PyBytes::new_bound(py, &out_data),
+        PyBytes::new_bound(py, &out_valid),
+    ))
+}
+
+/// Build a `(MetalDevice, CommandQueue)` pair for one comparison-kernel
+/// dispatch. The kernel dispatcher reuses the queue across its three
+/// internal passes (load + compute + readback) so callers don't share
+/// queues across pyfunction invocations.
+fn new_device_and_queue() -> PyResult<(MetalDevice, CommandQueue)> {
+    let device = MetalDevice::system_default()
+        .map_err(|e| crate::engine_err(crate::EngineError::Buffer(e)))?;
+    let queue = CommandQueue::new(&device)
+        .map_err(|e| crate::engine_err(crate::EngineError::Other(format!("command queue: {e}"))))?;
+    Ok((device, queue))
+}
+
+/// Length-check the data and validity buffers for a numeric column input
+/// to a comparison kernel. `data_bytes_per_row` is 8 for i64/f64 (the
+/// only widths we support today). Validity is bit-packed.
+fn check_numeric_buffers(
+    data: &[u8],
+    valid: &[u8],
+    n_rows: usize,
+    data_bytes_per_row: usize,
+) -> PyResult<()> {
+    let expected_data = n_rows * data_bytes_per_row;
+    if data.len() < expected_data {
+        return Err(PyValueError::new_err(format!(
+            "polars_metal: data buffer is {got} B, need at least {expected} B for {n} rows",
+            got = data.len(),
+            expected = expected_data,
+            n = n_rows,
+        )));
+    }
+    let min_valid = (n_rows + 7) / 8;
+    if valid.len() < min_valid {
+        return Err(PyValueError::new_err(format!(
+            "polars_metal: validity buffer is {got} B, need at least {expected} B for {n} rows",
+            got = valid.len(),
+            expected = min_valid,
+            n = n_rows,
+        )));
+    }
+    Ok(())
 }
