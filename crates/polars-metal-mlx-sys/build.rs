@@ -9,8 +9,8 @@ fn main() {
     let mlx_build = mlx_root.join("build");
 
     cxx_build::bridge("src/lib.rs")
-        .file("cxx/hello.cc")
-        // Add MLX headers so T20 can use `#include "mlx/array.h"`.
+        .file("cxx/mlx_bridge.cc")
+        // Add MLX headers so `#include "mlx/array.h"` etc. resolve.
         .include(&mlx_root)
         .flag_if_supported("-std=c++17")
         .compile("polars_metal_mlx_bridge");
@@ -26,6 +26,6 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=Accelerate");
 
     println!("cargo:rerun-if-changed=src/lib.rs");
-    println!("cargo:rerun-if-changed=cxx/hello.h");
-    println!("cargo:rerun-if-changed=cxx/hello.cc");
+    println!("cargo:rerun-if-changed=cxx/mlx_bridge.h");
+    println!("cargo:rerun-if-changed=cxx/mlx_bridge.cc");
 }
