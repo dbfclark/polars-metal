@@ -41,7 +41,7 @@ def execute_with_metal(nt: Any, duration_since_start: int | None, *, config: Met
 
     if isinstance(result, FallBack):
         if config.debug:
-            log.debug("polars_metal: falling back: %s", result.reason)
+            log.debug("polars_metal: walker fallback: %s", result.reason)
         return
 
     assert isinstance(result, Handled)
@@ -53,6 +53,9 @@ def execute_with_metal(nt: Any, duration_since_start: int | None, *, config: Met
         if config.debug:
             log.debug("polars_metal: router raised %r; falling back", e)
         return
+
+    if config.debug:
+        log.debug("router decisions: %r", dict(lifting))
 
     if any(v.startswith("fallback:") for v in lifting.values()):
         if config.debug:

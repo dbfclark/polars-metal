@@ -91,7 +91,7 @@ def test_walker_falls_back_for_unsupported_dtype(caplog) -> None:
     df = pl.DataFrame({"a": [1, 2, 3], "s": ["x", "y", "z"]})
     _ = df.lazy().select(["s", "a"]).collect(engine=polars_metal.MetalEngine(debug=True))
     msgs = [r.getMessage() for r in caplog.records if r.name == "polars_metal"]
-    assert any("falling back" in m for m in msgs), msgs
+    assert any("walker fallback" in m for m in msgs), msgs
     assert not any("installed UDF" in m for m in msgs), msgs
 
 
@@ -109,5 +109,5 @@ def test_walker_falls_back_for_filter_with_unsupported_predicate(caplog) -> None
     df = pl.DataFrame({"a": [1, 2, 3, 4], "b": [10.0, 20.0, 30.0, 40.0]})
     _ = df.lazy().filter(pl.col("a") + 1 > 2).collect(engine=polars_metal.MetalEngine(debug=True))
     msgs = [r.getMessage() for r in caplog.records if r.name == "polars_metal"]
-    assert any("falling back" in m for m in msgs), msgs
+    assert any("walker fallback" in m for m in msgs), msgs
     assert not any("installed UDF" in m for m in msgs), msgs
