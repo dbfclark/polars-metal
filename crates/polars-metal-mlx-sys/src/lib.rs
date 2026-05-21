@@ -23,7 +23,15 @@ mod ffi {
             a: &CxxVector<f32>,
             b: &CxxVector<f32>,
         ) -> Result<UniquePtr<CxxVector<f32>>>;
-        fn cumsum_u8_to_u32(input: &CxxVector<u8>) -> Result<UniquePtr<CxxVector<u32>>>;
+        // Slice-based cumsum: cxx maps `&[u8]` / `&mut [u32]` to
+        // `rust::Slice<const uint8_t>` / `rust::Slice<uint32_t>`, which are
+        // thin pointer+length pairs. This eliminates the per-element
+        // `CxxVector` push/iter loops on both sides of the FFI. The internal
+        // MLX `array(ptr, shape, dtype)` constructor still copies the input
+        // into MLX-owned memory (one memcpy) and we memcpy the result back
+        // into the caller's output slice — those are the only data-touching
+        // passes left in this call. T30 Step 3 / `docs/open-questions.md`.
+        fn cumsum_u8_to_u32(input: &[u8], output: &mut [u32]) -> Result<()>;
     }
 }
 
@@ -86,10 +94,13 @@ pub fn add_f32(a: &[f32], b: &[f32]) -> Result<Vec<f32>, FfiError> {
 /// Used by the M1 filter compaction pipeline: bit-packed predicate column ->
 /// dense u8 keep-flags -> cumsum -> scatter indices.
 ///
-/// Note: copy-in/copy-out via `CxxVector` is suboptimal — every u8 and every
-/// u32 crosses the FFI boundary by value. Acceptable for M1; M2's MLX-FFI
-/// revisit (see `docs/open-questions.md`) will reconsider direct
-/// MLX-over-MetalBuffer wiring to eliminate these copies.
+/// FFI shape: the cxx bridge passes `input` / `output` as `rust::Slice`s —
+/// thin pointer+length pairs — so there is no per-element marshalling on
+/// either side of the call. The MLX `array(ptr, shape, dtype)` constructor
+/// still copies the input bytes into MLX-managed memory and we memcpy the
+/// result back into `output`; eliminating those two memcpys requires
+/// dropping down to MLX's lower-level Metal-buffer API and is deferred to
+/// the M2 MLX-FFI revisit (see `docs/open-questions.md`).
 pub fn cumsum_u8_to_u32(input: &[u8], output: &mut [u32]) -> Result<(), FfiError> {
     if input.len() != output.len() {
         return Err(FfiError::ShapeMismatch {
@@ -100,15 +111,7 @@ pub fn cumsum_u8_to_u32(input: &[u8], output: &mut [u32]) -> Result<(), FfiError
     if input.is_empty() {
         return Ok(());
     }
-    let mut cxx_in = cxx::CxxVector::<u8>::new();
-    for &b in input {
-        cxx_in.pin_mut().push(b);
-    }
-    let cxx_out = ffi::cumsum_u8_to_u32(&cxx_in).map_err(FfiError::from)?;
-    for (i, v) in cxx_out.iter().enumerate() {
-        output[i] = *v;
-    }
-    Ok(())
+    ffi::cumsum_u8_to_u32(input, output).map_err(FfiError::from)
 }
 
 #[cfg(test)]
