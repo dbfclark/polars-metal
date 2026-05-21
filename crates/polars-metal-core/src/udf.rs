@@ -92,6 +92,15 @@ fn execute_node<'py>(
                  not execute_plan (the Python UDF handles the routing)",
             ))
         }
+        MetalPlanNode::GroupBy { .. } => {
+            // GroupBy execution lands in Task 28. For now, this code path
+            // should not be reached — the Python UDF routes GroupBy through
+            // a dedicated entry point (Task 29). If reached, raise a clear
+            // error rather than panicking.
+            Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                "polars_metal: GroupBy execution not yet implemented (lands in Phase 2)",
+            ))
+        }
     }
 }
 

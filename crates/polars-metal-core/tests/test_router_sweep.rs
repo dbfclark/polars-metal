@@ -49,6 +49,7 @@ fn count_nodes(node: &MetalPlanNode) -> usize {
         MetalPlanNode::Scan { .. } => 1,
         MetalPlanNode::Project { input, .. } => 1 + count_nodes(input),
         MetalPlanNode::Filter { input, .. } => 1 + count_nodes(input),
+        MetalPlanNode::GroupBy { input, .. } => 1 + count_nodes(input),
     }
 }
 

@@ -120,7 +120,8 @@ fn walk(node: &MetalPlanNode, plan: &mut LiftingPlan, next_seq: &mut u32) -> Nod
             let child_id = walk(input, plan, next_seq);
             let id = NodeId::new("Project", *next_seq);
             *next_seq += 1;
-            let child_decision = plan.get(&child_id)
+            let child_decision = plan
+                .get(&child_id)
                 .cloned()
                 .unwrap_or(NodeDecision::Fallback("missing child decision".into()));
             plan.set(id.clone(), cost::decide_project(&child_decision));
@@ -132,6 +133,34 @@ fn walk(node: &MetalPlanNode, plan: &mut LiftingPlan, next_seq: &mut u32) -> Nod
             *next_seq += 1;
             plan.set(id.clone(), cost::decide_filter(0));
             id
+        }
+        MetalPlanNode::GroupBy { input, .. } => {
+            let n_rows = input_row_count(input);
+            let _ = walk(input, plan, next_seq);
+            let id = NodeId::new("GroupBy", *next_seq);
+            *next_seq += 1;
+            plan.set(id.clone(), cost::decide_groupby(n_rows));
+            id
+        }
+    }
+}
+
+/// Best-effort row count for cost-model input. Walks past Project and
+/// Filter to find the underlying Scan; returns 0 if none. Filter is a
+/// notable simplification — we use the *input* row count for the cost
+/// estimate (the kernel sees the post-filter count, but at plan time
+/// we don't know it). This is the M2 starting heuristic; later PRs may
+/// thread an estimated cardinality.
+fn input_row_count(node: &MetalPlanNode) -> usize {
+    match node {
+        MetalPlanNode::Scan { n_rows, .. } => *n_rows,
+        MetalPlanNode::Project { input, .. } => input_row_count(input),
+        MetalPlanNode::Filter { input, .. } => input_row_count(input),
+        MetalPlanNode::GroupBy { .. } => {
+            // GroupBy-of-GroupBy: post-grouped row count is unknown at
+            // plan time. Conservative default: route the outer GroupBy
+            // to CPU by reporting 0 rows.
+            0
         }
     }
 }
