@@ -11,8 +11,8 @@
 
 use std::collections::HashMap;
 
-pub mod cost;
 pub mod affinity;
+pub mod cost;
 
 /// Identifier for an IR node in the MetalPlanNode tree. Tuple of
 /// (kind, sequence-number); the walker emits these deterministically so
@@ -26,12 +26,21 @@ pub struct NodeId {
 
 impl NodeId {
     pub fn new(kind: impl Into<String>, seq: u32) -> Self {
-        Self { kind: kind.into(), seq }
+        Self {
+            kind: kind.into(),
+            seq,
+        }
     }
-    pub fn kind(&self) -> &str { &self.kind }
-    pub fn seq(&self) -> u32 { self.seq }
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+    pub fn seq(&self) -> u32 {
+        self.seq
+    }
     /// Wire-format string the Python walker receives: `"Kind#seq"`.
-    pub fn to_wire(&self) -> String { format!("{}#{}", self.kind, self.seq) }
+    pub fn to_wire(&self) -> String {
+        format!("{}#{}", self.kind, self.seq)
+    }
 }
 
 /// Per-node routing decision.
@@ -55,21 +64,29 @@ pub struct LiftingPlan {
 }
 
 impl LiftingPlan {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
     pub fn set(&mut self, id: NodeId, decision: NodeDecision) {
         self.decisions.insert(id, decision);
     }
     pub fn get(&self, id: &NodeId) -> Option<&NodeDecision> {
         self.decisions.get(id)
     }
-    pub fn len(&self) -> usize { self.decisions.len() }
-    pub fn is_empty(&self) -> bool { self.decisions.is_empty() }
+    pub fn len(&self) -> usize {
+        self.decisions.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.decisions.is_empty()
+    }
     pub fn iter(&self) -> impl Iterator<Item = (&NodeId, &NodeDecision)> {
         self.decisions.iter()
     }
     /// True iff the plan contains any Fallback decision. When true, the
     /// walker drops the entire LiftingPlan and routes to CPU.
     pub fn has_fallback(&self) -> bool {
-        self.decisions.values().any(|d| matches!(d, NodeDecision::Fallback(_)))
+        self.decisions
+            .values()
+            .any(|d| matches!(d, NodeDecision::Fallback(_)))
     }
 }
