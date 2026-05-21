@@ -17,7 +17,6 @@ from __future__ import annotations
 import logging
 
 import polars as pl
-import pytest
 from polars.testing import assert_frame_equal
 
 import polars_metal
@@ -35,7 +34,10 @@ def test_filter_col_gt_scalar_runs_on_gpu(caplog) -> None:
     metal = df.lazy().filter(pl.col("a") > 0).collect(engine=polars_metal.MetalEngine(debug=True))
     assert_frame_equal(cpu, metal)
     log_text = " ".join(r.getMessage() for r in caplog.records if r.name == "polars_metal")
-    assert "installed UDF" in log_text, f"expected UDF installation, got logs: {log_text}"
+    # M2 cost model: filter→CPU always. No UDF is installed; the router logs the CPU route.
+    assert "router routes entire query to CPU" in log_text, (
+        f"expected router-to-CPU log, got: {log_text}"
+    )
 
 
 def test_filter_col_lt_col_runs_on_gpu() -> None:
@@ -82,18 +84,15 @@ def test_filter_with_f64_comparison() -> None:
     assert_frame_equal(cpu, metal)
 
 
-@pytest.mark.xfail(
-    reason="cmp_f64 implements IEEE 754 ordered semantics (NaN OP x → false), but "
-    "Polars uses TotalOrd (NaN > any non-NaN → true). Kernel-level fix tracked "
-    "as a Task 17 follow-up in docs/open-questions.md.",
-    strict=True,
-)
 def test_filter_with_nan_f64_total_ord() -> None:
     """Polars treats NaN with TotalOrd: ``NaN > 0`` is True, the row survives.
 
-    Our kernel implements IEEE 754 ordered comparison (``NaN > 0`` is False),
-    so this test fails today. The kernel must be reworked to match Polars'
-    TotalOrd semantics — that's a Task 17 follow-up, not Task 18 territory.
+    Under M1's GPU path the cmp_f64 kernel used IEEE 754 ordered semantics
+    (``NaN > 0`` is False), so this test was xfail(strict). Under M2's cost
+    model filter→CPU, the query now routes to CPU, so Metal and CPU agree
+    (both use CPU), and the xfail is no longer needed. When the GPU filter
+    path is re-enabled, re-introduce the xfail until the kernel implements
+    TotalOrd semantics (tracked as Task 17 follow-up).
     """
     df = pl.DataFrame({"x": [1.0, float("nan"), 3.0, float("nan"), 5.0]})
     cpu = df.lazy().filter(pl.col("x") > 0).collect()

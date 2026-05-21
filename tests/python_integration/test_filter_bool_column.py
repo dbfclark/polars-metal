@@ -44,8 +44,11 @@ def test_filter_precomputed_bool_column_runs_on_gpu(caplog) -> None:
         .collect(engine=polars_metal.MetalEngine(debug=True))
     )
     assert_frame_equal(cpu, metal)
-    log_text = " ".join(rec.message for rec in caplog.records)
-    assert "installed UDF" in log_text, f"expected UDF installation, got logs: {log_text}"
+    log_text = " ".join(rec.getMessage() for rec in caplog.records if rec.name == "polars_metal")
+    # M2 cost model: filter→CPU always. No UDF is installed; the router logs the CPU route.
+    assert "router routes entire query to CPU" in log_text, (
+        f"expected router-to-CPU log, got: {log_text}"
+    )
 
 
 def test_filter_bool_all_kept_round_trips() -> None:

@@ -69,15 +69,19 @@ def test_select_with_bool_column() -> None:
     assert_frame_equal(cpu, metal)
 
 
-def test_walker_actually_installs_udf_for_supported_query(caplog) -> None:
+def test_walker_actually_routes_supported_query_via_router(caplog) -> None:
     """Proves the walker fires (rather than silently falling back) when the
-    plan is in its closed set. Without this, a regression that broke the
-    walker but kept results correct via CPU fallback would slip through."""
+    plan is in its closed set, and that the router is consulted. Under M2's
+    cost model, select-only queries route to CPU (no UDF installed), but the
+    router-to-CPU log line confirms the full walker+router pipeline ran.
+    Without this, a regression that broke the walker but kept results correct
+    via CPU fallback would slip through."""
     caplog.set_level(logging.DEBUG, logger="polars_metal")
     df = pl.DataFrame({"a": [1, 2, 3], "b": [10.0, 20.0, 30.0]})
     _ = df.lazy().select(["b", "a"]).collect(engine=polars_metal.MetalEngine(debug=True))
     msgs = [r.getMessage() for r in caplog.records if r.name == "polars_metal"]
-    assert any("installed UDF for plan kind=Scan" in m for m in msgs), msgs
+    # M2: Scan→CpuLeave, Project inherits. No UDF installed; router logs CPU route.
+    assert any("router routes entire query to CPU" in m for m in msgs), msgs
 
 
 def test_walker_falls_back_for_unsupported_dtype(caplog) -> None:
