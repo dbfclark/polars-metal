@@ -90,3 +90,48 @@ impl LiftingPlan {
             .any(|d| matches!(d, NodeDecision::Fallback(_)))
     }
 }
+
+use crate::plan::MetalPlanNode;
+
+/// Walk `root` bottom-up assigning per-node IDs in post-order; consult
+/// the cost model at each node; return the full LiftingPlan.
+///
+/// `NodeId::seq` is a monotone counter incremented in post-order. The
+/// Python walker uses the same counter (it produces the MetalPlanNode
+/// tree in the same shape), so wire-format IDs round-trip.
+pub fn compute_lifting_plan(root: &MetalPlanNode) -> LiftingPlan {
+    let mut plan = LiftingPlan::new();
+    let mut next_seq: u32 = 0;
+    let _ = walk(root, &mut plan, &mut next_seq);
+    plan
+}
+
+/// Recursive worker. Returns the assigned NodeId so the parent can read
+/// the child's recorded decision.
+fn walk(node: &MetalPlanNode, plan: &mut LiftingPlan, next_seq: &mut u32) -> NodeId {
+    match node {
+        MetalPlanNode::Scan { .. } => {
+            let id = NodeId::new("Scan", *next_seq);
+            *next_seq += 1;
+            plan.set(id.clone(), cost::decide_scan_initial());
+            id
+        }
+        MetalPlanNode::Project { input, .. } => {
+            let child_id = walk(input, plan, next_seq);
+            let id = NodeId::new("Project", *next_seq);
+            *next_seq += 1;
+            let child_decision = plan.get(&child_id)
+                .cloned()
+                .unwrap_or(NodeDecision::Fallback("missing child decision".into()));
+            plan.set(id.clone(), cost::decide_project(&child_decision));
+            id
+        }
+        MetalPlanNode::Filter { input, .. } => {
+            let _ = walk(input, plan, next_seq);
+            let id = NodeId::new("Filter", *next_seq);
+            *next_seq += 1;
+            plan.set(id.clone(), cost::decide_filter(0));
+            id
+        }
+    }
+}
