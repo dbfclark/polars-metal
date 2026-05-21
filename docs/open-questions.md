@@ -38,6 +38,8 @@ We committed to `cxx` for M0 based on a weak prior. If friction emerges before M
 
 **M1 friction observation (T5, 2026-05-20):** the `cxx::CxxVector` push-in / iter-copy-out pattern forces a per-element copy across the FFI boundary for every binding (`add_f32`, `cumsum_u8_to_u32`). At M1 sizes this is invisible; at M2's groupby/join scale (10M+ rows, multi-column) the u32-per-row copy on cumsum alone will dominate. The fix is direct MLX-over-`MTLBuffer` wiring — construct `mlx::core::array` views over our already-allocated `MTLBuffer` and read the result back in place rather than via `std::vector`. This rules in favor of either (a) extending `cxx` with raw-pointer-plus-len shims, or (b) the hand-written C shim + `bindgen` route mentioned above. Decide at M2 design.
 
+**M1 confirmation (T24, 2026-05-21):** the M1 baseline (`tests/bench/baseline.json`) shows the cumsum-via-`CxxVector` step is one of several contributors to the 12–55× end-to-end gap. Per-element FFI copy is no longer speculative; M2 design owns the decision between (a) extending `cxx` with raw-pointer-plus-len shims, or (b) hand-written C shim + `bindgen`.
+
 ## Walker / UDF integration with Polars internals (M1, T7 2026-05-20)
 
 Three friction points discovered while building the IR walker in Task 7. Each will affect every later task that touches the walker or the UDF path, so they live here rather than buried in T7's commit body.
@@ -101,4 +103,43 @@ Initially missing on the dev host: T19's MLX build had to use `-DMLX_BUILD_METAL
 
 - The portability gate (small M2, M1) is still a manual run-on-your-other-machine step. Document the procedure in `docs/` if we want subsequent milestones to enforce it more uniformly.
 - The `pyo3 0.22` macro emits `useless_conversion` clippy warnings in `polars-metal-core`; suppressed file-scoped with `#![allow(clippy::useless_conversion)]`. Revisit when pyo3 is upgraded.
-- The hypothesis differential harness in `tests/diff/` generates bare scans (no varied operations), so it's only really testing fallback parity. Add filter/select/groupby strategies once M1 has kernels producing real GPU output.
+- ~~The hypothesis differential harness in `tests/diff/` generates bare scans (no varied operations), so it's only really testing fallback parity. Add filter/select/groupby strategies once M1 has kernels producing real GPU output.~~ Filter+select portion done in T21 — `tests/diff/strategies.py` now exports `m1_null_density_dataframe`, `m1_predicate_expr`, and `m1_projection_subset`, exercised by `tests/diff/test_filter_random.py` (hypothesis) and `tests/diff/test_filter_edges.py` (empty / all-null / all-true / all-false). Groupby strategies remain deferred to M3 — see "Groupby differential strategies still missing" under "M1 retrospective notes" below.
+
+## M1 end-to-end performance gap (M1, T24 2026-05-21)
+
+The M1 design spec § Layer 4 sets a `ratio_metal_over_cpu <= 1.05` gate on five E2E queries. `tests/bench/baseline.json` (M2 Ultra, commit `299f4cb`) shows the actual ratios at 10M rows are 12.14× – 54.82× — Metal is 1–2 orders of magnitude **slower** than CPU on every query, not within 5%.
+
+Kernel-only criterion numbers (T23 — `cmp_i64` ~20 ms per 10M rows, `filter_scatter` ~19 ms per 10M rows) account for ~40 ms of the ~150–250 ms per-query Metal wall-clock. The remaining ~110–200 ms is dispatch + Arrow↔MTLBuffer marshalling per query, not kernel compute.
+
+Likely root causes, in rough order of suspected impact:
+
+- **The per-query Arrow→MTLBuffer setup is not hitting the M0 zero-copy bridge's fast path.** The bridge has both a zero-copy regime (page-aligned, refcount-bumped) and a copy regime; we don't yet know which one M1 queries actually take. Profile before optimising.
+- **`cmp_i64` shows ~5 GB/s effective memory throughput at 10M rows** versus M2 Ultra's ~800 GB/s peak. Possible causes: threadgroup sizing left at a portable default rather than tuned per device class, validity-bitmap loads issued one byte at a time (vs the 8-rows-at-a-time pattern called out in CLAUDE.md's gotchas), or scatter writes serialising on the prefix-sum dependency.
+- **Python walker → Rust UDF dispatch path has per-query Python overhead.** GIL acquisition, dict-walking the Polars IR, and Python-side `PyBytes` construction (see "BumpArena ships but is unwired" below) all sit on the hot path.
+- **MLX cumsum `CxxVector` copy-in / copy-out** (already tracked in the "FFI choice (cxx)" entry above) — confirmed contributor here, not just suspected.
+
+T28's M1 retrospective owns the gate decision: (a) widen the M1 ratio band and ship, (b) defer M1 ship pending optimisation, or (c) ship M1 with the gap documented and address in M2. M2 design owns the implementation response. *Owner:* M1 (T28 retrospective for the gate; M2 design for the fix path).
+
+## BumpArena ships but is unwired in the M1 hot path (M1, T25 2026-05-21)
+
+The M1 design spec (`docs/superpowers/specs/2026-05-20-m1-design.md:134-147`) described an arena that owns predicate intermediates, `keep_flags`, the `prefix_sum`, and the output column buffers, with output Arrow buffers' custom-deallocator closures keeping an `Arc<ScratchArena>` alive across the UDF boundary.
+
+The shipped M1 differs on the output side: `crates/polars-metal-core/src/udf.rs` materialises kernel outputs as `Vec<u8>` and copies them into `PyBytes::new_bound(py, &out_data)` (and the matching validity buffer) before returning to the walker, which round-trips them through Polars Arrow buffers. `BumpArena` (`crates/polars-metal-core/src/arena.rs`) is fully implemented with integration tests but is not called from `pipeline.rs` or `udf.rs` — it ships dormant.
+
+This is intentional for M1 (the keep-alive closure model needs design work to play nicely with Python's GC and Polars' Arrow buffer ownership) but is a known item for M2 — especially if the perf-gap investigation above points at allocation cost or the second copy through `PyBytes` as a contributor. *Owner:* M2 design.
+
+## M1 retrospective notes (2026-05-21)
+
+This is a placeholder structure for T28's full retrospective. T27 captures only the highest-signal items here; T28 will populate the rest.
+
+**Resolved in M1:**
+
+- ~~Differential harness only tested fallback parity (M0 retrospective).~~ Filter + projection strategies and edge cases landed in T21 — see strikethrough under "Still to revisit at M1" above.
+- ~~MLX FFI revisit was speculative (M0 "FFI choice" entry).~~ Now backed by both T5 friction (cumsum `CxxVector` copy) and T24 baseline data; M2 design owns the implementation choice.
+
+**Still to revisit at M2 (not blockers):**
+
+- **End-to-end perf gap.** The 12–55× CPU/Metal ratio at 10M rows is the dominant M2 design input — see dedicated entry above.
+- **BumpArena wiring.** Implemented but unwired in the M1 hot path — see dedicated entry above.
+- **Groupby differential strategies still missing.** T21 closed the filter/select half of the M0-era harness gap; groupby strategies wait on M3 kernels producing real GPU output, just as filter/select did for M1.
+- **Threadgroup tuning per device class.** `cmp_i64` and `filter_scatter` use portable defaults from `MTLDevice.maxThreadsPerThreadgroup()` (per CLAUDE.md), but the ~5 GB/s effective throughput on M2 Ultra suggests these are leaving silicon on the table. M2 owns the per-device-class tuning pass — not before, because we don't yet have a profiling story.
