@@ -220,6 +220,131 @@ pub fn encode_keys(cols: &[KeyColumn<'_>]) -> Result<(Vec<u128>, KeySchema), Key
     ))
 }
 
+// -----------------------------------------------------------------------
+// dispatch_hash — Rust dispatcher for the `groupby_hash` MSL kernel
+// -----------------------------------------------------------------------
+
+use crate::command::{CommandQueue, DispatchError};
+use crate::shader_lib::{shared_library, ShaderError};
+use polars_metal_buffer::{BufferError, MetalDevice};
+
+/// Errors raised by the groupby dispatchers.
+#[derive(Debug, thiserror::Error)]
+pub enum GroupByError {
+    #[error("key encoding: {0}")]
+    KeyEncode(#[from] KeyEncodeError),
+    #[error("shader library: {0}")]
+    Shader(#[from] ShaderError),
+    #[error("dispatch: {0}")]
+    Dispatch(#[from] DispatchError),
+    #[error("buffer: {0}")]
+    Buffer(#[from] BufferError),
+    #[error("output buffer too short: got {got}, need {need}")]
+    OutputTooShort { got: usize, need: usize },
+    #[error("n_rows {n_rows} exceeds u32::MAX")]
+    RowCountOverflow { n_rows: usize },
+}
+
+/// Dispatch the `groupby_hash` kernel.
+///
+/// Reads `encoded[0..n_rows]` (one u128 per row), writes one u32 hash per
+/// row to `hashes[0..n_rows]`.
+///
+/// `n_rows == 0` is a no-op (Metal rejects zero-byte buffers and zero-grid
+/// dispatches; we short-circuit cleanly here).
+pub fn dispatch_hash(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    encoded: &[u128],
+    n_rows: usize,
+    hashes: &mut [u32],
+) -> Result<(), GroupByError> {
+    if n_rows == 0 {
+        return Ok(());
+    }
+
+    let n_rows_u32: u32 =
+        u32::try_from(n_rows).map_err(|_| GroupByError::RowCountOverflow { n_rows })?;
+
+    if encoded.len() < n_rows {
+        return Err(GroupByError::OutputTooShort {
+            got: encoded.len(),
+            need: n_rows,
+        });
+    }
+    if hashes.len() < n_rows {
+        return Err(GroupByError::OutputTooShort {
+            got: hashes.len(),
+            need: n_rows,
+        });
+    }
+
+    // SAFETY: `u128` is plain-old-data with no invalid bit patterns.
+    // We reinterpret a live `&[u128]` as a `&[u8]` of length `n_rows * 16`.
+    // The slice is alive for the duration of this call; `new_buffer_from_bytes`
+    // copies bytes synchronously into a freshly allocated MTLBuffer and does
+    // not retain the reference past the call.
+    let key_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            encoded.as_ptr() as *const u8,
+            n_rows * std::mem::size_of::<u128>(),
+        )
+    };
+
+    let lib = shared_library(device)?;
+    let pso = lib.pipeline("groupby_hash")?;
+
+    let keys_buf = device.new_buffer_from_bytes(key_bytes)?;
+    let hashes_buf = device.new_buffer_zeroed(n_rows * std::mem::size_of::<u32>())?;
+    let n_rows_buf = device.new_buffer_from_bytes(&n_rows_u32.to_le_bytes())?;
+
+    queue.dispatch_1d(&pso, &[&keys_buf, &hashes_buf, &n_rows_buf], n_rows)?;
+    queue.wait_until_complete()?;
+
+    // Copy results back. `as_slice()` returns `&[u8]`; decode to `u32`.
+    let out_bytes = hashes_buf.as_slice();
+    let need_bytes = n_rows * std::mem::size_of::<u32>();
+    if out_bytes.len() < need_bytes {
+        return Err(GroupByError::OutputTooShort {
+            got: out_bytes.len(),
+            need: need_bytes,
+        });
+    }
+    for (i, h) in hashes.iter_mut().take(n_rows).enumerate() {
+        let b = &out_bytes[i * 4..(i + 1) * 4];
+        *h = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    }
+    Ok(())
+}
+
+/// Pure-Rust reference implementation of `hash_u128` from `shaders/_groupby.metal`.
+///
+/// Must stay byte-for-byte in sync with the MSL `hash_u128` function. Used by
+/// the proptest in `tests/test_groupby_hash.rs` to verify GPU output.
+///
+/// Inputs: `lo` and `hi` are the low and high 64-bit halves of a u128 key,
+/// exactly as the kernel reads them from `keys[gid*2]` and `keys[gid*2+1]`.
+pub fn hash_u128_reference(lo: u64, hi: u64) -> u32 {
+    fn rotl_u64(x: u64, r: u32) -> u64 {
+        (x << r) | (x >> (64 - r))
+    }
+    fn xxhash_finalize_u64(v: u64) -> u32 {
+        const PRIME32_2: u32 = 2_246_822_519;
+        const PRIME32_3: u32 = 3_266_489_917;
+        let mut h: u32 = (v ^ (v >> 32)) as u32;
+        h ^= h >> 15;
+        h = h.wrapping_mul(PRIME32_2);
+        h ^= h >> 13;
+        h = h.wrapping_mul(PRIME32_3);
+        h ^= h >> 16;
+        h
+    }
+    let combined = lo ^ rotl_u64(hi, 27);
+    xxhash_finalize_u64(combined)
+}
+
+// -----------------------------------------------------------------------
+
 /// Decoded representation of one key column, used to reconstruct result
 /// DataFrames after the kernel returns indices.
 #[derive(Debug, Clone, PartialEq)]
