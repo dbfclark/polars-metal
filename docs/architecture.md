@@ -234,9 +234,11 @@ the hot path.
 
 ## Three-pass compaction pipeline
 
-`crates/polars-metal-kernels/src/pipeline.rs::compact_{i64,f64,bool}`
-runs three passes per source column, given the predicate `(data,
-valid)` pair from step 3 above and the column's `(data, valid)` pair:
+`crates/polars-metal-kernels/src/pipeline.rs` splits the work into two
+phases. Passes 1 and 2 (`compute_keep_and_prefix`) run **once per
+filter dispatch**; pass 3 (`compact_{i64,f64,bool}`) runs **once per
+surviving column**, taking the shared `keep` and `prefix` buffers
+plus the precomputed survivor count `n_out`.
 
 1. **Predicate to dense u8.** `dispatch_predicate_to_u8`
    (`shaders/filter_predicate.metal::filter_predicate_to_u8`) reads
@@ -260,8 +262,13 @@ valid)` pair from step 3 above and the column's `(data, valid)` pair:
    the bool variant cannot reserve a slot since every bit is
    meaningful) is allocated and checked post-dispatch.
 
-The `keep_flags` u8 buffer, the u32 prefix buffer, and the dst
-buffers are each freshly allocated per compaction call; per-query
+Before T30 Step 2 (`fcf7a1f`) passes 1 and 2 were inlined into each
+per-column `compact_*` call and ran redundantly once per surviving
+column. Hoisting them out is the largest single contribution to the
+post-T30 perf numbers below.
+
+The `keep_flags` u8 buffer, the u32 prefix buffer, and the per-column
+dst buffers are each freshly allocated per filter dispatch; per-query
 arena reuse is deferred to M2 — see
 [Arena and deallocator keep-alive](#arena-and-deallocator-keep-alive).
 
@@ -269,12 +276,14 @@ arena reuse is deferred to M2 — see
 
 `polars-metal-mlx-sys::cumsum_u8_to_u32` is the only MLX op M1 uses.
 Its FFI signature is `(input: &[u8], out: &mut [u32]) -> Result<(),
-FfiError>`, implemented via `cxx::CxxVector` — every input byte is
-pushed into a `std::vector<u8>` and every output u32 is iterated back
-out. At M1 sizes this is invisible; at M2 sizes (10M+ rows, multiple
-columns) the u32-per-row read-back will dominate. The fix — direct
-MLX-over-`MTLBuffer` views — is the scheduled M2 FFI revisit, tracked
-in [`open-questions.md` § FFI choice (cxx)](open-questions.md).
+FfiError>`, implemented over `rust::Slice` (thin pointer + length) on
+both sides — no per-element marshalling across the FFI boundary. The
+remaining cost inside the bridge is the MLX `array(ptr, shape, dtype)`
+constructor's copy-in and a memcpy of the scan result back into the
+caller's slice. At M1 sizes that's small; fully eliminating it
+requires direct MLX-over-`MTLBuffer` views, which is the scheduled M2
+FFI revisit tracked in
+[`open-questions.md` § FFI choice (cxx)](open-questions.md).
 
 ## Arena and deallocator keep-alive
 
@@ -372,18 +381,25 @@ Two categories, per the
 ## Performance (current state)
 
 End-to-end M1 benchmarks at 10M rows on Apple M2 Ultra
-(`tests/bench/baseline.json`) put `engine=MetalEngine()` between 12×
-and 55× **slower** than `engine="cpu"` across the five M1 queries.
-Per-kernel criterion numbers (`target/criterion/`) show the individual
-MSL kernels are competitive (`cmp_i64` ~20ms, `filter_scatter` ~19ms
-per 10M rows). The remaining 150–180ms per query is dispatch overhead
-and Arrow ↔ MTLBuffer marshalling. The 5%-of-CPU bar from the design
-spec is therefore not met in M1; details and the gate-widening
-discussion are in
-[`open-questions.md`](open-questions.md) and the M1 retrospective.
-This is the honest M1 starting point; M2's planned MLX-over-MTLBuffer
-direct wiring and per-query arena both target the dispatch overhead
-directly.
+(`tests/bench/baseline.json`) put `engine=MetalEngine()` between 5.3×
+and 17.6× **slower** than `engine="cpu"` across the five M1 queries
+(`filter_simple` 8.4×, `filter_compound` 9.0×, `filter_then_project`
+8.7×, `filter_then_project_high_selectivity` 17.6×,
+`filter_then_project_low_selectivity` 5.3×). T30 cut `filter_simple`
+from 220ms to 78ms (−65%) by hoisting the predicate-to-u8 and MLX
+cumsum out of the per-column loop and by replacing the
+`CxxVector`-based cumsum FFI with a `rust::Slice` bridge. The
+pre-T30 picture put cumsum FFI marshalling × per-column redundancy on
+the hot path; that is now fixed.
+
+What's left in the surviving ~78ms (per T30 Step 1 profiling) is
+kernel-level dispatch (predicate + scatter — threadgroup tuning,
+validity-bitmap load patterns), the per-query Arrow→MTLBuffer setup
+(~18ms — the original zero-copy bridge wiring), and the two
+host↔MLX memcpys still inside the cumsum call. All three are
+M2-shaped; the 5%-of-CPU bar from the design spec is not met in M1.
+Details are in [`open-questions.md`](open-questions.md) and the M1
+retrospective.
 
 ## Where the code lives
 
@@ -444,10 +460,13 @@ Forward-pointers to [`open-questions.md`](open-questions.md):
 
 - **`cmp_f64` NaN vs Polars TotalOrd.** IEEE 754 semantics; one
   conformance test is `xfail(strict=True)`. *Owner:* M1 post-T18 / M2.
-- **MLX FFI revisit.** `cumsum_u8_to_u32` is the canary; M2's
-  reductions will force the direct-MLX-over-MTLBuffer rewrite.
-- **Per-query dispatch + marshalling overhead.** Dominates M1 E2E
-  perf (above); arena + direct MLX wiring are the planned M2 levers.
+- **MLX FFI revisit.** The slice-based `cumsum_u8_to_u32` bridge
+  retired the per-element marshalling cost; the remaining two
+  host↔MLX memcpys inside the call need the direct-MLX-over-MTLBuffer
+  rewrite, which M2's reductions will force anyway.
+- **Per-query dispatch + marshalling overhead.** What remains of the
+  M1 E2E gap after T30 (above); arena + direct MLX wiring +
+  threadgroup tuning are the planned M2 levers.
 - **Polars rev drift / walker IR-class identification.** M1 has no
   version handshake; cuDF's pattern is the model when we add one.
 - **Monkey-patch coupling.** Two patch sites today; upstream-hook

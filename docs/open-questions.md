@@ -36,9 +36,11 @@ We assume Arrow `Buffer`s sometimes arrive page-aligned and sometimes don't. The
 
 We committed to `cxx` for M0 based on a weak prior. If friction emerges before M2, switch to hand-written C shim + `bindgen`. *Owner:* M0 (revisit at M2's design).
 
-**M1 friction observation (T5, 2026-05-20):** the `cxx::CxxVector` push-in / iter-copy-out pattern forces a per-element copy across the FFI boundary for every binding (`add_f32`, `cumsum_u8_to_u32`). At M1 sizes this is invisible; at M2's groupby/join scale (10M+ rows, multi-column) the u32-per-row copy on cumsum alone will dominate. The fix is direct MLX-over-`MTLBuffer` wiring — construct `mlx::core::array` views over our already-allocated `MTLBuffer` and read the result back in place rather than via `std::vector`. This rules in favor of either (a) extending `cxx` with raw-pointer-plus-len shims, or (b) the hand-written C shim + `bindgen` route mentioned above. Decide at M2 design.
+**M1 friction observation (T5, 2026-05-20):** ~~the `cxx::CxxVector` push-in / iter-copy-out pattern forces a per-element copy across the FFI boundary for every binding (`add_f32`, `cumsum_u8_to_u32`). At M1 sizes this is invisible; at M2's groupby/join scale (10M+ rows, multi-column) the u32-per-row copy on cumsum alone will dominate.~~ **Resolved for cumsum in T30 Step 3 (`ae63acb`):** `cumsum_u8_to_u32` now uses `rust::Slice` on both sides — no `CxxVector`, no per-element marshalling. T30 Step 2 (`fcf7a1f`) also hoisted the cumsum out of the per-column compaction loop, so the call now happens once per filter dispatch rather than once per surviving column. The remaining cost inside the bridge is the MLX `array(ptr, shape, dtype)` constructor's copy-in and a memcpy of the scan result back into the caller's slice.
 
-**M1 confirmation (T24, 2026-05-21):** the M1 baseline (`tests/bench/baseline.json`) shows the cumsum-via-`CxxVector` step is one of several contributors to the 12–55× end-to-end gap. Per-element FFI copy is no longer speculative; M2 design owns the decision between (a) extending `cxx` with raw-pointer-plus-len shims, or (b) hand-written C shim + `bindgen`.
+**M1 confirmation (T24, 2026-05-21):** the M1 baseline (`tests/bench/baseline.json`) showed the cumsum-via-`CxxVector` step was a confirmed contributor to the end-to-end gap. T30 (above) resolved the per-element marshalling component; the two host↔MLX memcpys still inside the cumsum call require direct MLX-over-`MTLBuffer` wiring (construct `mlx::core::array` views over our already-allocated `MTLBuffer` and read the result back in place).
+
+**Partial resolution of the cxx-vs-bindgen question:** the T30 Step 3 slice bridge demonstrates that `cxx` *can* do raw-pointer-plus-len performantly via `rust::Slice`. The remaining M2 decision — whether direct MLX-over-`MTLBuffer` views are cleaner under (a) extended `cxx` shims or (b) hand-written C shim + `bindgen` — is narrower than originally framed.
 
 ## Walker / UDF integration with Polars internals (M1, T7 2026-05-20)
 
@@ -107,18 +109,17 @@ Initially missing on the dev host: T19's MLX build had to use `-DMLX_BUILD_METAL
 
 ## M1 end-to-end performance gap (M1, T24 2026-05-21)
 
-The M1 design spec § Layer 4 sets a `ratio_metal_over_cpu <= 1.05` gate on five E2E queries. `tests/bench/baseline.json` (M2 Ultra, commit `299f4cb`) shows the actual ratios at 10M rows are 12.14× – 54.82× — Metal is 1–2 orders of magnitude **slower** than CPU on every query, not within 5%.
+The M1 design spec § Layer 4 sets a `ratio_metal_over_cpu <= 1.05` gate on five E2E queries. `tests/bench/baseline.json` (M2 Ultra, post-T30 at `ae63acb`) shows the actual ratios at 10M rows are 5.27× – 17.65× — Metal still slower than CPU on every query, not within 5%, but down from the pre-T30 12.14× – 54.82× range. `filter_simple` cumulatively dropped from 220ms to 78ms (−65%) across T30.
 
-Kernel-only criterion numbers (T23 — `cmp_i64` ~20 ms per 10M rows, `filter_scatter` ~19 ms per 10M rows) account for ~40 ms of the ~150–250 ms per-query Metal wall-clock. The remaining ~110–200 ms is dispatch + Arrow↔MTLBuffer marshalling per query, not kernel compute.
+Kernel-only criterion numbers (T23 — `cmp_i64` ~20 ms per 10M rows, `filter_scatter` ~19 ms per 10M rows) account for the bulk of the remaining ~50–100 ms per-query Metal wall-clock. The remaining gap is dispatch + Arrow↔MTLBuffer setup per query, not kernel compute.
 
-Likely root causes, in rough order of suspected impact:
+Remaining root causes, in rough order of suspected impact (post-T30):
 
-- **The per-query Arrow→MTLBuffer setup is not hitting the M0 zero-copy bridge's fast path.** The bridge has both a zero-copy regime (page-aligned, refcount-bumped) and a copy regime; we don't yet know which one M1 queries actually take. Profile before optimising.
-- **`cmp_i64` shows ~5 GB/s effective memory throughput at 10M rows** versus M2 Ultra's ~800 GB/s peak. Possible causes: threadgroup sizing left at a portable default rather than tuned per device class, validity-bitmap loads issued one byte at a time (vs the 8-rows-at-a-time pattern called out in CLAUDE.md's gotchas), or scatter writes serialising on the prefix-sum dependency.
-- **Python walker → Rust UDF dispatch path has per-query Python overhead.** GIL acquisition, dict-walking the Polars IR, and Python-side `PyBytes` construction (see "BumpArena ships but is unwired" below) all sit on the hot path.
-- **MLX cumsum `CxxVector` copy-in / copy-out** (already tracked in the "FFI choice (cxx)" entry above) — confirmed contributor here, not just suspected.
+- **Predicate-kernel and scatter-kernel dispatch.** Threadgroup sizing is left at a portable default rather than tuned per device class; validity-bitmap loads are issued one byte at a time (vs the 8-rows-at-a-time pattern called out in CLAUDE.md's gotchas); scatter writes serialise on the prefix-sum dependency. Owner: M2 kernel-level tuning pass.
+- **Per-query Arrow→MTLBuffer setup (~18 ms).** The M0 zero-copy bridge has both a zero-copy regime (page-aligned, refcount-bumped) and a copy regime; M1 queries are taking the copy regime more often than expected. Owner: M2 perf response (direct MLX-over-MTLBuffer wiring will also bear on this).
+- **Two host↔MLX memcpys inside the cumsum call.** MLX's `array(ptr, shape, dtype)` constructor copies bytes into MLX-managed memory and we memcpy the scan result back into the caller's slice. Per-element marshalling was eliminated in T30 Step 3 (`ae63acb`); full elimination of the data-touching passes needs the MLX-over-`MTLBuffer` rewrite tracked in "FFI choice (cxx)" above.
 
-T28's M1 retrospective owns the gate decision: (a) widen the M1 ratio band and ship, (b) defer M1 ship pending optimisation, or (c) ship M1 with the gap documented and address in M2. M2 design owns the implementation response. *Owner:* M1 (T28 retrospective for the gate; M2 design for the fix path).
+T28's M1 retrospective took the "ship M1 with the gap documented" path; T30 followed up with the cumsum/per-column-redundancy fix; the three bottlenecks above are the M2 design inputs. *Owner:* M2 design.
 
 ## BumpArena ships but is unwired in the M1 hot path (M1, T25 2026-05-21)
 
@@ -135,11 +136,11 @@ This is a placeholder structure for T28's full retrospective. T27 captures only 
 **Resolved in M1:**
 
 - ~~Differential harness only tested fallback parity (M0 retrospective).~~ Filter + projection strategies and edge cases landed in T21 — see strikethrough under "Still to revisit at M1" above.
-- ~~MLX FFI revisit was speculative (M0 "FFI choice" entry).~~ Now backed by both T5 friction (cumsum `CxxVector` copy) and T24 baseline data; M2 design owns the implementation choice.
+- ~~MLX FFI revisit was speculative (M0 "FFI choice" entry).~~ Backed by T5 friction and T24 baseline data; cumsum-specific component resolved in T30 Step 3 (`ae63acb`) via the `rust::Slice` bridge. The broader MLX-over-`MTLBuffer` decision remains an M2 design item — see "FFI choice (cxx)".
 
 **Still to revisit at M2 (not blockers):**
 
-- **End-to-end perf gap.** The 12–55× CPU/Metal ratio at 10M rows is the dominant M2 design input — see dedicated entry above.
+- **End-to-end perf gap.** The 5.3–17.6× CPU/Metal ratio at 10M rows (post-T30) is the dominant M2 design input — see dedicated entry above.
 - **BumpArena wiring.** Implemented but unwired in the M1 hot path — see dedicated entry above.
 - **Groupby differential strategies still missing.** T21 closed the filter/select half of the M0-era harness gap; groupby strategies wait on M3 kernels producing real GPU output, just as filter/select did for M1.
 - **Threadgroup tuning per device class.** `cmp_i64` and `filter_scatter` use portable defaults from `MTLDevice.maxThreadsPerThreadgroup()` (per CLAUDE.md), but the ~5 GB/s effective throughput on M2 Ultra suggests these are leaving silicon on the table. M2 owns the per-device-class tuning pass — not before, because we don't yet have a profiling story.
