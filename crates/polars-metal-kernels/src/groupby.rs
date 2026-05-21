@@ -4,11 +4,13 @@
 //! Each key column contributes (1-bit null flag) + (dtype-width-bits) to
 //! a u128 lane per row. Lane layout, from LSB to MSB:
 //!
-//!     bit 0:                      key0.null
-//!     bits 1..1+w(key0):          key0.data
-//!     bit 1+w(key0):              key1.null
-//!     bits 2+w(key0)..2+w(key0)+w(key1):  key1.data
-//!     ...
+//! ```text
+//! bit 0:                      key0.null
+//! bits 1..1+w(key0):          key0.data
+//! bit 1+w(key0):              key1.null
+//! bits 2+w(key0)..2+w(key0)+w(key1):  key1.data
+//! ...
+//! ```
 //!
 //! The layout is deterministic given the input column list — the same
 //! column order yields the same encoding, byte-for-byte. The hash kernel
