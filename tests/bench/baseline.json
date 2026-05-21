@@ -1,34 +1,34 @@
 {
   "_units": "median wall-clock in milliseconds from pytest-benchmark default config (warmup absorbed)",
-  "_notes": "Post-T30 baseline. T30 Step 2 (this commit) hoists the predicate-to-u8 + MLX cumsum work out of the per-column compaction loop in execute_filter_compact: with 3 surviving columns the cumsum FFI used to run 3x at ~48ms each (~144ms redundant work per filter); now it runs once and the (keep, prefix, n_out) triple is shared across columns. filter_simple dropped from 221.6ms to 117.2ms (47%), and every other Metal query improved correspondingly. The dominant remaining cost is the MLX cumsum FFI itself (CxxVector push/pop overhead) — T30 Step 3 owns that fix.",
+  "_notes": "Post-T30 Step 3 baseline. The cumsum FFI in `crates/polars-metal-mlx-sys` now passes input/output as `rust::Slice` (thin pointer+length) instead of per-element `cxx::CxxVector` push/iter loops. With 10M-row inputs the Rust-side push of 10M u8s plus the iter-copy of 10M u32s was costing ~40ms per call on its own; eliminating those loops drops filter_simple from 117.2ms to 77.8ms (-34%) and brings the Metal/CPU ratio for filter_simple under 9x for the first time. The internal MLX `array(ptr, shape, dtype)` constructor still copies bytes into MLX-managed memory and we memcpy the scan result back into the caller's slice — those two memcpys are the only data-touching passes left in the cumsum call. Pushing the FFI cost lower than this requires the M2 MLX-over-MTLBuffer rewrite tracked in docs/open-questions.md.",
   "machine": "Apple M2 Ultra",
-  "git_sha": "fcf7a1fec60659fbc6094f765f6d703a2f384baa",
+  "git_sha": "ae63acb8021433d955ee3e9e8e5a4ac4c8d017a4",
   "date": "2026-05-21",
   "queries": {
     "filter_simple": {
-      "cpu_ms": 9.188,
-      "metal_ms": 117.245,
-      "ratio_metal_over_cpu": 12.76
+      "cpu_ms": 9.262,
+      "metal_ms": 77.752,
+      "ratio_metal_over_cpu": 8.39
     },
     "filter_compound": {
-      "cpu_ms": 11.261,
-      "metal_ms": 144.064,
-      "ratio_metal_over_cpu": 12.79
+      "cpu_ms": 11.371,
+      "metal_ms": 102.049,
+      "ratio_metal_over_cpu": 8.97
     },
     "filter_then_project": {
-      "cpu_ms": 11.783,
-      "metal_ms": 141.981,
-      "ratio_metal_over_cpu": 12.05
+      "cpu_ms": 11.554,
+      "metal_ms": 100.542,
+      "ratio_metal_over_cpu": 8.70
     },
     "filter_then_project_high_selectivity": {
-      "cpu_ms": 2.651,
-      "metal_ms": 95.602,
-      "ratio_metal_over_cpu": 36.06
+      "cpu_ms": 2.933,
+      "metal_ms": 51.763,
+      "ratio_metal_over_cpu": 17.65
     },
     "filter_then_project_low_selectivity": {
-      "cpu_ms": 14.326,
-      "metal_ms": 123.136,
-      "ratio_metal_over_cpu": 8.60
+      "cpu_ms": 15.250,
+      "metal_ms": 80.288,
+      "ratio_metal_over_cpu": 5.27
     }
   }
 }
