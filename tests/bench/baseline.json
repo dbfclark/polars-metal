@@ -1,0 +1,34 @@
+{
+  "_units": "median wall-clock in milliseconds from pytest-benchmark default config (warmup absorbed)",
+  "_notes": "All five Metal queries exceed the M1 ratio_metal_over_cpu <= 1.05 gate by 12-55x at 10M rows. The cpu_ms timings reflect Polars 1.40.1 with default optimization; metal_ms reflects the M1 end-to-end path (DataFrameScan -> Filter -> optional Project) lowered through the Python walker, predicate-AST UDF, MSL kernels, and Arrow<->MTLBuffer bridge. Kernel-only criterion numbers (target/criterion/) show cmp_i64 ~20ms and filter_scatter ~19ms per 10M rows, so even the raw kernels are slower than CPU end-to-end; the remaining ~150-180ms in metal_ms is dispatch + buffer marshalling overhead per query. Treat as the honest M1 starting point; T28 retrospective owns the gate-widening decision.",
+  "machine": "Apple M2 Ultra",
+  "git_sha": "<HEAD>",
+  "date": "2026-05-21",
+  "queries": {
+    "filter_simple": {
+      "cpu_ms": 9.239,
+      "metal_ms": 221.639,
+      "ratio_metal_over_cpu": 23.99
+    },
+    "filter_compound": {
+      "cpu_ms": 10.969,
+      "metal_ms": 244.731,
+      "ratio_metal_over_cpu": 22.31
+    },
+    "filter_then_project": {
+      "cpu_ms": 10.990,
+      "metal_ms": 244.679,
+      "ratio_metal_over_cpu": 22.26
+    },
+    "filter_then_project_high_selectivity": {
+      "cpu_ms": 2.598,
+      "metal_ms": 142.394,
+      "ratio_metal_over_cpu": 54.82
+    },
+    "filter_then_project_low_selectivity": {
+      "cpu_ms": 14.246,
+      "metal_ms": 172.992,
+      "ratio_metal_over_cpu": 12.14
+    }
+  }
+}
