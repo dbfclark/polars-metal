@@ -9,6 +9,7 @@
 mod arena;
 mod error;
 pub mod plan;
+pub mod router;
 mod udf;
 
 pub use arena::{BumpArena, ScratchArena, StubArena};
