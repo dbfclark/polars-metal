@@ -1,0 +1,34 @@
+{
+  "_units": "median wall-clock in milliseconds from pytest-benchmark default config (warmup absorbed)",
+  "_notes": "Post-T30 Step 3 baseline. The cumsum FFI in `crates/polars-metal-mlx-sys` now passes input/output as `rust::Slice` (thin pointer+length) instead of per-element `cxx::CxxVector` push/iter loops. With 10M-row inputs the Rust-side push of 10M u8s plus the iter-copy of 10M u32s was costing ~40ms per call on its own; eliminating those loops drops filter_simple from 117.2ms to 77.8ms (-34%) and brings the Metal/CPU ratio for filter_simple under 9x for the first time. The internal MLX `array(ptr, shape, dtype)` constructor still copies bytes into MLX-managed memory and we memcpy the scan result back into the caller's slice — those two memcpys are the only data-touching passes left in the cumsum call. Pushing the FFI cost lower than this requires the M2 MLX-over-MTLBuffer rewrite tracked in docs/open-questions.md.",
+  "machine": "Apple M2 Ultra",
+  "git_sha": "ae63acb8021433d955ee3e9e8e5a4ac4c8d017a4",
+  "date": "2026-05-21",
+  "queries": {
+    "filter_simple": {
+      "cpu_ms": 9.262,
+      "metal_ms": 77.752,
+      "ratio_metal_over_cpu": 8.39
+    },
+    "filter_compound": {
+      "cpu_ms": 11.371,
+      "metal_ms": 102.049,
+      "ratio_metal_over_cpu": 8.97
+    },
+    "filter_then_project": {
+      "cpu_ms": 11.554,
+      "metal_ms": 100.542,
+      "ratio_metal_over_cpu": 8.70
+    },
+    "filter_then_project_high_selectivity": {
+      "cpu_ms": 2.933,
+      "metal_ms": 51.763,
+      "ratio_metal_over_cpu": 17.65
+    },
+    "filter_then_project_low_selectivity": {
+      "cpu_ms": 15.250,
+      "metal_ms": 80.288,
+      "ratio_metal_over_cpu": 5.27
+    }
+  }
+}

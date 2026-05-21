@@ -10,5 +10,48 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+[dependencies]
+objc2 = "0.5"
+objc2-metal = { version = "0.2", features = [
+    "MTLDevice",
+    "MTLLibrary",
+    "MTLComputePipeline",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLComputeCommandEncoder",
+    "MTLBuffer",
+    "MTLResource",
+    "MTLTypes",
+] }
+objc2-foundation = { version = "0.2", features = ["NSURL", "NSString", "NSError"] }
+polars-metal-buffer = { path = "../polars-metal-buffer" }
+polars-metal-mlx-sys = { path = "../polars-metal-mlx-sys" }
+thiserror = "1"
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1"
+
+[[bench]]
+name = "cmp_i64"
+harness = false
+
+[[bench]]
+name = "cmp_f64"
+harness = false
+
+[[bench]]
+name = "logical_bool"
+harness = false
+
+[[bench]]
+name = "filter_predicate"
+harness = false
+
+[[bench]]
+name = "filter_scatter"
+harness = false
+
 [lints]
 workspace = true

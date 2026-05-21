@@ -36,6 +36,39 @@ We assume Arrow `Buffer`s sometimes arrive page-aligned and sometimes don't. The
 
 We committed to `cxx` for M0 based on a weak prior. If friction emerges before M2, switch to hand-written C shim + `bindgen`. *Owner:* M0 (revisit at M2's design).
 
+**M1 friction observation (T5, 2026-05-20):** ~~the `cxx::CxxVector` push-in / iter-copy-out pattern forces a per-element copy across the FFI boundary for every binding (`add_f32`, `cumsum_u8_to_u32`). At M1 sizes this is invisible; at M2's groupby/join scale (10M+ rows, multi-column) the u32-per-row copy on cumsum alone will dominate.~~ **Resolved for cumsum in T30 Step 3 (`ae63acb`):** `cumsum_u8_to_u32` now uses `rust::Slice` on both sides — no `CxxVector`, no per-element marshalling. T30 Step 2 (`fcf7a1f`) also hoisted the cumsum out of the per-column compaction loop, so the call now happens once per filter dispatch rather than once per surviving column. The remaining cost inside the bridge is the MLX `array(ptr, shape, dtype)` constructor's copy-in and a memcpy of the scan result back into the caller's slice.
+
+**M1 confirmation (T24, 2026-05-21):** the M1 baseline (`tests/bench/baseline.json`) showed the cumsum-via-`CxxVector` step was a confirmed contributor to the end-to-end gap. T30 (above) resolved the per-element marshalling component; the two host↔MLX memcpys still inside the cumsum call require direct MLX-over-`MTLBuffer` wiring (construct `mlx::core::array` views over our already-allocated `MTLBuffer` and read the result back in place).
+
+**Partial resolution of the cxx-vs-bindgen question:** the T30 Step 3 slice bridge demonstrates that `cxx` *can* do raw-pointer-plus-len performantly via `rust::Slice`. The remaining M2 decision — whether direct MLX-over-`MTLBuffer` views are cleaner under (a) extended `cxx` shims or (b) hand-written C shim + `bindgen` — is narrower than originally framed.
+
+## Walker / UDF integration with Polars internals (M1, T7 2026-05-20)
+
+Three friction points discovered while building the IR walker in Task 7. Each will affect every later task that touches the walker or the UDF path, so they live here rather than buried in T7's commit body.
+
+1. **UDF re-entry via `df.select`.** `pl.DataFrame.select` internally calls `lazy().collect()`. When `MetalEngine` is installed, our patched `LazyFrame.collect` intercepts that re-entrant call and dispatches *back* through the walker — infinite recursion. T7 mitigates by using `pl.DataFrame._from_pydf(df._df.select(list(names)))` (the underlying PyDataFrame's sync `select`, no LazyFrame round-trip). **Task 8's Rust dispatch will hit the same trap** the moment it constructs a result DataFrame from kernel outputs; any reassembly path that uses `df.select`/`df.with_columns` triggers re-entry. *Owner:* M1 (T8 onward — always use PyDataFrame internals when assembling UDF outputs).
+
+2. **Polars NodeTraverser version handshake.** T7 identifies IR nodes by `type(node).__name__` because the PyO3-generated IR classes in py-1.40.1 live in the unnamed `builtins` module. This is the canonical Polars-Python idiom for one pinned rev. cuDF-Polars guards against silent breakage on Polars version drift by asserting `(version := nt.version()) < (12, 1)` at walk entry. We don't have an equivalent guard. Adding one before any Polars rev bump (current pin: `py-1.40.1`) prevents silently wrong behavior when an IR class is renamed. *Owner:* M1 (T8 or first conformance regression on a rev bump).
+
+3. **`DataFrameScan.selection` predicate pushdown triggers M1 fallback.** Polars' optimizer can push a Filter predicate onto a DataFrameScan as a `.selection` attribute, eliminating the explicit Filter node. The walker currently rejects any DataFrameScan with a non-None `selection` (because we'd need to evaluate that predicate via the same kernels Filter uses). Once Phase 5+ Filter lands, the walker should lift these to GPU instead — otherwise many CSE-optimized queries fall back unnecessarily even when they're entirely within the M1 supported set. *Owner:* M1 (Phase 5+, T15+).
+
+## cmp_f64 NaN semantics: IEEE 754 vs Polars TotalOrd (M1, T18 2026-05-20)
+
+`shaders/cmp_f64.metal` (Task 17) implements IEEE 754 ordered comparison: `NaN OP x` is `false` for `==, <, <=, >, >=` and `true` only for `!=`. Polars CPU implements `TotalOrd` semantics for these ops — NaN is treated as **greater than any non-NaN** value, so `NaN > 0 = true`, `NaN > NaN = false` (per total ordering), `NaN == NaN = true`.
+
+Concrete check (`py-1.40.1`):
+
+```
+pl.Series([1.0, NaN, 3.0]) > 0  →  [True, True, True]
+pl.Series([1.0, NaN, 3.0]) == pl.Series([1.0, NaN, 3.0])  →  [True, True, True]
+```
+
+Discovered while landing the Task 18 end-to-end filter+comparison wiring. The integer path (`cmp_i64.metal`) is unaffected. T18 marks the failing test (`test_filter_with_nan_f64_total_ord`) `xfail(strict=True)` so when the kernel is fixed, the strict-xfail will flip and force us to drop the marker.
+
+**Fix sketch:** rework the six `f64_<op>` helpers in `cmp_f64.metal` to short-circuit NaN-presence into the matching TotalOrd outcome. `f64_eq` returns true when both inputs are NaN; the order helpers (`<, <=, >, >=`) treat NaN as larger than any non-NaN value. `f64_total_order_key` is already nearly the right primitive — it just needs to map NaN consistently above ±Inf.
+
+*Owner:* M1 (post-T18 follow-up alongside Task 21's hypothesis differential strategies, which would have caught this immediately).
+
 ## MLX install path
 
 Resolved in T19: git submodule under `vendor/mlx`, pinned to v0.22.0, built via cmake. *Owner:* M0 (resolved). Refresh via standalone cmake invocation, not via `scripts/refresh-references.sh` (which is for read-only references, not build deps).
@@ -72,4 +105,61 @@ Initially missing on the dev host: T19's MLX build had to use `-DMLX_BUILD_METAL
 
 - The portability gate (small M2, M1) is still a manual run-on-your-other-machine step. Document the procedure in `docs/` if we want subsequent milestones to enforce it more uniformly.
 - The `pyo3 0.22` macro emits `useless_conversion` clippy warnings in `polars-metal-core`; suppressed file-scoped with `#![allow(clippy::useless_conversion)]`. Revisit when pyo3 is upgraded.
-- The hypothesis differential harness in `tests/diff/` generates bare scans (no varied operations), so it's only really testing fallback parity. Add filter/select/groupby strategies once M1 has kernels producing real GPU output.
+- ~~The hypothesis differential harness in `tests/diff/` generates bare scans (no varied operations), so it's only really testing fallback parity. Add filter/select/groupby strategies once M1 has kernels producing real GPU output.~~ Filter+select portion done in T21 — `tests/diff/strategies.py` now exports `m1_null_density_dataframe`, `m1_predicate_expr`, and `m1_projection_subset`, exercised by `tests/diff/test_filter_random.py` (hypothesis) and `tests/diff/test_filter_edges.py` (empty / all-null / all-true / all-false). Groupby strategies remain deferred to M3 — see "Groupby differential strategies still missing" under "M1 retrospective notes" below.
+
+## Routing layer: per-op GPU-vs-CPU dispatch on unified memory (M1, post-T30 2026-05-21)
+
+The M1 perf investigation surfaced an architectural assumption we'd been carrying from cuDF without noticing. On a discrete GPU, the dispatch decision is dominated by "is this data already on the GPU?" because PCIe transfer costs swamp everything — so cuDF keeps everything on GPU. On Apple Silicon's unified memory that constraint vanishes: the same bytes are equally addressable from both processors with zero transfer cost.
+
+This changes the right framing of the engine. Today the walker says "if I have a kernel for this shape, dispatch to GPU." The correct rule is "if I have a kernel AND the kernel beats CPU at this input shape, dispatch to GPU." Per-op, possibly per-row-count, decided at plan time from a small cost-model table.
+
+Worked example from M1: filter is memory-bound. CPU Polars hits ~200–400 GB/s effective via SIMD on the same DRAM the GPU would read. The GPU has no fundamental bandwidth advantage on memory-bound ops on unified memory; the realistic ceiling for GPU filter at 10M rows is 2–3× CPU, not 5% slower. The M1 baseline (5.3–17.6×) is close to the structural ceiling for filter specifically. M2's stated ops (groupby/sort/join) are compute-/parallelism-dense and should beat CPU — that's where dispatch to GPU is the right answer.
+
+Concrete design items for M2:
+
+1. **Cost model in the walker.** Per-op, per-input-shape estimates seeded from `tests/bench/baseline.json` and the criterion microbenches. Starts dumb (constants table), refines over time.
+2. **`Handled` becomes explicit GPU-plan; the CPU path is also explicit** rather than implicit-via-fallback. Three states, not two: `Handled(GpuPlan)`, `Handled(CpuPlan)`, `FallBack(reason)`.
+3. **Per-op crossover thresholds.** Filter: probably CPU below 100M rows when isolated. Groupby/sort/join: GPU at much lower row counts. Updated as kernels improve.
+4. **Spec language fix.** The ≤5% Metal/CPU bar should become "≤5% slower than the best routing." If the router picks CPU, we *are* CPU on that path — the gate is automatically met by definition.
+
+The M1 filter kernels are not wasted under this framing — they're the reference for what GPU filter looks like when it's competitive (large-N, chained with other GPU ops, etc.). They're called when the cost model says yes; they sit dormant when it says no.
+
+**Mission reframe.** CLAUDE.md says "Match cuDF-Polars-on-a-4090 performance for realistic analytical workloads." That survives intact: cuDF wins on a 4090 because of dedicated VRAM bandwidth on bandwidth-bound ops; we win on Apple Silicon by routing to whichever processor is best per-op. Same end result (best-available perf on the user's hardware) without pretending the GPU is always the right answer. *Owner:* M2 design spec — this is the dominant architectural input.
+
+## M1 end-to-end performance gap (M1, T24 2026-05-21)
+
+The M1 design spec § Layer 4 sets a `ratio_metal_over_cpu <= 1.05` gate on five E2E queries. `tests/bench/baseline.json` (M2 Ultra, post-T30 at `ae63acb`) shows the actual ratios at 10M rows are 5.27× – 17.65× — Metal still slower than CPU on every query, not within 5%, but down from the pre-T30 12.14× – 54.82× range. `filter_simple` cumulatively dropped from 220ms to 78ms (−65%) across T30.
+
+Kernel-only criterion numbers (T23 — `cmp_i64` ~20 ms per 10M rows, `filter_scatter` ~19 ms per 10M rows) account for the bulk of the remaining ~50–100 ms per-query Metal wall-clock. The remaining gap is dispatch + Arrow↔MTLBuffer setup per query, not kernel compute.
+
+Remaining root causes, in rough order of suspected impact (post-T30):
+
+- **Predicate-kernel and scatter-kernel dispatch.** Threadgroup sizing is left at a portable default rather than tuned per device class; validity-bitmap loads are issued one byte at a time (vs the 8-rows-at-a-time pattern called out in CLAUDE.md's gotchas); scatter writes serialise on the prefix-sum dependency. Owner: M2 kernel-level tuning pass.
+- **Per-query Arrow→MTLBuffer setup (~18 ms).** The M0 zero-copy bridge has both a zero-copy regime (page-aligned, refcount-bumped) and a copy regime; M1 queries are taking the copy regime more often than expected. Owner: M2 perf response (direct MLX-over-MTLBuffer wiring will also bear on this).
+- **Two host↔MLX memcpys inside the cumsum call.** MLX's `array(ptr, shape, dtype)` constructor copies bytes into MLX-managed memory and we memcpy the scan result back into the caller's slice. Per-element marshalling was eliminated in T30 Step 3 (`ae63acb`); full elimination of the data-touching passes needs the MLX-over-`MTLBuffer` rewrite tracked in "FFI choice (cxx)" above.
+
+T28's M1 retrospective took the "ship M1 with the gap documented" path; T30 followed up with the cumsum/per-column-redundancy fix; the three bottlenecks above are the M2 design inputs. *Owner:* M2 design.
+
+## BumpArena ships but is unwired in the M1 hot path (M1, T25 2026-05-21)
+
+The M1 design spec (`docs/superpowers/specs/2026-05-20-m1-design.md:134-147`) described an arena that owns predicate intermediates, `keep_flags`, the `prefix_sum`, and the output column buffers, with output Arrow buffers' custom-deallocator closures keeping an `Arc<ScratchArena>` alive across the UDF boundary.
+
+The shipped M1 differs on the output side: `crates/polars-metal-core/src/udf.rs` materialises kernel outputs as `Vec<u8>` and copies them into `PyBytes::new_bound(py, &out_data)` (and the matching validity buffer) before returning to the walker, which round-trips them through Polars Arrow buffers. `BumpArena` (`crates/polars-metal-core/src/arena.rs`) is fully implemented with integration tests but is not called from `pipeline.rs` or `udf.rs` — it ships dormant.
+
+This is intentional for M1 (the keep-alive closure model needs design work to play nicely with Python's GC and Polars' Arrow buffer ownership) but is a known item for M2 — especially if the perf-gap investigation above points at allocation cost or the second copy through `PyBytes` as a contributor. *Owner:* M2 design.
+
+## M1 retrospective notes (2026-05-21)
+
+This is a placeholder structure for T28's full retrospective. T27 captures only the highest-signal items here; T28 will populate the rest.
+
+**Resolved in M1:**
+
+- ~~Differential harness only tested fallback parity (M0 retrospective).~~ Filter + projection strategies and edge cases landed in T21 — see strikethrough under "Still to revisit at M1" above.
+- ~~MLX FFI revisit was speculative (M0 "FFI choice" entry).~~ Backed by T5 friction and T24 baseline data; cumsum-specific component resolved in T30 Step 3 (`ae63acb`) via the `rust::Slice` bridge. The broader MLX-over-`MTLBuffer` decision remains an M2 design item — see "FFI choice (cxx)".
+
+**Still to revisit at M2 (not blockers):**
+
+- **End-to-end perf gap.** The 5.3–17.6× CPU/Metal ratio at 10M rows (post-T30) is the dominant M2 design input — see dedicated entry above.
+- **BumpArena wiring.** Implemented but unwired in the M1 hot path — see dedicated entry above.
+- **Groupby differential strategies still missing.** T21 closed the filter/select half of the M0-era harness gap; groupby strategies wait on M3 kernels producing real GPU output, just as filter/select did for M1.
+- **Threadgroup tuning per device class.** `cmp_i64` and `filter_scatter` use portable defaults from `MTLDevice.maxThreadsPerThreadgroup()` (per CLAUDE.md), but the ~5 GB/s effective throughput on M2 Ultra suggests these are leaving silicon on the table. M2 owns the per-device-class tuning pass — not before, because we don't yet have a profiling story.

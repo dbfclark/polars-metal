@@ -1,0 +1,1 @@
+# Baseline for tests/unit/operations/test_select.py — see tests/conformance/test_polars_suite.py docstring for refresh recipe.
