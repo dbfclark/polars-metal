@@ -71,6 +71,8 @@ Decisions made in M0 are inherited by every subsequent milestone, so M0's spec d
 
 **M2-defining decision (in M2's design spec).** Null-aware reductions via (a) custom MSL null-aware kernel or (b) MLX op on data + separate validity reduction. Pick one after a spike; do not defer the decision into the implementation.
 
+**Architectural pivot from M1 (in M2's design spec).** M1's perf investigation (T30) surfaced that the engine should be an *auto-router* over CPU+GPU, not a GPU executor that handles everything. Apple Silicon's unified memory means per-op routing has zero transfer cost — the cuDF "keep everything on GPU" constraint does not apply. M2's deliverable expands accordingly: alongside the elementwise/reductions kernels, ship a cost-model-driven walker that decides GPU vs CPU per op (and per input shape). Filter and other memory-bound ops route to CPU by default; compute/parallelism-dense ops (groupby in M3, also relevant for some M2 reductions on large hash-distribution work) route to GPU. The ≤5% Metal/CPU perf gate should become "≤5% slower than best routing" — under routing the gate is met by definition for ops we choose to run on CPU. See `docs/open-questions.md` § "Routing layer: per-op GPU-vs-CPU dispatch on unified memory".
+
 ### M3 — Hash groupby with sum/mean/count/min/max
 
 **Deliverable.** `df.group_by(key).agg(...)` runs on GPU and **strictly beats CPU Polars** on a documented representative analytical query on M2 Ultra. This is the "narrow-but-fast" goal.

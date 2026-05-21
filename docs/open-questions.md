@@ -107,6 +107,25 @@ Initially missing on the dev host: T19's MLX build had to use `-DMLX_BUILD_METAL
 - The `pyo3 0.22` macro emits `useless_conversion` clippy warnings in `polars-metal-core`; suppressed file-scoped with `#![allow(clippy::useless_conversion)]`. Revisit when pyo3 is upgraded.
 - ~~The hypothesis differential harness in `tests/diff/` generates bare scans (no varied operations), so it's only really testing fallback parity. Add filter/select/groupby strategies once M1 has kernels producing real GPU output.~~ Filter+select portion done in T21 — `tests/diff/strategies.py` now exports `m1_null_density_dataframe`, `m1_predicate_expr`, and `m1_projection_subset`, exercised by `tests/diff/test_filter_random.py` (hypothesis) and `tests/diff/test_filter_edges.py` (empty / all-null / all-true / all-false). Groupby strategies remain deferred to M3 — see "Groupby differential strategies still missing" under "M1 retrospective notes" below.
 
+## Routing layer: per-op GPU-vs-CPU dispatch on unified memory (M1, post-T30 2026-05-21)
+
+The M1 perf investigation surfaced an architectural assumption we'd been carrying from cuDF without noticing. On a discrete GPU, the dispatch decision is dominated by "is this data already on the GPU?" because PCIe transfer costs swamp everything — so cuDF keeps everything on GPU. On Apple Silicon's unified memory that constraint vanishes: the same bytes are equally addressable from both processors with zero transfer cost.
+
+This changes the right framing of the engine. Today the walker says "if I have a kernel for this shape, dispatch to GPU." The correct rule is "if I have a kernel AND the kernel beats CPU at this input shape, dispatch to GPU." Per-op, possibly per-row-count, decided at plan time from a small cost-model table.
+
+Worked example from M1: filter is memory-bound. CPU Polars hits ~200–400 GB/s effective via SIMD on the same DRAM the GPU would read. The GPU has no fundamental bandwidth advantage on memory-bound ops on unified memory; the realistic ceiling for GPU filter at 10M rows is 2–3× CPU, not 5% slower. The M1 baseline (5.3–17.6×) is close to the structural ceiling for filter specifically. M2's stated ops (groupby/sort/join) are compute-/parallelism-dense and should beat CPU — that's where dispatch to GPU is the right answer.
+
+Concrete design items for M2:
+
+1. **Cost model in the walker.** Per-op, per-input-shape estimates seeded from `tests/bench/baseline.json` and the criterion microbenches. Starts dumb (constants table), refines over time.
+2. **`Handled` becomes explicit GPU-plan; the CPU path is also explicit** rather than implicit-via-fallback. Three states, not two: `Handled(GpuPlan)`, `Handled(CpuPlan)`, `FallBack(reason)`.
+3. **Per-op crossover thresholds.** Filter: probably CPU below 100M rows when isolated. Groupby/sort/join: GPU at much lower row counts. Updated as kernels improve.
+4. **Spec language fix.** The ≤5% Metal/CPU bar should become "≤5% slower than the best routing." If the router picks CPU, we *are* CPU on that path — the gate is automatically met by definition.
+
+The M1 filter kernels are not wasted under this framing — they're the reference for what GPU filter looks like when it's competitive (large-N, chained with other GPU ops, etc.). They're called when the cost model says yes; they sit dormant when it says no.
+
+**Mission reframe.** CLAUDE.md says "Match cuDF-Polars-on-a-4090 performance for realistic analytical workloads." That survives intact: cuDF wins on a 4090 because of dedicated VRAM bandwidth on bandwidth-bound ops; we win on Apple Silicon by routing to whichever processor is best per-op. Same end result (best-available perf on the user's hardware) without pretending the GPU is always the right answer. *Owner:* M2 design spec — this is the dominant architectural input.
+
 ## M1 end-to-end performance gap (M1, T24 2026-05-21)
 
 The M1 design spec § Layer 4 sets a `ratio_metal_over_cpu <= 1.05` gate on five E2E queries. `tests/bench/baseline.json` (M2 Ultra, post-T30 at `ae63acb`) shows the actual ratios at 10M rows are 5.27× – 17.65× — Metal still slower than CPU on every query, not within 5%, but down from the pre-T30 12.14× – 54.82× range. `filter_simple` cumulatively dropped from 220ms to 78ms (−65%) across T30.
