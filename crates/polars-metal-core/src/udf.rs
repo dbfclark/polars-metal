@@ -28,7 +28,9 @@ use polars_metal_kernels::cmp::{
 };
 use polars_metal_kernels::command::CommandQueue;
 use polars_metal_kernels::logical::{dispatch_bool_and, dispatch_bool_or};
-use polars_metal_kernels::pipeline::{compact_bool, compact_f64, compact_i64};
+use polars_metal_kernels::pipeline::{
+    compact_bool, compact_f64, compact_i64, compute_keep_and_prefix,
+};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
@@ -160,6 +162,25 @@ pub fn execute_filter_compact<'py>(
     let mut queue = CommandQueue::new(&device)
         .map_err(|e| crate::engine_err(crate::EngineError::Other(format!("command queue: {e}"))))?;
 
+    // Hoist the predicate-to-u8 + MLX cumsum out of the per-column loop:
+    // the predicate doesn't depend on the source column, so this work is
+    // identical for every column. Running it once and sharing the
+    // `(keep, prefix, n_out)` saves `(num_cols - 1) * (predicate + cumsum)`
+    // of redundant work per filter dispatch — the dominant cost in the
+    // M1 filter path (see Task 30 profiling).
+    let (keep, prefix, n_out) = compute_keep_and_prefix(
+        &device,
+        &mut queue,
+        pred_data_bytes,
+        pred_valid_bytes,
+        n_rows,
+    )
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "polars_metal: compute_keep_and_prefix failed: {e}"
+        ))
+    })?;
+
     let results = PyList::empty_bound(py);
 
     for (idx, entry) in columns.iter().enumerate() {
@@ -188,16 +209,8 @@ pub fn execute_filter_compact<'py>(
         let valid_b: &[u8] = valid_py.as_bytes();
 
         let dtype = parse_dtype(&dtype_s)?;
-        let (out_data, out_valid, n_out) = compact_one_column(
-            &device,
-            &mut queue,
-            dtype,
-            n_rows,
-            data_b,
-            valid_b,
-            pred_data_bytes,
-            pred_valid_bytes,
-            &name,
+        let (out_data, out_valid) = compact_one_column(
+            &device, &mut queue, dtype, n_rows, data_b, valid_b, &keep, &prefix, n_out, &name,
         )?;
 
         let tup = PyTuple::new_bound(
@@ -214,10 +227,15 @@ pub fn execute_filter_compact<'py>(
     Ok(results)
 }
 
-/// Run the compaction pipeline on a single column and return its
-/// `(data_bytes, valid_bytes, n_out)` triple. Per-dtype branching is
-/// contained here so `execute_filter_compact`'s loop body stays
-/// dtype-agnostic.
+/// Run pass 3 (scatter) of the compaction pipeline on a single column,
+/// reusing the shared `(keep, prefix, n_out)` produced once per filter
+/// dispatch. Per-dtype branching is contained here so
+/// `execute_filter_compact`'s loop body stays dtype-agnostic.
+///
+/// When `n_out == 0` we short-circuit before allocating output buffers
+/// or calling Metal — every column's result is `( [], [], 0 )`. The
+/// shared n_out is the source of truth across all columns: a single
+/// `prefix[n_rows - 1]` read decides whether any column has survivors.
 ///
 /// `column_name` is used only for error messages.
 #[allow(clippy::too_many_arguments)]
@@ -228,10 +246,11 @@ fn compact_one_column(
     n_rows: usize,
     src_data: &[u8],
     src_valid: &[u8],
-    pred_data: &[u8],
-    pred_valid: &[u8],
+    keep: &[u8],
+    prefix: &[u32],
+    n_out: usize,
     column_name: &str,
-) -> PyResult<(Vec<u8>, Vec<u8>, usize)> {
+) -> PyResult<(Vec<u8>, Vec<u8>)> {
     let min_valid_bytes = (n_rows + 7) / 8;
     if src_valid.len() < min_valid_bytes {
         return Err(PyValueError::new_err(format!(
@@ -240,6 +259,15 @@ fn compact_one_column(
             expected = min_valid_bytes,
             n = n_rows,
         )));
+    }
+
+    // Short-circuit when no rows survive the predicate. Producing an
+    // empty `valid` Vec at the kernel's alignment requirement would be
+    // lying: there's no data to gate, so an empty `(data, valid)` pair
+    // is the honest result. The Python side reassembles a zero-length
+    // PyArrow array from these.
+    if n_out == 0 {
+        return Ok((Vec::new(), Vec::new()));
     }
 
     match dtype {
@@ -258,14 +286,12 @@ fn compact_one_column(
             // is 64 bytes for primitive arrays), so the reinterpret is well-aligned.
             let src_typed: &[i64] =
                 unsafe { std::slice::from_raw_parts(src_data.as_ptr() as *const i64, n_rows) };
-            let result = compact_i64(
-                device, queue, src_typed, src_valid, pred_data, pred_valid, n_rows,
-            )
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "polars_metal: compact_i64({column_name:?}) failed: {e}"
-                ))
-            })?;
+            let result = compact_i64(device, queue, src_typed, src_valid, keep, prefix, n_out)
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "polars_metal: compact_i64({column_name:?}) failed: {e}"
+                    ))
+                })?;
             // SAFETY: `result.data` is a `Vec<i64>` of `result.n_out` elements;
             // reinterpret as bytes for the wire format. i64 has no invalid bit
             // patterns and `from_raw_parts` length is exactly `n_out * 8`.
@@ -280,7 +306,7 @@ fn compact_one_column(
                 }
                 v
             };
-            Ok((data_bytes, result.valid, result.n_out))
+            Ok((data_bytes, result.valid))
         }
         MetalDtype::F64 => {
             let expected_data = n_rows * 8;
@@ -295,14 +321,12 @@ fn compact_one_column(
             // slice length is exactly `n_rows` f64s.
             let src_typed: &[f64] =
                 unsafe { std::slice::from_raw_parts(src_data.as_ptr() as *const f64, n_rows) };
-            let result = compact_f64(
-                device, queue, src_typed, src_valid, pred_data, pred_valid, n_rows,
-            )
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "polars_metal: compact_f64({column_name:?}) failed: {e}"
-                ))
-            })?;
+            let result = compact_f64(device, queue, src_typed, src_valid, keep, prefix, n_out)
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "polars_metal: compact_f64({column_name:?}) failed: {e}"
+                    ))
+                })?;
             // SAFETY: see I64 branch; reinterpret f64 → u8.
             let data_bytes: Vec<u8> = {
                 let n_bytes = result.n_out * std::mem::size_of::<f64>();
@@ -315,7 +339,7 @@ fn compact_one_column(
                 }
                 v
             };
-            Ok((data_bytes, result.valid, result.n_out))
+            Ok((data_bytes, result.valid))
         }
         MetalDtype::Bool => {
             // Bool source data is bit-packed: at least `ceil(n_rows / 8)` bytes.
@@ -327,7 +351,7 @@ fn compact_one_column(
                 )));
             }
             let result = compact_bool(
-                device, queue, src_data, src_valid, pred_data, pred_valid, n_rows,
+                device, queue, src_data, src_valid, keep, prefix, n_rows, n_out,
             )
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -337,7 +361,7 @@ fn compact_one_column(
             // For bool, `result.data` is already bit-packed u8 (padded to
             // 4-byte alignment by the kernel). The Python side will trim to
             // `ceil(n_out / 8)` before calling PyArrow.
-            Ok((result.data, result.valid, result.n_out))
+            Ok((result.data, result.valid))
         }
     }
 }
