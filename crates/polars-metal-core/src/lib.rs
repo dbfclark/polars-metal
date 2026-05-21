@@ -10,6 +10,7 @@ mod arena;
 mod error;
 pub mod plan;
 pub mod router;
+mod router_udf;
 mod udf;
 
 pub use arena::{BumpArena, ScratchArena, StubArena};
@@ -62,5 +63,6 @@ fn polars_metal_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add_function(wrap_pyfunction!(udf::cmp_f64_col_col, m)?)?;
     m.add_function(wrap_pyfunction!(udf::bool_and_dispatch, m)?)?;
     m.add_function(wrap_pyfunction!(udf::bool_or_dispatch, m)?)?;
+    m.add_function(wrap_pyfunction!(router_udf::compute_lifting_plan_py, m)?)?;
     Ok(())
 }
