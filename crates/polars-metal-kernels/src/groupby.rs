@@ -317,6 +317,159 @@ pub fn dispatch_hash(
     Ok(())
 }
 
+/// Initial load factor for the build-phase hash table.
+/// table_size = next_pow2(n_rows * BUILD_LOAD_FACTOR_DEN / BUILD_LOAD_FACTOR_NUM).
+pub const BUILD_LOAD_FACTOR_NUM: usize = 1;
+pub const BUILD_LOAD_FACTOR_DEN: usize = 2;
+
+fn next_pow2(n: usize) -> usize {
+    if n <= 1 {
+        return 1;
+    }
+    let bits = usize::BITS - (n - 1).leading_zeros();
+    1usize << bits
+}
+
+/// Output of the build phase.
+pub struct BuildOutput {
+    /// `row_to_group[i]` = group ID for row i.
+    pub row_to_group: Vec<u32>,
+    /// Total number of distinct groups produced by the build.
+    pub group_count: u32,
+    /// `first_row_per_group[g]` = a representative source-row index for
+    /// group g, used to reconstruct key columns in the result.
+    pub first_row_per_group: Vec<u32>,
+}
+
+/// Dispatch the `groupby_build` kernel.
+///
+/// Slots use a 3-state machine (`atomic_uint`): 0=EMPTY, 1=CLAIMED, 2=READY.
+/// Keys are stored as four `atomic_uint` words (lo_lo, lo_hi, hi_lo, hi_hi).
+/// This layout avoids `atomic_ulong` CAS which is unsupported on Apple Silicon
+/// Metal compute kernels (verified: Apple metal 32023.883).
+pub fn dispatch_build(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    encoded: &[u128],
+    hashes: &[u32],
+    n_rows: usize,
+) -> Result<BuildOutput, GroupByError> {
+    if n_rows == 0 {
+        return Ok(BuildOutput {
+            row_to_group: vec![],
+            group_count: 0,
+            first_row_per_group: vec![],
+        });
+    }
+    let n_rows_u32: u32 =
+        u32::try_from(n_rows).map_err(|_| GroupByError::RowCountOverflow { n_rows })?;
+
+    if encoded.len() < n_rows {
+        return Err(GroupByError::OutputTooShort {
+            got: encoded.len(),
+            need: n_rows,
+        });
+    }
+    if hashes.len() < n_rows {
+        return Err(GroupByError::OutputTooShort {
+            got: hashes.len(),
+            need: n_rows,
+        });
+    }
+
+    // table_size = next_pow2(n_rows * 2), minimum 2.
+    let raw_size = n_rows
+        .checked_mul(BUILD_LOAD_FACTOR_DEN)
+        .and_then(|n| n.checked_div(BUILD_LOAD_FACTOR_NUM))
+        .ok_or(GroupByError::RowCountOverflow { n_rows })?;
+    let table_size = next_pow2(raw_size).max(2);
+    let table_size_u32: u32 = u32::try_from(table_size)
+        .map_err(|_| GroupByError::RowCountOverflow { n_rows: table_size })?;
+
+    // SAFETY: `u128` and `u32` are plain-old-data with no invalid bit patterns.
+    // We reinterpret live slices as `&[u8]` for the duration of this call.
+    // `new_buffer_from_bytes` copies bytes synchronously; the references do not
+    // escape this function.
+    let key_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(encoded.as_ptr() as *const u8, n_rows * 16) };
+    let hash_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(hashes.as_ptr() as *const u8, n_rows * 4) };
+
+    let lib = shared_library(device)?;
+    let pso = lib.pipeline("groupby_build")?;
+
+    let keys_buf = device.new_buffer_from_bytes(key_bytes)?;
+    let hashes_buf = device.new_buffer_from_bytes(hash_bytes)?;
+    // slot_state:    table_size × atomic_uint (4 bytes each)
+    let slot_state_buf = device.new_buffer_zeroed(table_size * 4)?;
+    // slot_key:      table_size × 4 × atomic_uint (16 bytes per slot)
+    let slot_key_buf = device.new_buffer_zeroed(table_size * 16)?;
+    // slot_group_id: table_size × atomic_uint (4 bytes each)
+    let slot_gid_buf = device.new_buffer_zeroed(table_size * 4)?;
+    // group_count:   1 × atomic_uint (4 bytes)
+    let group_count_buf = device.new_buffer_zeroed(4)?;
+    // first_row_per_group: n_rows × u32 — overallocated; truncated on output
+    let first_row_buf = device.new_buffer_zeroed(n_rows * 4)?;
+    // row_to_group:  n_rows × u32
+    let row_to_group_buf = device.new_buffer_zeroed(n_rows * 4)?;
+    let n_rows_buf = device.new_buffer_from_bytes(&n_rows_u32.to_le_bytes())?;
+    let table_size_buf = device.new_buffer_from_bytes(&table_size_u32.to_le_bytes())?;
+
+    queue.dispatch_1d(
+        &pso,
+        &[
+            &keys_buf,
+            &hashes_buf,
+            &slot_state_buf,
+            &slot_key_buf,
+            &slot_gid_buf,
+            &group_count_buf,
+            &first_row_buf,
+            &row_to_group_buf,
+            &n_rows_buf,
+            &table_size_buf,
+        ],
+        n_rows,
+    )?;
+    queue.wait_until_complete()?;
+
+    let group_count = {
+        let b = group_count_buf.as_slice();
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    };
+
+    let row_to_group = read_u32_vec(&row_to_group_buf, n_rows)?;
+    let mut first_row_full = read_u32_vec(&first_row_buf, n_rows)?;
+    first_row_full.truncate(group_count as usize);
+
+    Ok(BuildOutput {
+        row_to_group,
+        group_count,
+        first_row_per_group: first_row_full,
+    })
+}
+
+/// Copy back `count` u32 values from a Metal buffer.
+fn read_u32_vec(
+    buf: &polars_metal_buffer::MetalBuffer,
+    count: usize,
+) -> Result<Vec<u32>, GroupByError> {
+    let bytes = buf.as_slice();
+    let need = count * 4;
+    if bytes.len() < need {
+        return Err(GroupByError::OutputTooShort {
+            got: bytes.len(),
+            need,
+        });
+    }
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let b = &bytes[i * 4..(i + 1) * 4];
+        out.push(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    }
+    Ok(out)
+}
+
 /// Pure-Rust reference implementation of `hash_u128` from `shaders/_groupby.metal`.
 ///
 /// Must stay byte-for-byte in sync with the MSL `hash_u128` function. Used by
