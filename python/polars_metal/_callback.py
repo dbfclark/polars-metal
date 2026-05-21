@@ -66,7 +66,17 @@ def execute_with_metal(nt: Any, duration_since_start: int | None, *, config: Met
             log.debug("polars_metal: router routes entire query to CPU")
         return
 
-    nt.set_udf(build_udf(plan))
+    try:
+        udf = build_udf(plan)
+    except NotImplementedError as e:
+        if config.debug:
+            log.debug(
+                "polars_metal: UDF builder not ready for plan kind=%s (%r); falling back",
+                plan["kind"],
+                e,
+            )
+        return
+    nt.set_udf(udf)
     if config.debug:
         log.debug(
             "polars_metal: installed UDF for plan kind=%s (lifting=%s)",
@@ -94,4 +104,8 @@ def _strip_side_channels(plan: dict) -> dict:
             out["columns"] = plan.get("columns", [])
         else:
             out["predicate"] = plan.get("predicate")
+    elif plan["kind"] == "GroupBy":
+        out["input"] = _strip_side_channels(plan["input"])
+        out["keys"] = plan.get("keys", [])
+        out["aggs"] = plan.get("aggs", [])
     return out

@@ -62,6 +62,11 @@ def build_udf(plan: dict) -> Any:
     When ``should_time`` is true Polars expects a ``(df, timings)`` tuple.
     We don't measure kernel timings yet; emit an empty timing list.
     """
+    if plan["kind"] == "GroupBy":
+        raise NotImplementedError(
+            "GroupBy execution not yet wired (Phase 8). Router lifts GroupBy "
+            "to GPU but the kernel pipeline lands later."
+        )
     df_pydf, wire_plan = _extract_scan_df_and_wire_plan(plan)
 
     def udf(

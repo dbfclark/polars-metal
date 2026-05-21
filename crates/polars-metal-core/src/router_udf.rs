@@ -82,7 +82,18 @@ fn parse_and_route(
             lifting.set(id.clone(), cost::decide_filter(0));
             Ok(id)
         }
-        // GroupBy lands in Task 12 once the MetalPlanNode variant exists.
+        "GroupBy" => {
+            let input_obj = dict
+                .get_item("input")?
+                .ok_or_else(|| PyKeyError::new_err("GroupBy: missing input"))?;
+            let input_dict: Bound<PyDict> = input_obj.downcast_into()?;
+            let n_rows = peek_input_row_count(&input_dict)?;
+            let _ = parse_and_route(&input_dict, next_seq, lifting)?;
+            let id = NodeId::new("GroupBy", *next_seq);
+            *next_seq += 1;
+            lifting.set(id.clone(), cost::decide_groupby(n_rows));
+            Ok(id)
+        }
         other => {
             // Walk a single "input" if present so seq numbering matches
             // the walker's post-order traversal.
@@ -99,5 +110,32 @@ fn parse_and_route(
             );
             Ok(id)
         }
+    }
+}
+
+/// Best-effort row count for cost-model input from a plan dict. Walks
+/// past Project/Filter/GroupBy `"input"` fields to find the underlying
+/// Scan. Mirrors `router::input_row_count`.
+fn peek_input_row_count(dict: &Bound<PyDict>) -> PyResult<usize> {
+    let kind: String = dict
+        .get_item("kind")?
+        .ok_or_else(|| PyKeyError::new_err("missing 'kind'"))?
+        .extract()?;
+    match kind.as_str() {
+        "Scan" => {
+            let n: usize = dict
+                .get_item("n_rows")?
+                .ok_or_else(|| PyKeyError::new_err("Scan: missing n_rows"))?
+                .extract()?;
+            Ok(n)
+        }
+        "Project" | "Filter" | "GroupBy" => {
+            let input_obj = dict
+                .get_item("input")?
+                .ok_or_else(|| PyKeyError::new_err("missing 'input' in row-count peek"))?;
+            let input_dict: Bound<PyDict> = input_obj.downcast_into()?;
+            peek_input_row_count(&input_dict)
+        }
+        _ => Ok(0),
     }
 }
