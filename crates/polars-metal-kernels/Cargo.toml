@@ -30,7 +30,28 @@ polars-metal-mlx-sys = { path = "../polars-metal-mlx-sys" }
 thiserror = "1"
 
 [dev-dependencies]
+criterion = "0.5"
 proptest = "1"
+
+[[bench]]
+name = "cmp_i64"
+harness = false
+
+[[bench]]
+name = "cmp_f64"
+harness = false
+
+[[bench]]
+name = "logical_bool"
+harness = false
+
+[[bench]]
+name = "filter_predicate"
+harness = false
+
+[[bench]]
+name = "filter_scatter"
+harness = false
 
 [lints]
 workspace = true
