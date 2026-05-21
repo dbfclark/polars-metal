@@ -743,6 +743,7 @@ dependencies = [
  "polars-metal-buffer",
  "polars-metal-kernels",
  "polars-metal-mlx-sys",
+ "proptest",
  "pyo3",
  "thiserror",
 ]
