@@ -190,3 +190,161 @@ fn f64_key_encodes_via_raw_bits() {
         _ => panic!("expected F64"),
     }
 }
+
+// === T15 proptest module ===
+
+use proptest::prelude::*;
+
+#[derive(Debug, Clone)]
+struct ArbI64Col {
+    values: Vec<i64>,
+    valid: Vec<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct ArbBoolCol {
+    values: Vec<bool>,
+    valid: Vec<bool>,
+}
+
+fn pack_valid(valid: &[bool]) -> Vec<u8> {
+    let mut out = vec![0u8; (valid.len() + 7) / 8];
+    for (i, &v) in valid.iter().enumerate() {
+        if v {
+            out[i >> 3] |= 1 << (i & 7);
+        }
+    }
+    out
+}
+
+fn pack_bool_data(values: &[bool]) -> Vec<u8> {
+    let mut out = vec![0u8; (values.len() + 7) / 8];
+    for (i, &v) in values.iter().enumerate() {
+        if v {
+            out[i >> 3] |= 1 << (i & 7);
+        }
+    }
+    out
+}
+
+fn arb_i64_col(n: usize) -> impl Strategy<Value = ArbI64Col> {
+    (
+        prop::collection::vec(any::<i64>(), n..=n),
+        prop::collection::vec(any::<bool>(), n..=n),
+    )
+        .prop_map(|(values, valid)| ArbI64Col { values, valid })
+}
+
+fn arb_bool_col(n: usize) -> impl Strategy<Value = ArbBoolCol> {
+    (
+        prop::collection::vec(any::<bool>(), n..=n),
+        prop::collection::vec(any::<bool>(), n..=n),
+    )
+        .prop_map(|(values, valid)| ArbBoolCol { values, valid })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// One i64 key, varying row counts. Round-trip preserves valid rows'
+    /// values byte-for-byte.
+    #[test]
+    fn roundtrip_single_i64(n in 1usize..256, col in arb_i64_col(256)) {
+        let values: Vec<i64> = col.values.iter().take(n).copied().collect();
+        let valid_bools: Vec<bool> = col.valid.iter().take(n).copied().collect();
+        let data = bytes_i64(&values);
+        let valid = pack_valid(&valid_bools);
+
+        let kc = KeyColumn {
+            name: "k".into(),
+            dtype: KeyDtype::I64,
+            data: &data,
+            valid: &valid,
+            n_rows: n,
+        };
+        let (encoded, schema) = encode_keys(&[kc]).expect("encode_keys");
+        let decoded = decode_keys(&encoded, &schema);
+        prop_assert_eq!(decoded.len(), 1);
+        match &decoded[0] {
+            DecodedColumn::I64 { values: dv, valid: dvalid } => {
+                prop_assert_eq!(dv.len(), n);
+                prop_assert_eq!(dvalid.len(), n);
+                for i in 0..n {
+                    prop_assert_eq!(dvalid[i], valid_bools[i]);
+                    if valid_bools[i] {
+                        prop_assert_eq!(dv[i], values[i]);
+                    }
+                }
+            }
+            _ => prop_assert!(false, "expected I64 decoded column"),
+        }
+    }
+
+    /// One i64 + one bool key — composite case under 128 bits.
+    #[test]
+    fn roundtrip_i64_plus_bool(
+        i64_col in arb_i64_col(32),
+        bool_col in arb_bool_col(32),
+    ) {
+        let n = 32;
+        let i64_values = i64_col.values;
+        let i64_valid = i64_col.valid;
+        let bool_values = bool_col.values;
+        let bool_valid = bool_col.valid;
+
+        let i64_data = bytes_i64(&i64_values);
+        let i64_valid_packed = pack_valid(&i64_valid);
+        let bool_data = pack_bool_data(&bool_values);
+        let bool_valid_packed = pack_valid(&bool_valid);
+
+        let cols = vec![
+            KeyColumn { name: "i".into(), dtype: KeyDtype::I64, data: &i64_data, valid: &i64_valid_packed, n_rows: n },
+            KeyColumn { name: "b".into(), dtype: KeyDtype::Bool, data: &bool_data, valid: &bool_valid_packed, n_rows: n },
+        ];
+        let (encoded, schema) = encode_keys(&cols).expect("encode_keys");
+        prop_assert_eq!(schema.total_bits(), 1 + 64 + 1 + 1);
+        let decoded = decode_keys(&encoded, &schema);
+        prop_assert_eq!(decoded.len(), 2);
+        match (&decoded[0], &decoded[1]) {
+            (
+                DecodedColumn::I64 { values: iv, valid: ivd },
+                DecodedColumn::Bool { values: bv, valid: bvd },
+            ) => {
+                for i in 0..n {
+                    prop_assert_eq!(ivd[i], i64_valid[i]);
+                    prop_assert_eq!(bvd[i], bool_valid[i]);
+                    if i64_valid[i] {
+                        prop_assert_eq!(iv[i], i64_values[i]);
+                    }
+                    if bool_valid[i] {
+                        prop_assert_eq!(bv[i], bool_values[i]);
+                    }
+                }
+            }
+            _ => prop_assert!(false, "unexpected decoded shape"),
+        }
+    }
+
+    /// Equal rows in the source produce equal u128 lanes.
+    #[test]
+    fn equal_keys_encode_to_equal_lanes(a in any::<i64>(), b in any::<i64>()) {
+        let n = 4;
+        let values: Vec<i64> = vec![a, b, a, b];
+        let valid_bools = vec![true, true, true, true];
+        let data = bytes_i64(&values);
+        let valid = pack_valid(&valid_bools);
+        let kc = KeyColumn {
+            name: "k".into(),
+            dtype: KeyDtype::I64,
+            data: &data,
+            valid: &valid,
+            n_rows: n,
+        };
+        let (encoded, _) = encode_keys(&[kc]).expect("encode_keys");
+        prop_assert_eq!(encoded[0], encoded[2]);
+        prop_assert_eq!(encoded[1], encoded[3]);
+        if a != b {
+            prop_assert_ne!(encoded[0], encoded[1]);
+        }
+    }
+}
