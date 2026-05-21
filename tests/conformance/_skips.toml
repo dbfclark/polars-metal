@@ -1,7 +1,21 @@
 # tests/conformance/_skips.toml
 #
 # Per-milestone xfail/skip registry. Adding an entry is a deliberate
-# decision documented in the milestone's PR. M0: empty.
+# decision documented in the milestone's PR.
+#
+# M0: empty.
+# M1 (scan / project / filter / comparison / logical_bool):
+#   No skips needed. The upstream paths wired in Task 22
+#   (operations/test_filter.py, operations/test_comparison.py,
+#   operations/test_select.py, expr/test_binary.py) exercise only
+#   M1-supported shapes — i64/f64/bool scan + project + filter, comparison
+#   predicates with Polars NaN semantics, and AND/OR over Boolean masks
+#   with three-valued logic. All pass under engine=MetalEngine() with no
+#   divergence from pure-CPU output, so nothing to deliberately skip yet.
+#
+#   Out-of-scope shapes (strings, structs, lists, joins, groupby, sort,
+#   window) are not exercised by the wired paths — they live in upstream
+#   suites we have not yet enabled.
 
 skips = []
 xfails = []
