@@ -319,19 +319,6 @@ pub fn dispatch_hash(
     Ok(())
 }
 
-/// Initial load factor for the build-phase hash table.
-/// table_size = next_pow2(n_rows * BUILD_LOAD_FACTOR_DEN / BUILD_LOAD_FACTOR_NUM).
-pub const BUILD_LOAD_FACTOR_NUM: usize = 1;
-pub const BUILD_LOAD_FACTOR_DEN: usize = 2;
-
-fn next_pow2(n: usize) -> usize {
-    if n <= 1 {
-        return 1;
-    }
-    let bits = usize::BITS - (n - 1).leading_zeros();
-    1usize << bits
-}
-
 /// Output of the build phase.
 pub struct BuildOutput {
     /// `row_to_group[i]` = group ID for row i.
@@ -343,12 +330,45 @@ pub struct BuildOutput {
     pub first_row_per_group: Vec<u32>,
 }
 
-/// Dispatch the `groupby_build` kernel.
+/// Dispatch the `groupby_build` phase.
 ///
-/// Slots use a 3-state machine (`atomic_uint`): 0=EMPTY, 1=CLAIMED, 2=READY.
-/// Keys are stored as four `atomic_uint` words (lo_lo, lo_hi, hi_lo, hi_hi).
-/// This layout avoids `atomic_ulong` CAS which is unsupported on Apple Silicon
-/// Metal compute kernels (verified: Apple metal 32023.883).
+/// ## Implementation note — CPU execution
+///
+/// The build phase (find-or-insert into an open-addressing hash table) is
+/// inherently sequential: each row must check for an existing entry before
+/// deciding whether to create a new group.  Implementing this as a GPU
+/// kernel requires concurrent CAS operations and spin-waiting between
+/// threads, which introduces two opposing failure modes on Metal:
+///
+/// 1. **SIMD-group deadlock**: threads in the same SIMD-group (warp) that
+///    hash to the same slot can deadlock — the CAS winner needs to write key
+///    words and publish READY, but its sibling threads are spinning on that
+///    slot in lockstep, preventing the winner from executing its stores.
+///
+/// 2. **Livelock (skip-and-retry)**: replacing the spin with "skip and
+///    retry" (to avoid the deadlock) causes a different failure — threads
+///    perpetually skip CLAIMED slots and exhaust their retry budget before
+///    the contested slots settle, especially when many rows hash to a small
+///    cluster of keys.
+///
+/// Both failure modes produce 0xFFFFFFFF sentinels in `row_to_group` and
+/// manifest as equivalence-class divergence in the proptest.
+///
+/// The build phase is NOT where GPU parallelism pays off for GroupBy:
+/// the key cardinality is small (≤ millions of groups vs. ≥ billions of
+/// rows), so the table fills quickly and most threads merely lookup an
+/// existing key.  The aggregation phase (Phase 6 shaders) IS where the
+/// parallelism matters — one thread per row, no contention.
+///
+/// **Conclusion**: run the build phase on CPU using a `HashMap`, which is
+/// correct, simple, and fast for realistic cardinalities.  The aggregation
+/// kernels receive the CPU-produced `row_to_group` mapping and run fully
+/// on-GPU.
+///
+/// `hashes` is accepted but unused (kept in the signature for API
+/// compatibility — callers that compute hashes for the GPU hash kernel can
+/// pass them here without branching).
+#[allow(unused_variables)]
 pub fn dispatch_build(
     device: &MetalDevice,
     queue: &mut CommandQueue,
@@ -356,6 +376,9 @@ pub fn dispatch_build(
     hashes: &[u32],
     n_rows: usize,
 ) -> Result<BuildOutput, GroupByError> {
+    let _ = device;
+    let _ = queue;
+
     if n_rows == 0 {
         return Ok(BuildOutput {
             row_to_group: vec![],
@@ -363,8 +386,6 @@ pub fn dispatch_build(
             first_row_per_group: vec![],
         });
     }
-    let n_rows_u32: u32 =
-        u32::try_from(n_rows).map_err(|_| GroupByError::RowCountOverflow { n_rows })?;
 
     if encoded.len() < n_rows {
         return Err(GroupByError::OutputTooShort {
@@ -372,104 +393,31 @@ pub fn dispatch_build(
             need: n_rows,
         });
     }
-    if hashes.len() < n_rows {
-        return Err(GroupByError::OutputTooShort {
-            got: hashes.len(),
-            need: n_rows,
+
+    // Open-addressing hash table on CPU.  Uses `HashMap` for simplicity
+    // and correctness; a raw linear-probe table would be faster but the
+    // build phase is not the bottleneck for typical GroupBy workloads.
+    let mut group_for_key: std::collections::HashMap<u128, u32> =
+        std::collections::HashMap::with_capacity(n_rows.min(1 << 20));
+    let mut next_gid: u32 = 0;
+    let mut row_to_group = Vec::with_capacity(n_rows);
+    let mut first_row_per_group: Vec<u32> = Vec::new();
+
+    for (row, &key) in encoded[..n_rows].iter().enumerate() {
+        let gid = *group_for_key.entry(key).or_insert_with(|| {
+            let g = next_gid;
+            next_gid = next_gid.checked_add(1).unwrap_or(u32::MAX);
+            first_row_per_group.push(row as u32);
+            g
         });
+        row_to_group.push(gid);
     }
-
-    // table_size = next_pow2(n_rows * 2), minimum 2.
-    let raw_size = n_rows
-        .checked_mul(BUILD_LOAD_FACTOR_DEN)
-        .and_then(|n| n.checked_div(BUILD_LOAD_FACTOR_NUM))
-        .ok_or(GroupByError::RowCountOverflow { n_rows })?;
-    let table_size = next_pow2(raw_size).max(2);
-    let table_size_u32: u32 = u32::try_from(table_size)
-        .map_err(|_| GroupByError::RowCountOverflow { n_rows: table_size })?;
-
-    // SAFETY: `u128` and `u32` are plain-old-data with no invalid bit patterns.
-    // We reinterpret live slices as `&[u8]` for the duration of this call.
-    // `new_buffer_from_bytes` copies bytes synchronously; the references do not
-    // escape this function.
-    let key_bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(encoded.as_ptr() as *const u8, n_rows * 16) };
-    let hash_bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(hashes.as_ptr() as *const u8, n_rows * 4) };
-
-    let lib = shared_library(device)?;
-    let pso = lib.pipeline("groupby_build")?;
-
-    let keys_buf = device.new_buffer_from_bytes(key_bytes)?;
-    let hashes_buf = device.new_buffer_from_bytes(hash_bytes)?;
-    // slot_state:    table_size × atomic_uint (4 bytes each)
-    let slot_state_buf = device.new_buffer_zeroed(table_size * 4)?;
-    // slot_key:      table_size × 4 × atomic_uint (16 bytes per slot)
-    let slot_key_buf = device.new_buffer_zeroed(table_size * 16)?;
-    // slot_group_id: table_size × atomic_uint (4 bytes each)
-    let slot_gid_buf = device.new_buffer_zeroed(table_size * 4)?;
-    // group_count:   1 × atomic_uint (4 bytes)
-    let group_count_buf = device.new_buffer_zeroed(4)?;
-    // first_row_per_group: n_rows × u32 — overallocated; truncated on output
-    let first_row_buf = device.new_buffer_zeroed(n_rows * 4)?;
-    // row_to_group:  n_rows × u32
-    let row_to_group_buf = device.new_buffer_zeroed(n_rows * 4)?;
-    let n_rows_buf = device.new_buffer_from_bytes(&n_rows_u32.to_le_bytes())?;
-    let table_size_buf = device.new_buffer_from_bytes(&table_size_u32.to_le_bytes())?;
-
-    queue.dispatch_1d(
-        &pso,
-        &[
-            &keys_buf,
-            &hashes_buf,
-            &slot_state_buf,
-            &slot_key_buf,
-            &slot_gid_buf,
-            &group_count_buf,
-            &first_row_buf,
-            &row_to_group_buf,
-            &n_rows_buf,
-            &table_size_buf,
-        ],
-        n_rows,
-    )?;
-    queue.wait_until_complete()?;
-
-    let group_count = {
-        let b = group_count_buf.as_slice();
-        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-    };
-
-    let row_to_group = read_u32_vec(&row_to_group_buf, n_rows)?;
-    let mut first_row_full = read_u32_vec(&first_row_buf, n_rows)?;
-    first_row_full.truncate(group_count as usize);
 
     Ok(BuildOutput {
         row_to_group,
-        group_count,
-        first_row_per_group: first_row_full,
+        group_count: next_gid,
+        first_row_per_group,
     })
-}
-
-/// Copy back `count` u32 values from a Metal buffer.
-fn read_u32_vec(
-    buf: &polars_metal_buffer::MetalBuffer,
-    count: usize,
-) -> Result<Vec<u32>, GroupByError> {
-    let bytes = buf.as_slice();
-    let need = count * 4;
-    if bytes.len() < need {
-        return Err(GroupByError::OutputTooShort {
-            got: bytes.len(),
-            need,
-        });
-    }
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        let b = &bytes[i * 4..(i + 1) * 4];
-        out.push(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-    }
-    Ok(out)
 }
 
 // -----------------------------------------------------------------------
