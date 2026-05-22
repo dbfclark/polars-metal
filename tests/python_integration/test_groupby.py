@@ -182,3 +182,53 @@ def test_groupby_all_same_key() -> None:
     cpu = q.collect(engine="cpu")
     metal = q.collect(engine=_engine())
     assert_frame_equal(cpu, metal)
+
+
+def test_groupby_i32_keys_i32_values_matches_cpu() -> None:
+    """I32 key + I32 values — exercises the 32-bit GPU dispatcher path."""
+    n = 200_000
+    df = pl.DataFrame(
+        {
+            "k": [(i % 7) for i in range(n)],
+            "v": [(i % 100) for i in range(n)],
+        }
+    ).with_columns([pl.col("k").cast(pl.Int32), pl.col("v").cast(pl.Int32)])
+    q = (
+        df.lazy()
+        .group_by("k")
+        .agg(
+            pl.col("v").sum().alias("s"),
+            pl.col("v").mean().alias("m"),
+            pl.col("v").min().alias("mn"),
+            pl.col("v").max().alias("mx"),
+            pl.col("v").count().alias("c"),
+            pl.len().alias("n"),
+        )
+        .sort("k")
+    )
+    cpu = q.collect(engine="cpu")
+    metal = q.collect(engine=_engine())
+    assert_frame_equal(cpu, metal)
+
+
+def test_groupby_f32_values_matches_cpu() -> None:
+    """I32 key + F32 values — exercises the 32-bit float GPU dispatcher path."""
+    n = 200_000
+    df = pl.DataFrame(
+        {
+            "k": [(i % 5) for i in range(n)],
+            "v": [float(i % 100) for i in range(n)],
+        }
+    ).with_columns([pl.col("k").cast(pl.Int32), pl.col("v").cast(pl.Float32)])
+    q = (
+        df.lazy()
+        .group_by("k")
+        .agg(
+            pl.col("v").sum().alias("s"),
+            pl.col("v").mean().alias("m"),
+        )
+        .sort("k")
+    )
+    cpu = q.collect(engine="cpu")
+    metal = q.collect(engine=_engine())
+    assert_frame_equal(cpu, metal)
