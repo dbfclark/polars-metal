@@ -258,3 +258,62 @@ must be run manually. Consider automating: a CI job that runs on rev bumps,
 diffs the captured baseline against the committed one, and either updates
 the baseline or reports drift as a review item. *Owner:* post-M2 CI
 infrastructure.
+
+### M2 perf finding — GroupBy aggregation kernels are not the bottleneck
+
+The Q1 benchmarks shipped with M2 produce surprisingly tight ratios:
+
+| Variant | n_groups | CPU ms | Metal ms | Ratio |
+|---|---|---|---|---|
+| Q1-64bit (i64 keys + f64 values, CPU finalize for aggs) | 4 | 339 | 309 | 0.914 |
+| Q1-32bit (Bool keys + i32/f32 values, GPU aggs) | 4 | 27 | 26 | 0.988 |
+| Q1-32bit high-card (Int32 group key, GPU aggs) | ~1024 | 67 | 66 | 0.991 |
+
+The high-cardinality variant was added to test the "atomic contention is
+killing GPU aggregation" hypothesis (low cardinality → 7M rows contending
+on 4 atomic slots). **The hypothesis was disproved**: 256× lower contention
+(4 → 1024 groups) moved the ratio by only ~0.003. The absolute time jumped
+~40ms equally for both engines.
+
+What this tells us:
+
+- **Both engines pay ~40ms more at 1024 groups vs 4 groups.** That cost is
+  *shared* between CPU and Metal because the build phase (CPU HashMap) and
+  result-DataFrame assembly (CPU) scale with cardinality. The GPU
+  aggregation kernels themselves did not change cost meaningfully —
+  whatever they were doing at 4 groups, they do at 1024 groups.
+
+- **The GPU aggregation kernels are already fast enough to be invisible
+  in Q1-shaped queries.** The remaining 1-2% gap is split between
+  CPU-routed phases (filter, sort), the CPU build phase, MetalBuffer
+  marshalling overhead, and PyO3 boundary crossings. None of those can be
+  improved by tuning the GPU aggregation code further.
+
+**The largest perf lever for M3+ is therefore not "tune the aggregation
+kernels" — it's:**
+
+1. **Move the build phase back to GPU.** The current CPU HashMap build is the
+   single largest residual CPU cost at high cardinality. A sort-then-
+   segment-reduce design (cuDF has one) avoids the atomics-and-lockstep
+   issues that forced the M2 build-phase pivot to CPU. *Owner:* M3.
+
+2. **Kernel-fusion across aggregations.** Q1's 8 aggregations dispatch 8+
+   separate kernels (each ~50-100μs Metal launch overhead + buffer setup).
+   A fused kernel that reads each row once and updates all aggregations in
+   one pass would cut dispatch overhead ~10×. *Owner:* M3 / kernel-tuning
+   pass.
+
+3. **GPU filter when it's the immediate parent of a GPU GroupBy.** The
+   current cost model routes filter to CPU unconditionally. For
+   filter→groupby pipelines, fusing the filter into the GPU path
+   eliminates the post-filter MetalBuffer round-trip. *Owner:* M3 cost-
+   model extension.
+
+4. **Larger workloads.** At 100M rows the build phase scaling becomes
+   genuinely painful for the CPU HashMap; the GPU advantage should widen.
+   Worth re-measuring before deciding M3 priorities. *Owner:* M3 pre-
+   planning.
+
+Recorded as an explicit M3 design input. The empirical evidence is in
+`tests/bench/baseline.json` (entries `tpch_q1_modified`,
+`tpch_q1_modified_32bit`, `tpch_q1_modified_32bit_high_card`).
