@@ -36,7 +36,8 @@
       "ratio_metal_over_cpu": 0.914,
       "n_rows": 10000000,
       "hardware": "M2 Ultra",
-      "_notes": "Boolean l_returnflag/l_linestatus (encoder 128-bit budget). Filter routes to CPU per M2 cost model; groupby routes to GPU; sort routes to CPU. M2 perf gate: ratio < 1.0. Measured 2026-05-22; Metal median 309.5ms vs CPU median 338.8ms over 5 rounds."
+      "_notes": "Boolean l_returnflag/l_linestatus (encoder 128-bit budget). Filter routes to CPU per M2 cost model; groupby routes to GPU; sort routes to CPU. M2 perf gate: ratio < 1.0. Measured 2026-05-22; Metal median 309.5ms vs CPU median 338.8ms over 5 rounds.",
+      "_gate": {"ratio_lt": 1.0}
     },
     "tpch_q1_modified_32bit": {
       "cpu_ms": 26.75,
@@ -44,7 +45,8 @@
       "ratio_metal_over_cpu": 0.988,
       "n_rows": 10000000,
       "hardware": "M2 Ultra",
-      "_notes": "All-GPU comparison variant. Boolean l_returnflag/l_linestatus keys; Int32 quantity/shipdate and Float32 price/discount/tax/disc_price/charge value columns. Aggregations use GPU 32-bit dispatchers (no CPU finalize). Measured 2026-05-22; Metal median 26.4ms vs CPU median 26.8ms over 39/29 rounds. The 32-bit path roughly matches CPU latency — both run in ~27ms — because the 32-bit bottleneck shifts from CPU-finalize aggregation to the filter (CPU) and sort (CPU) phases. Without the filter+sort overhead, raw groupby-only timing would show larger GPU advantage."
+      "_notes": "All-GPU comparison variant. Boolean l_returnflag/l_linestatus keys; Int32 quantity/shipdate and Float32 price/discount/tax/disc_price/charge value columns. Aggregations use GPU 32-bit dispatchers (no CPU finalize). Measured 2026-05-22; Metal median 26.4ms vs CPU median 26.8ms over 39/29 rounds. The 32-bit path roughly matches CPU latency — both run in ~27ms — because the 32-bit bottleneck shifts from CPU-finalize aggregation to the filter (CPU) and sort (CPU) phases. Without the filter+sort overhead, raw groupby-only timing would show larger GPU advantage.",
+      "_gate": {"ratio_lt": 1.0}
     },
     "tpch_q1_modified_32bit_high_card": {
       "cpu_ms": 66.52,
@@ -53,7 +55,8 @@
       "n_rows": 10000000,
       "n_groups_approx": 1024,
       "hardware": "M2 Ultra",
-      "_notes": "Q1-shaped query grouped by l_part_class (~1024 distinct groups). Tests the GPU aggregation pipeline under low per-group atomic contention (vs the 4-group degenerate case in tpch_q1_modified_32bit). Hypothesis: GPU should win more substantially here. Measured 2026-05-22; Metal median 65.9ms vs CPU median 66.5ms over 15/13 rounds. Hypothesis NOT strongly confirmed: ratio 0.991 is nearly identical to the 4-group ratio of 0.988. The dominant cost at 10M rows is the filter (CPU-routed, ~9ms on its own) and the sort (CPU-routed, growing with n_groups). The groupby stage itself is a small fraction of total latency at both cardinalities; contention on 4 atomic slots is not the bottleneck at this scale — data movement and CPU-routed stages dominate."
+      "_notes": "Q1-shaped query grouped by l_part_class (~1024 distinct groups). Tests the GPU aggregation pipeline under low per-group atomic contention (vs the 4-group degenerate case in tpch_q1_modified_32bit). Hypothesis: GPU should win more substantially here. Measured 2026-05-22; Metal median 65.9ms vs CPU median 66.5ms over 15/13 rounds. Hypothesis NOT strongly confirmed: ratio 0.991 is nearly identical to the 4-group ratio of 0.988. The dominant cost at 10M rows is the filter (CPU-routed, ~9ms on its own) and the sort (CPU-routed, growing with n_groups). The groupby stage itself is a small fraction of total latency at both cardinalities; contention on 4 atomic slots is not the bottleneck at this scale — data movement and CPU-routed stages dominate.",
+      "_gate": {"ratio_lt": 1.0}
     }
   }
 }
