@@ -1,0 +1,1 @@
+# CPU baseline failures for test_group_by — never count as regressions
