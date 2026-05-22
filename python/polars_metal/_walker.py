@@ -39,6 +39,17 @@ IR-node shapes for the nodes we touch in Phase 4 (from
   and whose operands are each either a ``Column(I64|F64)`` or a
   matching-dtype ``Literal``. Compound predicates (AND/OR) and arithmetic
   inside the predicate land in later tasks.
+- ``GroupBy``: ``.keys`` (list[PyExprIR]), ``.aggs`` (list[PyExprIR]),
+  ``.maintain_order`` (bool), ``.options`` (GroupbyOptions). The ``PyExprIR``
+  objects each have ``.node`` (int arena index) and ``.output_name`` (str).
+  The alias, if any, is conveyed via ``agg_expr.output_name`` — there is no
+  separate ``Alias`` wrapper node for aggregations. Expression-arena nodes
+  reachable from ``GroupBy.aggs`` are either:
+  - ``Agg``: ``.name`` (lowercase str, e.g. ``'sum'``), ``.arguments``
+    (list[int] — raw arena indices, **not** PyExprIR objects).
+  - ``Len``: no attributes (empty ``dir()``).
+  For ``Agg``, each element of ``.arguments`` is a plain ``int`` used as the
+  arena index for the argument expression (typically a ``Column`` node).
 
 PyExprIR shape (from ``polars-python/src/lazyframe/visit.rs``): ``.node``
 (usize into the expression arena) and ``.output_name`` (str). To inspect
@@ -110,6 +121,8 @@ def _walk_at_current(nt: Any) -> WalkResult:
         return _walk_select(nt, node)
     if cls == "Filter":
         return _walk_filter(nt, node)
+    if cls == "GroupBy":
+        return _walk_group_by(nt, node)
     return FallBack(reason=f"unsupported IR node: {cls}")
 
 
@@ -125,6 +138,29 @@ def _walk_dataframe_scan(nt: Any, node: Any) -> WalkResult:
     # We don't handle predicates yet — fall back if one is present.
     if getattr(node, "selection", None) is not None:
         return FallBack(reason="DataFrameScan with pushed-down predicate")
+
+    # Multi-chunk Series are not yet supported. Convert the PyDataFrame to a
+    # pl.DataFrame and check each column's chunk count.
+    df = getattr(node, "df", None)
+    if df is not None:
+        try:
+            import polars as pl
+
+            polars_df = pl.DataFrame._from_pydf(df)
+            for col_name in polars_df.columns:
+                try:
+                    n_chunks = polars_df[col_name].n_chunks()
+                    if n_chunks > 1:
+                        return FallBack(
+                            reason=f"multi-chunk Series not yet supported (column {col_name!r} has {n_chunks} chunks)"
+                        )
+                except Exception:
+                    # If n_chunks() raises (shouldn't happen), assume single chunk
+                    pass
+        except Exception:
+            # If we can't convert or inspect the DataFrame, just proceed; the
+            # kernel will handle it or the UDF fallback will catch it.
+            pass
 
     schema = dict(nt.get_schema())
     columns: list[tuple[str, str]] = []
@@ -315,6 +351,184 @@ def _walk_filter(nt: Any, node: Any) -> WalkResult:
     )
 
 
+_AGG_NAME_TO_OP: dict[str, str] = {
+    # Polars Agg node's .name (lowercase) → MetalAggOp tag used in the plan dict.
+    "sum": "Sum",
+    "mean": "Mean",
+    "min": "Min",
+    "max": "Max",
+    "count": "Count",
+}
+
+
+def _walk_group_by(nt: Any, node: Any) -> WalkResult:
+    """Lower a Polars GroupBy IR node iff every key is a bare Column of an
+    accepted dtype and every aggregation is in the M2 closed set.
+
+    Verified IR shape (py-1.40.1):
+    - ``node.keys``: list[PyExprIR] — each has ``.node`` (int arena index)
+      and ``.output_name`` (str). The arena expression is a ``Column`` node.
+    - ``node.aggs``: list[PyExprIR] — each has ``.node`` and ``.output_name``
+      (carries the alias; there is no separate Alias wrapper). The arena
+      expression is either ``Agg`` or ``Len``.
+    - ``Agg``: ``.name`` (lowercase str), ``.arguments`` (list[int] — raw
+      arena indices, not PyExprIR objects).
+    - ``Len``: no attributes (empty dir).
+
+    For key dtype resolution, ``nt.get_dtype(key_node_id)`` works from the
+    GroupBy level because key columns are present in the output schema.
+    For agg argument columns (e.g. the ``v`` in ``pl.col("v").sum()``),
+    ``nt.get_dtype`` raises ``ColumnNotFoundError`` because those columns may
+    not appear in the GroupBy output; we look them up in the input schema
+    fetched by navigating to the child node.
+    """
+    keys_expr = getattr(node, "keys", None)
+    aggs_expr = getattr(node, "aggs", None)
+    if keys_expr is None or aggs_expr is None:
+        return FallBack(reason="GroupBy node missing .keys or .aggs")
+
+    inputs = nt.get_inputs()
+    if len(inputs) != 1:
+        return FallBack(reason=f"GroupBy expected 1 input, got {len(inputs)}")
+
+    # Fetch the input schema once: needed for agg-argument dtype validation.
+    parent_id = nt.get_node()
+    nt.set_node(inputs[0])
+    try:
+        in_schema = dict(nt.get_schema())
+    finally:
+        nt.set_node(parent_id)
+
+    keys: list[list[str]] = []
+    for key_expr in keys_expr:
+        key_node_id = getattr(key_expr, "node", None)
+        if key_node_id is None:
+            return FallBack(reason="GroupBy key expression has no .node id")
+        try:
+            key_inner = nt.view_expression(key_node_id)
+        except Exception as ex:
+            return FallBack(reason=f"could not view key expression: {ex!r}")
+        key_cls = type(key_inner).__name__
+        if key_cls != "Column":
+            return FallBack(reason=f"GroupBy key expression {key_cls} not supported")
+        key_name = getattr(key_inner, "name", None)
+        if key_name is None:
+            return FallBack(reason="GroupBy key Column missing .name")
+        dtype = in_schema.get(str(key_name))
+        if dtype is None:
+            return FallBack(reason=f"GroupBy key {key_name!r} not in input schema")
+        mapped = _map_dtype(dtype)
+        if mapped is None:
+            return FallBack(reason=f"unsupported dtype {dtype!s} on key {key_name!r}")
+        keys.append([str(key_name), mapped])
+
+    aggs: list[dict[str, str]] = []
+    for agg_expr in aggs_expr:
+        agg_dict = _walk_agg_expression(nt, agg_expr, in_schema)
+        if agg_dict is None:
+            return FallBack(reason="GroupBy agg expression not in M2 closed set")
+        aggs.append(agg_dict)
+
+    nt.set_node(inputs[0])
+    inner = _walk_at_current(nt)
+    if isinstance(inner, FallBack):
+        return inner
+
+    return Handled(
+        plan={
+            "kind": "GroupBy",
+            "input": inner.plan,
+            "keys": keys,
+            "aggs": aggs,
+        }
+    )
+
+
+def _walk_agg_expression(
+    nt: Any, agg_expr: Any, in_schema: dict[str, Any]
+) -> dict[str, str] | None:
+    """Lower one aggregation PyExprIR to ``{input_col, op, output_alias}``.
+
+    The alias is read from ``agg_expr.output_name`` (Polars carries it on the
+    PyExprIR wrapper, not as a separate Alias expression node).
+
+    ``in_schema`` is the GroupBy node's input schema (pre-aggregation), used to
+    validate that agg argument columns are present and have supported dtypes.
+    We cannot use ``nt.get_dtype()`` for agg-argument columns from the GroupBy
+    level — they may not appear in the GroupBy output schema, causing
+    ``ColumnNotFoundError``.
+
+    Accepted shapes:
+    - ``Agg(name=<op>, arguments=[col_arena_id])`` where the argument resolves
+      to a bare ``Column`` of a supported dtype, and ``name`` is one of the
+      entries in ``_AGG_NAME_TO_OP``.
+    - ``Len`` (no arguments) — maps to op ``"Len"`` with ``input_col=""``.
+
+    Everything else (e.g. ``Agg`` with a ``BinaryExpr`` argument, unknown agg
+    names, multi-arg aggs) returns ``None`` and causes the GroupBy to fall back.
+    """
+    node_id = getattr(agg_expr, "node", None)
+    if node_id is None:
+        return None
+    output_alias = str(getattr(agg_expr, "output_name", "") or "")
+
+    try:
+        inner = nt.view_expression(node_id)
+    except Exception:
+        return None
+
+    inner_cls = type(inner).__name__
+
+    if inner_cls == "Len":
+        return {
+            "input_col": "",
+            "op": "Len",
+            "output_alias": output_alias or "len",
+        }
+
+    if inner_cls != "Agg":
+        return None
+
+    agg_name = getattr(inner, "name", None)
+    if agg_name is None:
+        return None
+    op = _AGG_NAME_TO_OP.get(str(agg_name))
+    if op is None:
+        return None
+
+    # .arguments is a list of raw int arena indices (not PyExprIR objects).
+    args = getattr(inner, "arguments", None)
+    if not args or len(args) != 1:
+        return None
+    arg_id = args[0]
+    if not isinstance(arg_id, int):
+        return None
+
+    try:
+        col_expr = nt.view_expression(arg_id)
+    except Exception:
+        return None
+    if type(col_expr).__name__ != "Column":
+        return None
+    col_name = getattr(col_expr, "name", None)
+    if col_name is None:
+        return None
+
+    # Look up the column dtype in the input schema rather than via get_dtype,
+    # because agg argument columns are not in the GroupBy output schema.
+    dtype = in_schema.get(str(col_name))
+    if dtype is None:
+        return None
+    if _map_dtype(dtype) is None:
+        return None
+
+    return {
+        "input_col": str(col_name),
+        "op": op,
+        "output_alias": output_alias or f"{col_name}_{op.lower()}",
+    }
+
+
 _CMP_OP_NAMES: dict[str, str] = {
     # Polars' Operator enum's `str(op)` form → our MetalDtype-side op tag.
     "Operator.Eq": "Eq",
@@ -501,9 +715,9 @@ def _leaf_dtype(pred: dict) -> str | None:
 def _map_dtype(dt: Any) -> str | None:
     """Map a Polars DataType to a MetalDtype tag, or None if unsupported.
 
-    The current closed set: Int64 (i64), Float64 (f64), Boolean. Everything
-    else (String, Categorical, List, Struct, smaller ints, etc.) is a
-    fallback for M1.
+    The current closed set: Int64 (i64), Float64 (f64), Boolean, Int32 (i32),
+    Float32 (f32). Everything else (String, Categorical, List, Struct, etc.)
+    is a fallback.
     """
     s = str(dt)
     if s == "Int64":
@@ -512,4 +726,8 @@ def _map_dtype(dt: Any) -> str | None:
         return "F64"
     if s == "Boolean":
         return "Bool"
+    if s == "Int32":
+        return "I32"
+    if s == "Float32":
+        return "F32"
     return None

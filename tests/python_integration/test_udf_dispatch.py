@@ -99,16 +99,18 @@ def test_native_execute_plan_unknown_kind_raises() -> None:
 
 
 def test_end_to_end_walker_select_uses_rust_dispatch(caplog) -> None:
-    """End-to-end smoke test: a select query routes through the walker, which
-    installs the UDF, which now calls into Rust ``execute_plan``. The result
-    must match CPU Polars."""
+    """End-to-end smoke test: a select query routes through the walker and the
+    Rust router. Under M2's cost model (project inherits scan→CPU), the router
+    routes this to CPU without installing a UDF. The result must still match
+    CPU Polars."""
     caplog.set_level(logging.DEBUG, logger="polars_metal")
     df = pl.DataFrame({"a": [1, 2, 3], "b": [10.0, 20.0, 30.0]})
     cpu = df.lazy().select(["b", "a"]).collect()
     metal = df.lazy().select(["b", "a"]).collect(engine=polars_metal.MetalEngine(debug=True))
     assert_frame_equal(cpu, metal)
     msgs = [r.getMessage() for r in caplog.records if r.name == "polars_metal"]
-    assert any("installed UDF" in m for m in msgs), msgs
+    # M2 cost model: Scan→CpuLeave, Project inherits→CpuLeave. No UDF installed.
+    assert any("router routes entire query to CPU" in m for m in msgs), msgs
 
 
 def test_end_to_end_walker_scan_only_uses_rust_dispatch() -> None:

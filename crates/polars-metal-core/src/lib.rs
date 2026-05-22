@@ -9,13 +9,16 @@
 mod arena;
 mod error;
 pub mod plan;
+pub mod router;
+mod router_udf;
 mod udf;
 
 pub use arena::{BumpArena, ScratchArena, StubArena};
 pub use error::EngineError;
 pub use udf::{
     bool_and_dispatch, bool_or_dispatch, cmp_f64_col_col, cmp_f64_col_scalar, cmp_i64_col_col,
-    cmp_i64_col_scalar, execute_filter_compact, execute_plan,
+    cmp_i64_col_scalar, execute_filter_compact, execute_groupby, execute_plan, parse_groupby_plan,
+    GroupByParseError, ParsedAgg, ParsedGroupByPlan, ParsedKey,
 };
 
 use polars_metal_buffer::MetalDevice;
@@ -61,5 +64,7 @@ fn polars_metal_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add_function(wrap_pyfunction!(udf::cmp_f64_col_col, m)?)?;
     m.add_function(wrap_pyfunction!(udf::bool_and_dispatch, m)?)?;
     m.add_function(wrap_pyfunction!(udf::bool_or_dispatch, m)?)?;
+    m.add_function(wrap_pyfunction!(router_udf::compute_lifting_plan_py, m)?)?;
+    m.add_function(wrap_pyfunction!(udf::execute_groupby, m)?)?;
     Ok(())
 }

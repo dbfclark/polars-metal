@@ -62,6 +62,8 @@ def build_udf(plan: dict) -> Any:
     When ``should_time`` is true Polars expects a ``(df, timings)`` tuple.
     We don't measure kernel timings yet; emit an empty timing list.
     """
+    if plan["kind"] == "GroupBy":
+        return _build_groupby(plan)
     df_pydf, wire_plan = _extract_scan_df_and_wire_plan(plan)
 
     def udf(
@@ -181,6 +183,135 @@ def _dispatch_filter(df_pydf: Any, filter_plan: dict) -> pl.DataFrame:
             )
         series_list.append(_assemble_series(col_name, dtype_tag, out_data, out_valid, n_out))
 
+    return pl.DataFrame(series_list)
+
+
+def _build_groupby(plan: dict) -> Any:
+    """Return a UDF callable for a GroupBy plan.
+
+    The plan dict's ``input`` subtree resolves to the upstream DataFrame.
+    For Phase 8, the supported input shape is ``Scan`` directly under GroupBy
+    (or any other scan/project/filter shape that ``_extract_scan_df_and_wire_plan``
+    already handles). We extract the underlying ``df_pydf`` and the full wire
+    plan (including the GroupBy root node) and dispatch to ``_dispatch_groupby``
+    at call time.
+    """
+    df_pydf, wire_plan = _extract_scan_df_and_wire_plan(plan)
+
+    def udf(
+        with_columns: list[str] | None,
+        predicate: Any,
+        n_rows: int | None,
+        should_time: bool,
+    ) -> Any:
+        df = _dispatch_groupby(df_pydf, wire_plan)
+        if n_rows is not None:
+            df = df.slice(0, n_rows)
+        if should_time:
+            return df, []
+        return df
+
+    return udf
+
+
+def _dispatch_groupby(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
+    """Run the GroupBy pipeline against ``df_pydf`` and return a Polars
+    DataFrame of (groups x (keys + aggs)) computed on Metal.
+
+    Steps:
+      1. Convert df_pydf → pl.DataFrame for column iteration.
+      2. Determine the set of columns we need (union of keys + agg.input_col,
+         skipping empty input_col which is for Len).
+      3. Materialize each column as (name, dtype_tag, data_bytes, valid_bytes).
+      4. Call ``_native.execute_groupby(wire_plan, n_rows, columns)``.
+      5. Reassemble the returned (name, dtype_tag, data, valid) tuples into
+         a Polars DataFrame.
+    """
+    # The wire_plan root is a GroupBy node; the upstream data lives in its
+    # input subtree. We run the input subtree first to get the actual
+    # upstream DataFrame (which may involve scan/project/filter).
+    upstream_plan = wire_plan["input"]
+    if upstream_plan["kind"] == "Scan":
+        upstream = pl.DataFrame._from_pydf(df_pydf)
+    else:
+        upstream_pydf = _native.execute_plan(df_pydf, upstream_plan)
+        upstream = pl.DataFrame._from_pydf(upstream_pydf)
+
+    n_rows = upstream.height
+
+    # Collect the column names we'll send to Rust (keys + agg inputs).
+    needed: list[str] = []
+    seen: set[str] = set()
+    for key_entry in wire_plan["keys"]:
+        key_name = key_entry[0]
+        if key_name not in seen:
+            needed.append(key_name)
+            seen.add(key_name)
+    for agg in wire_plan["aggs"]:
+        ic = agg.get("input_col", "")
+        if ic and ic not in seen:
+            needed.append(ic)
+            seen.add(ic)
+
+    # Materialize each needed column as raw Arrow bytes.
+    columns_in: list[tuple[str, str, bytes, bytes]] = []
+    for col_name in needed:
+        if col_name not in upstream.columns:
+            raise RuntimeError(
+                f"polars_metal: column {col_name!r} required by GroupBy not in upstream df"
+            )
+        dtype = upstream.schema[col_name]
+        dtype_tag = _DTYPE_TO_TAG.get(str(dtype))
+        if dtype_tag is None:
+            raise RuntimeError(
+                f"polars_metal: unsupported dtype {dtype!s} on column {col_name!r} "
+                f"(walker should have fallen back)"
+            )
+        col_arr = _materialize_arrow(upstream.get_column(col_name))
+        data_bytes, valid_bytes = _data_and_valid_for_dtype(col_arr, n_rows, dtype_tag)
+        columns_in.append((col_name, dtype_tag, data_bytes, valid_bytes))
+
+    # Build the GroupBy-only wire plan (strip the input subtree; Rust re-uses
+    # just the keys/aggs/kind fields from the plan_dict).
+    groupby_plan = {
+        "kind": "GroupBy",
+        "input": wire_plan["input"],
+        "keys": wire_plan["keys"],
+        "aggs": wire_plan["aggs"],
+    }
+
+    # Call Rust.
+    out_columns = _native.execute_groupby(groupby_plan, n_rows, columns_in)
+
+    # Reassemble. out_columns is a list of (name, dtype_tag, data, valid).
+    # All output columns share the same n_out (number of groups); we determine
+    # it from the first non-Bool column or from the valid bitmap length for
+    # Bool columns.
+    series_list: list[pl.Series] = []
+    n_out: int | None = None
+
+    for col_entry in out_columns:
+        name, dtype_tag, data, valid = col_entry
+        # Determine the row count from this column.
+        if dtype_tag in ("U32", "I32", "F32"):
+            n_this = len(data) // 4
+        elif dtype_tag in ("I64", "F64"):
+            n_this = len(data) // 8
+        elif dtype_tag == "Bool":
+            # Bool data is bit-packed; use n_out from a previous column if
+            # available, otherwise estimate from valid-bitmap byte count
+            # (conservative upper bound, refined once we see a non-Bool col).
+            n_this = n_out if n_out is not None else len(valid) * 8
+        else:
+            raise RuntimeError(f"polars_metal: unexpected dtype_tag {dtype_tag!r}")
+
+        if n_out is None:
+            n_out = n_this
+
+        series_list.append(_assemble_series(name, dtype_tag, data, valid, n_out))
+
+    if not series_list:
+        return pl.DataFrame()
     return pl.DataFrame(series_list)
 
 
@@ -334,12 +465,17 @@ _DTYPE_TO_TAG: dict[str, str] = {
     "Int64": "I64",
     "Float64": "F64",
     "Boolean": "Bool",
+    "Int32": "I32",
+    "Float32": "F32",
 }
 
 _TAG_TO_PA: dict[str, pa.DataType] = {
     "I64": pa.int64(),
     "F64": pa.float64(),
     "Bool": pa.bool_(),
+    "U32": pa.uint32(),
+    "I32": pa.int32(),
+    "F32": pa.float32(),
 }
 
 
@@ -405,6 +541,10 @@ def _data_and_valid_for_dtype(arr: pa.Array, n_rows: int, dtype_tag: str) -> tup
         expected_data = n_rows * 8
         if len(data) < expected_data:
             data = data + b"\x00" * (expected_data - len(data))
+    elif dtype_tag in ("I32", "F32"):
+        expected_data = n_rows * 4
+        if len(data) < expected_data:
+            data = data + b"\x00" * (expected_data - len(data))
     elif dtype_tag == "Bool":
         if len(data) < min_valid_bytes:
             data = data + b"\x00" * (min_valid_bytes - len(data))
@@ -446,6 +586,9 @@ def _assemble_series(name: str, dtype_tag: str, data: bytes, valid: bytes, n_out
     valid_trim = valid[:min_valid_bytes] if min_valid_bytes > 0 else b""
     if dtype_tag == "Bool":
         data_trim = data[:min_valid_bytes] if min_valid_bytes > 0 else b""
+    elif dtype_tag in ("U32", "I32", "F32"):
+        # 32-bit types: dense, exactly n_out * 4 bytes.
+        data_trim = data[: n_out * 4]
     else:
         # I64/F64: dense, exactly n_out * 8 bytes.
         data_trim = data[: n_out * 8]
@@ -519,6 +662,13 @@ def _extract_scan_df_and_wire_plan(plan: dict) -> tuple[Any, dict]:
                 "kind": "Filter",
                 "predicate": node["predicate"],
                 "input": rewrite(node["input"]),
+            }
+        if kind == "GroupBy":
+            return {
+                "kind": "GroupBy",
+                "input": rewrite(node["input"]),
+                "keys": [list(k) for k in node["keys"]],
+                "aggs": [dict(a) for a in node["aggs"]],
             }
         raise ValueError(f"unknown plan kind: {kind!r}")
 

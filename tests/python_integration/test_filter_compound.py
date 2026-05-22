@@ -38,7 +38,10 @@ def test_filter_compound_and_runs_on_gpu(caplog) -> None:
     )
     assert_frame_equal(cpu, metal)
     log_text = " ".join(r.getMessage() for r in caplog.records if r.name == "polars_metal")
-    assert "installed UDF" in log_text, f"expected UDF installation, got logs: {log_text}"
+    # M2 cost model: filter→CPU always. No UDF is installed; the router logs the CPU route.
+    assert "router routes entire query to CPU" in log_text, (
+        f"expected router-to-CPU log, got: {log_text}"
+    )
 
 
 def test_filter_compound_or_runs_on_gpu() -> None:

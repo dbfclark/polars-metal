@@ -21,19 +21,23 @@
 //! directly via PyO3 `call_method1`. `PyDataFrame.select` is a synchronous,
 //! in-place column reorder/subset that bypasses the lazy plan entirely.
 
-use crate::plan::{MetalDtype, MetalPlanNode, PredicateAst};
+use crate::plan::{AggOp, MetalDtype, MetalPlanNode, PredicateAst};
 use polars_metal_buffer::MetalDevice;
 use polars_metal_kernels::cmp::{
     dispatch_cmp_f64, dispatch_cmp_f64_scalar, dispatch_cmp_i64, dispatch_cmp_i64_scalar, CompareOp,
 };
 use polars_metal_kernels::command::CommandQueue;
+use polars_metal_kernels::groupby::{
+    AggKind, AggRequest, GroupByError, KeyColumn, KeyDtype, ValueColumn,
+};
 use polars_metal_kernels::logical::{dispatch_bool_and, dispatch_bool_or};
 use polars_metal_kernels::pipeline::{
     compact_bool, compact_f64, compact_i64, compute_keep_and_prefix,
 };
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
+use std::collections::HashMap;
 
 /// PyO3 entry point exposed as `polars_metal._native.execute_plan`.
 ///
@@ -90,6 +94,15 @@ fn execute_node<'py>(
             Err(pyo3::exceptions::PyNotImplementedError::new_err(
                 "polars_metal: Filter nodes must be dispatched via execute_filter_compact, \
                  not execute_plan (the Python UDF handles the routing)",
+            ))
+        }
+        MetalPlanNode::GroupBy { .. } => {
+            // GroupBy execution lands in Task 28. For now, this code path
+            // should not be reached — the Python UDF routes GroupBy through
+            // a dedicated entry point (Task 29). If reached, raise a clear
+            // error rather than panicking.
+            Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                "polars_metal: GroupBy execution not yet implemented (lands in Phase 2)",
             ))
         }
     }
@@ -363,6 +376,14 @@ fn compact_one_column(
             // `ceil(n_out / 8)` before calling PyArrow.
             Ok((result.data, result.valid))
         }
+        MetalDtype::I32 | MetalDtype::F32 => {
+            // I32/F32: not yet supported in the filter compaction path.
+            // The walker should fall back for filter on 32-bit columns;
+            // reaching here is a logic bug — surface clearly.
+            Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                "polars_metal: filter compaction for {column_name:?} (I32/F32) not yet implemented"
+            )))
+        }
     }
 }
 
@@ -559,6 +580,8 @@ fn parse_dtype(s: &str) -> PyResult<MetalDtype> {
         "I64" => Ok(MetalDtype::I64),
         "F64" => Ok(MetalDtype::F64),
         "Bool" => Ok(MetalDtype::Bool),
+        "I32" => Ok(MetalDtype::I32),
+        "F32" => Ok(MetalDtype::F32),
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "polars_metal: unknown MetalDtype tag {other:?}"
         ))),
@@ -868,6 +891,747 @@ fn check_bitpacked_buffer(buf: &[u8], n_rows: usize, label: &str) -> PyResult<()
         )));
     }
     Ok(())
+}
+
+// ============================================================================
+// GroupBy PyO3 entry point — T28
+// ============================================================================
+
+/// Parsed view of a GroupBy plan dict received from the Python UDF.
+#[derive(Debug)]
+pub struct ParsedGroupByPlan {
+    pub keys: Vec<ParsedKey>,
+    pub aggs: Vec<ParsedAgg>,
+}
+
+/// One key column descriptor from the wire plan.
+#[derive(Debug)]
+pub struct ParsedKey {
+    pub name: String,
+    pub dtype: MetalDtype,
+}
+
+/// One aggregation descriptor from the wire plan.
+#[derive(Debug)]
+pub struct ParsedAgg {
+    pub input_col: String,
+    pub op: AggOp,
+    pub output_alias: String,
+}
+
+/// Errors produced while parsing the Python groupby plan dict.
+#[derive(Debug, thiserror::Error)]
+pub enum GroupByParseError {
+    #[error("missing required field: {0}")]
+    Missing(&'static str),
+    #[error("wrong type for field: {0}")]
+    WrongType(&'static str),
+    #[error("unknown dtype: {0}")]
+    UnknownDtype(String),
+    #[error("unknown agg op: {0}")]
+    UnknownOp(String),
+}
+
+/// Parse the `plan_dict` PyDict emitted by the Python walker into a
+/// [`ParsedGroupByPlan`]. No new Python dep required — we read the dict
+/// directly via PyO3.
+///
+/// Expected shape:
+/// ```python
+/// {
+///     "keys": [["col_name", "I64"], ...],
+///     "aggs": [{"input_col": "x", "op": "Sum", "output_alias": "x_sum"}, ...],
+/// }
+/// ```
+pub fn parse_groupby_plan(plan: &Bound<PyDict>) -> Result<ParsedGroupByPlan, GroupByParseError> {
+    // -- keys ----------------------------------------------------------------
+    let keys_obj = plan
+        .get_item("keys")
+        .ok()
+        .flatten()
+        .ok_or(GroupByParseError::Missing("keys"))?;
+    let keys_list: Bound<PyList> = keys_obj
+        .downcast_into()
+        .map_err(|_| GroupByParseError::WrongType("keys"))?;
+    let mut keys = Vec::with_capacity(keys_list.len());
+    for item in keys_list.iter() {
+        let entry: Bound<PyList> = item
+            .downcast_into()
+            .map_err(|_| GroupByParseError::WrongType("key entry"))?;
+        if entry.len() < 2 {
+            return Err(GroupByParseError::WrongType("key entry"));
+        }
+        let name: String = entry
+            .get_item(0)
+            .ok()
+            .and_then(|v| v.extract().ok())
+            .ok_or(GroupByParseError::WrongType("key name"))?;
+        let dtype_str: String = entry
+            .get_item(1)
+            .ok()
+            .and_then(|v| v.extract().ok())
+            .ok_or(GroupByParseError::WrongType("key dtype"))?;
+        let dtype =
+            MetalDtype::from_wire(&dtype_str).ok_or(GroupByParseError::UnknownDtype(dtype_str))?;
+        keys.push(ParsedKey { name, dtype });
+    }
+
+    // -- aggs ----------------------------------------------------------------
+    let aggs_obj = plan
+        .get_item("aggs")
+        .ok()
+        .flatten()
+        .ok_or(GroupByParseError::Missing("aggs"))?;
+    let aggs_list: Bound<PyList> = aggs_obj
+        .downcast_into()
+        .map_err(|_| GroupByParseError::WrongType("aggs"))?;
+    let mut aggs = Vec::with_capacity(aggs_list.len());
+    for item in aggs_list.iter() {
+        let entry: Bound<PyDict> = item
+            .downcast_into()
+            .map_err(|_| GroupByParseError::WrongType("agg entry"))?;
+        // input_col is empty string for Len; default to empty if absent.
+        let input_col: String = entry
+            .get_item("input_col")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract().ok())
+            .unwrap_or_default();
+        let op_str: String = entry
+            .get_item("op")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract().ok())
+            .ok_or(GroupByParseError::WrongType("op"))?;
+        let op = AggOp::from_wire(&op_str).ok_or(GroupByParseError::UnknownOp(op_str))?;
+        let output_alias: String = entry
+            .get_item("output_alias")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract().ok())
+            .ok_or(GroupByParseError::WrongType("output_alias"))?;
+        aggs.push(ParsedAgg {
+            input_col,
+            op,
+            output_alias,
+        });
+    }
+
+    Ok(ParsedGroupByPlan { keys, aggs })
+}
+
+/// Map a [`MetalDtype`] (plan layer) to the kernel-layer [`KeyDtype`].
+fn metal_dtype_to_key_dtype(d: MetalDtype) -> KeyDtype {
+    match d {
+        MetalDtype::I64 => KeyDtype::I64,
+        MetalDtype::F64 => KeyDtype::F64,
+        MetalDtype::Bool => KeyDtype::Bool,
+        MetalDtype::I32 => KeyDtype::I32,
+        MetalDtype::F32 => KeyDtype::F32,
+    }
+}
+
+/// Build the `(AggKind, ValueColumn<'a>)` pair for a single agg request,
+/// given the value column's raw byte buffers and dtype tag.
+///
+/// The `data` slice must be cast to the correct typed slice before being
+/// wrapped in `ValueColumn`. We use `unsafe slice::from_raw_parts` here
+/// for the same reason as the filter path: no `bytemuck` dep, and Arrow
+/// buffers are guaranteed to be at least 8-byte aligned.
+fn build_agg_kind_and_vcol<'a>(
+    op: AggOp,
+    dtype_tag: &str,
+    data: &'a [u8],
+    valid: &'a [u8],
+    n_rows: usize,
+) -> PyResult<(AggKind, ValueColumn<'a>)> {
+    match (op, dtype_tag) {
+        (AggOp::Sum, "I64") => {
+            let expected = n_rows * 8;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Sum/I64 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: i64 has no invalid bit patterns; data.len() >= n_rows*8
+            // and Arrow buffers are 64-byte aligned, so the reinterpret is
+            // well-aligned for i64 (8-byte alignment).
+            let typed: &[i64] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i64, n_rows) };
+            Ok((AggKind::SumI64, ValueColumn::I64 { data: typed, valid }))
+        }
+        (AggOp::Sum, "F64") => {
+            let expected = n_rows * 8;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Sum/F64 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: f64 has no invalid bit patterns; same alignment argument
+            // as the i64 path.
+            let typed: &[f64] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f64, n_rows) };
+            Ok((AggKind::SumF64, ValueColumn::F64 { data: typed, valid }))
+        }
+        (AggOp::Mean, "I64") => {
+            let expected = n_rows * 8;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Mean/I64 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/I64.
+            let typed: &[i64] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i64, n_rows) };
+            Ok((AggKind::MeanI64, ValueColumn::I64 { data: typed, valid }))
+        }
+        (AggOp::Mean, "F64") => {
+            let expected = n_rows * 8;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Mean/F64 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/F64.
+            let typed: &[f64] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f64, n_rows) };
+            Ok((AggKind::MeanF64, ValueColumn::F64 { data: typed, valid }))
+        }
+        (AggOp::Min, "I64") => {
+            let expected = n_rows * 8;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Min/I64 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/I64.
+            let typed: &[i64] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i64, n_rows) };
+            Ok((AggKind::MinI64, ValueColumn::I64 { data: typed, valid }))
+        }
+        (AggOp::Min, "F64") => {
+            let expected = n_rows * 8;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Min/F64 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/F64.
+            let typed: &[f64] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f64, n_rows) };
+            Ok((AggKind::MinF64, ValueColumn::F64 { data: typed, valid }))
+        }
+        (AggOp::Max, "I64") => {
+            let expected = n_rows * 8;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Max/I64 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/I64.
+            let typed: &[i64] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i64, n_rows) };
+            Ok((AggKind::MaxI64, ValueColumn::I64 { data: typed, valid }))
+        }
+        (AggOp::Max, "F64") => {
+            let expected = n_rows * 8;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Max/F64 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/F64.
+            let typed: &[f64] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f64, n_rows) };
+            Ok((AggKind::MaxF64, ValueColumn::F64 { data: typed, valid }))
+        }
+        (AggOp::Count, "I64") => {
+            let expected = n_rows * 8;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Count/I64 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/I64.
+            let typed: &[i64] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i64, n_rows) };
+            Ok((AggKind::Count, ValueColumn::I64 { data: typed, valid }))
+        }
+        (AggOp::Count, "F64") => {
+            let expected = n_rows * 8;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Count/F64 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/F64.
+            let typed: &[f64] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f64, n_rows) };
+            Ok((AggKind::Count, ValueColumn::F64 { data: typed, valid }))
+        }
+        // --- I32 variants ---
+        (AggOp::Sum, "I32") => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Sum/I32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: i32 has no invalid bit patterns; data.len() >= n_rows*4
+            // and Arrow buffers are 64-byte aligned.
+            let typed: &[i32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, n_rows) };
+            Ok((AggKind::SumI32, ValueColumn::I32 { data: typed, valid }))
+        }
+        (AggOp::Mean, "I32") => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Mean/I32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/I32.
+            let typed: &[i32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, n_rows) };
+            Ok((AggKind::MeanI32, ValueColumn::I32 { data: typed, valid }))
+        }
+        (AggOp::Min, "I32") => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Min/I32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/I32.
+            let typed: &[i32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, n_rows) };
+            Ok((AggKind::MinI32, ValueColumn::I32 { data: typed, valid }))
+        }
+        (AggOp::Max, "I32") => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Max/I32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/I32.
+            let typed: &[i32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, n_rows) };
+            Ok((AggKind::MaxI32, ValueColumn::I32 { data: typed, valid }))
+        }
+        (AggOp::Count, "I32") => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Count/I32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/I32.
+            let typed: &[i32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, n_rows) };
+            Ok((AggKind::Count, ValueColumn::I32 { data: typed, valid }))
+        }
+        // --- F32 variants ---
+        (AggOp::Sum, "F32") => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Sum/F32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: f32 has no invalid bit patterns; data.len() >= n_rows*4
+            // and Arrow buffers are 64-byte aligned.
+            let typed: &[f32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_rows) };
+            Ok((AggKind::SumF32, ValueColumn::F32 { data: typed, valid }))
+        }
+        (AggOp::Mean, "F32") => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Mean/F32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/F32.
+            let typed: &[f32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_rows) };
+            Ok((AggKind::MeanF32, ValueColumn::F32 { data: typed, valid }))
+        }
+        (AggOp::Min, "F32") => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Min/F32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/F32.
+            let typed: &[f32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_rows) };
+            Ok((AggKind::MinF32, ValueColumn::F32 { data: typed, valid }))
+        }
+        (AggOp::Max, "F32") => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Max/F32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/F32.
+            let typed: &[f32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_rows) };
+            Ok((AggKind::MaxF32, ValueColumn::F32 { data: typed, valid }))
+        }
+        (AggOp::Count, "F32") => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Count/F32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/F32.
+            let typed: &[f32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_rows) };
+            Ok((AggKind::Count, ValueColumn::F32 { data: typed, valid }))
+        }
+        (op, dtype) => Err(PyValueError::new_err(format!(
+            "polars_metal: unsupported (agg_op, dtype) combination: {op:?} / {dtype}"
+        ))),
+    }
+}
+
+/// Pack a `Vec<bool>` validity slice into a 4-byte-aligned little-endian
+/// bit-packed validity bitmap, matching Arrow's convention.
+fn pack_valid_bitmap(bits: &[bool]) -> Vec<u8> {
+    let n_bytes = ((bits.len() + 7) / 8 + 3) & !3;
+    let n_bytes = n_bytes.max(4);
+    let mut out = vec![0u8; n_bytes];
+    for (i, &b) in bits.iter().enumerate() {
+        if b {
+            out[i >> 3] |= 1 << (i & 7);
+        }
+    }
+    out
+}
+
+/// Encode a [`DecodedColumn`] (key output) into `(dtype_tag, data_bytes,
+/// valid_bytes)` for the wire return format.
+fn encode_decoded_column(
+    d: &polars_metal_kernels::groupby::DecodedColumn,
+) -> (&'static str, Vec<u8>, Vec<u8>) {
+    use polars_metal_kernels::groupby::DecodedColumn;
+    match d {
+        DecodedColumn::I64 { values, valid } => {
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let v = pack_valid_bitmap(valid);
+            ("I64", data, v)
+        }
+        DecodedColumn::F64 { values, valid } => {
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let v = pack_valid_bitmap(valid);
+            ("F64", data, v)
+        }
+        DecodedColumn::Bool { values, valid } => {
+            // Bool data is also bit-packed (Arrow convention).
+            let data = pack_valid_bitmap(values);
+            let v = pack_valid_bitmap(valid);
+            ("Bool", data, v)
+        }
+        DecodedColumn::I32 { values, valid } => {
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let v = pack_valid_bitmap(valid);
+            ("I32", data, v)
+        }
+        DecodedColumn::F32 { values, valid } => {
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let v = pack_valid_bitmap(valid);
+            ("F32", data, v)
+        }
+    }
+}
+
+/// Encode an [`AggOutput`] into `(dtype_tag, data_bytes, valid_bytes)`.
+///
+/// U64 outputs (Count, Len) are cast to u32 — Polars returns u32 for both
+/// `pl.col(x).count()` and `pl.len()`. At M2 row counts > 4 billion per
+/// group are unrealistic, so this truncation is safe in practice.
+fn encode_agg_output(
+    o: &polars_metal_kernels::groupby::AggOutput,
+) -> (&'static str, Vec<u8>, Vec<u8>) {
+    use polars_metal_kernels::groupby::AggOutput;
+    match o {
+        AggOutput::I64 { values, valid } => {
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let v = pack_valid_bitmap(valid);
+            ("I64", data, v)
+        }
+        AggOutput::F64 { values, valid } => {
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let v = pack_valid_bitmap(valid);
+            ("F64", data, v)
+        }
+        AggOutput::U64 { values } => {
+            // Cast u64 → u32. Counts / lens that fit in u32 are the common case.
+            let data: Vec<u8> = values
+                .iter()
+                .flat_map(|&v| (v as u32).to_le_bytes())
+                .collect();
+            let n = values.len();
+            // All-ones bitmap: counts/lens are never null.
+            let valid_bytes = (((n + 7) / 8 + 3) & !3).max(4);
+            let valid = vec![0xFFu8; valid_bytes];
+            ("U32", data, valid)
+        }
+        AggOutput::I32 { values, valid } => {
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let v = pack_valid_bitmap(valid);
+            ("I32", data, v)
+        }
+        AggOutput::F32 { values, valid } => {
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let v = pack_valid_bitmap(valid);
+            ("F32", data, v)
+        }
+    }
+}
+
+/// Convert the kernel `GroupByError` to a `PyErr`.
+fn groupby_err(e: GroupByError) -> PyErr {
+    PyValueError::new_err(format!("polars_metal: dispatch_groupby failed: {e}"))
+}
+
+/// PyO3 entry point: `polars_metal._native.execute_groupby`.
+///
+/// # Wire protocol
+///
+/// `plan_dict` shape:
+/// ```python
+/// {
+///     "keys": [["col_name", "I64"], ...],           # list of [name, dtype_tag]
+///     "aggs": [
+///         {"input_col": "x", "op": "Sum", "output_alias": "x_sum"},
+///         {"input_col": "",  "op": "Len", "output_alias": "n"},
+///     ],
+/// }
+/// ```
+///
+/// `columns`: one `(name, dtype_tag, data_bytes, valid_bytes)` tuple per
+/// column that appears in either `keys` or `aggs.input_col`.
+///
+/// # Returns
+///
+/// A Python list of `(col_name: str, dtype_tag: str, data: bytes,
+/// valid: bytes)` tuples — first the key columns (in `keys` order), then
+/// the agg outputs (in `aggs` order, named by `output_alias`).  The
+/// Python UDF (`_udf.py::_build_groupby`) reassembles these into a Polars
+/// DataFrame via PyArrow, matching the pattern of `execute_filter_compact`.
+///
+/// Supported dtype tags on output: `"I64"`, `"F64"`, `"Bool"`, `"U32"`.
+#[pyfunction]
+pub fn execute_groupby<'py>(
+    py: Python<'py>,
+    plan_dict: Bound<'py, PyDict>,
+    n_rows: usize,
+    columns: &Bound<'py, PyList>,
+) -> PyResult<Bound<'py, PyList>> {
+    // 1. Parse plan dict → ParsedGroupByPlan.
+    let parsed = parse_groupby_plan(&plan_dict)
+        .map_err(|e| PyValueError::new_err(format!("polars_metal: plan parse error: {e}")))?;
+
+    // 2. Build lookup: col_name → (dtype_tag, data_bytes, valid_bytes).
+    //    We hold references into the PyBytes objects rather than copying.
+    //    The PyBytes objects are alive for the duration of this function, so
+    //    the byte slice references are safe to use until we return.
+    let mut by_name: HashMap<String, (String, Bound<'py, PyBytes>, Bound<'py, PyBytes>)> =
+        HashMap::new();
+    for (idx, entry) in columns.iter().enumerate() {
+        let tup: Bound<PyTuple> = entry.downcast_into().map_err(|_| {
+            PyValueError::new_err(format!(
+                "polars_metal: execute_groupby columns[{idx}] must be a tuple"
+            ))
+        })?;
+        if tup.len() != 4 {
+            return Err(PyValueError::new_err(format!(
+                "polars_metal: execute_groupby columns[{idx}] must have 4 elements (name, dtype, data, valid), got {}",
+                tup.len()
+            )));
+        }
+        let name: String = tup.get_item(0)?.extract()?;
+        let dtype_tag: String = tup.get_item(1)?.extract()?;
+        let data_py: Bound<PyBytes> = tup.get_item(2)?.downcast_into().map_err(|_| {
+            PyValueError::new_err(format!(
+                "polars_metal: execute_groupby columns[{idx}].data must be bytes"
+            ))
+        })?;
+        let valid_py: Bound<PyBytes> = tup.get_item(3)?.downcast_into().map_err(|_| {
+            PyValueError::new_err(format!(
+                "polars_metal: execute_groupby columns[{idx}].valid must be bytes"
+            ))
+        })?;
+        by_name.insert(name, (dtype_tag, data_py, valid_py));
+    }
+
+    // 3. Build KeyColumn slice.
+    //    We must keep the &[u8] alive until after dispatch_groupby returns.
+    //    We collect (data_bytes, valid_bytes) references before constructing
+    //    KeyColumn structs so their lifetimes are tied to the PyBytes in
+    //    `by_name`, which outlives the dispatch call.
+    let mut key_byte_refs: Vec<(&[u8], &[u8])> = Vec::with_capacity(parsed.keys.len());
+    for k in &parsed.keys {
+        let (_, data_py, valid_py) = by_name.get(&k.name).ok_or_else(|| {
+            PyKeyError::new_err(format!(
+                "polars_metal: key column {:?} not found in upstream columns",
+                k.name
+            ))
+        })?;
+        key_byte_refs.push((data_py.as_bytes(), valid_py.as_bytes()));
+    }
+    let key_cols: Vec<KeyColumn<'_>> = parsed
+        .keys
+        .iter()
+        .zip(key_byte_refs.iter())
+        .map(|(k, (data, valid))| KeyColumn {
+            name: k.name.clone(),
+            dtype: metal_dtype_to_key_dtype(k.dtype),
+            data,
+            valid,
+            n_rows,
+        })
+        .collect();
+
+    // 4. Build (AggRequest, ValueColumn) pairs.
+    //    Len needs no value column; we use a zero-length I64 placeholder
+    //    because `run_one_agg` for Len ignores the ValueColumn entirely.
+    let empty_data: &[u8] = &[];
+    let empty_valid: &[u8] = &[];
+    // SAFETY: &[] cast to &[i64] is a zero-length slice — no pointer
+    // arithmetic occurs. The slice is valid and the pointer is non-null
+    // (a valid empty slice). This is the established pattern for
+    // zero-length typed slices in this codebase.
+    let empty_i64: &[i64] =
+        unsafe { std::slice::from_raw_parts(empty_data.as_ptr() as *const i64, 0) };
+
+    // Tuple type alias to keep the Vec type readable for clippy.
+    type AggByteRef<'a> = (&'a [u8], &'a [u8], String);
+
+    let mut agg_byte_refs: Vec<Option<AggByteRef<'_>>> = Vec::with_capacity(parsed.aggs.len());
+    for agg in &parsed.aggs {
+        if matches!(agg.op, AggOp::Len) {
+            agg_byte_refs.push(None);
+            continue;
+        }
+        let (dtype_tag, data_py, valid_py) = by_name.get(&agg.input_col).ok_or_else(|| {
+            PyKeyError::new_err(format!(
+                "polars_metal: agg input column {:?} not found in upstream columns",
+                agg.input_col
+            ))
+        })?;
+        agg_byte_refs.push(Some((
+            data_py.as_bytes(),
+            valid_py.as_bytes(),
+            dtype_tag.clone(),
+        )));
+    }
+
+    let mut agg_specs: Vec<(AggRequest, ValueColumn<'_>)> = Vec::with_capacity(parsed.aggs.len());
+    for (i, agg) in parsed.aggs.iter().enumerate() {
+        if matches!(agg.op, AggOp::Len) {
+            agg_specs.push((
+                AggRequest {
+                    kind: AggKind::Len,
+                    input_col_idx: i,
+                },
+                ValueColumn::I64 {
+                    data: empty_i64,
+                    valid: empty_valid,
+                },
+            ));
+            continue;
+        }
+        // This entry was populated in the previous loop (Len was already
+        // handled via `continue`), so `None` here is a logic bug rather than
+        // a runtime condition — surface it as an internal error.
+        let (data, valid, dtype_tag) = agg_byte_refs[i].as_ref().ok_or_else(|| {
+            PyValueError::new_err(
+                "polars_metal: internal error: missing agg byte ref for non-Len agg",
+            )
+        })?;
+        let (kind, vcol) = build_agg_kind_and_vcol(agg.op, dtype_tag, data, valid, n_rows)?;
+        agg_specs.push((
+            AggRequest {
+                kind,
+                input_col_idx: i,
+            },
+            vcol,
+        ));
+    }
+
+    // 5. Acquire device + queue.
+    let device = MetalDevice::system_default()
+        .map_err(|e| crate::engine_err(crate::EngineError::Buffer(e)))?;
+    let mut queue = CommandQueue::new(&device)
+        .map_err(|e| crate::engine_err(crate::EngineError::Other(format!("command queue: {e}"))))?;
+
+    // 6. Dispatch.
+    let result = polars_metal_kernels::groupby::dispatch_groupby(
+        &device, &mut queue, &key_cols, &agg_specs, n_rows,
+    )
+    .map_err(groupby_err)?;
+
+    // 7. Encode result as a list of (name, dtype_tag, data, valid) tuples.
+    //    Key columns first, then agg outputs.
+    let out_list = PyList::empty_bound(py);
+
+    for (i, key) in parsed.keys.iter().enumerate() {
+        let decoded = &result.decoded_keys[i];
+        let (dtype_tag, data, valid) = encode_decoded_column(decoded);
+        let tup = PyTuple::new_bound(
+            py,
+            [
+                key.name.clone().into_py(py),
+                dtype_tag.into_py(py),
+                PyBytes::new_bound(py, &data).into_py(py),
+                PyBytes::new_bound(py, &valid).into_py(py),
+            ],
+        );
+        out_list.append(tup)?;
+    }
+
+    for (i, agg) in parsed.aggs.iter().enumerate() {
+        let output = &result.agg_outputs[i];
+        let (dtype_tag, data, valid) = encode_agg_output(output);
+        let tup = PyTuple::new_bound(
+            py,
+            [
+                agg.output_alias.clone().into_py(py),
+                dtype_tag.into_py(py),
+                PyBytes::new_bound(py, &data).into_py(py),
+                PyBytes::new_bound(py, &valid).into_py(py),
+            ],
+        );
+        out_list.append(tup)?;
+    }
+
+    Ok(out_list)
 }
 
 /// PyO3 entry point exposed as `polars_metal._native.bool_and_dispatch`.

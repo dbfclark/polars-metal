@@ -25,5 +25,8 @@ arrow-buffer = "53"
 pyo3 = { version = "0.22", features = ["abi3-py310"] }
 thiserror = "1"
 
+[dev-dependencies]
+proptest = "1"
+
 [lints]
 workspace = true

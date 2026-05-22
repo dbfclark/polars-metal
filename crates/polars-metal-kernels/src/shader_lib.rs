@@ -85,14 +85,11 @@ impl ShaderLibrary {
     pub fn load(device: &MetalDevice) -> Result<Self, ShaderError> {
         let metallib_path = materialize_metallib_once()?;
         let library = load_library_at_path(device, metallib_path)?;
-        // The metallib has been read into `MTLLibrary` in-memory and the
-        // on-disk file is no longer needed. Removing it eagerly keeps
-        // `$TMPDIR` tidy across dev cycles. The remove is best-effort: a
-        // sibling thread that won the `OnceLock` race may have already
-        // unlinked it (or a previous `load` call did so), which is fine.
-        // Any other error here is non-fatal — the library load already
-        // succeeded — so we swallow it.
-        let _ = std::fs::remove_file(metallib_path);
+        // We deliberately leave the temp metallib in place for the lifetime
+        // of the process. The `materialize_metallib_once` OnceLock caches
+        // the path; a subsequent `load` (e.g. each test that calls it)
+        // reuses the same path. Removing the file here breaks those repeat
+        // callers — the OS cleans up the temp file at process exit.
         Ok(Self {
             library,
             psos: Mutex::new(HashMap::new()),

@@ -73,6 +73,18 @@ SUITE_PATHS: list[tuple[str, str, str, tuple[str, ...]]] = [
         "_polars_known_failures_expr_binary.txt",
         (),
     ),
+    (
+        "operations_group_by",
+        "tests/unit/operations/test_group_by.py",
+        "_polars_known_failures_operations_group_by.txt",
+        (),
+    ),
+    (
+        "operations_aggregation",
+        "tests/unit/operations/aggregation/test_aggregations.py",
+        "_polars_known_failures_operations_aggregation.txt",
+        (),
+    ),
 ]
 
 
