@@ -72,6 +72,42 @@ def make_lineitem(n_rows: int = 10_000_000, seed: int = 0xC0FFEE) -> pl.DataFram
     )
 
 
+def make_lineitem_32bit(n_rows: int = 10_000_000, seed: int = 0xC0FFEE) -> pl.DataFrame:
+    """All-32bit variant of make_lineitem for the all-GPU benchmark.
+
+    Same shape as make_lineitem but every numeric column is Int32 or Float32.
+    This puts every aggregation on the GPU 32-bit dispatcher path; useful
+    for measuring the upper bound of GPU groupby performance where the Metal
+    toolchain's 32-bit atomics can be used directly (no CPU finalize step).
+    """
+    rng = np.random.default_rng(seed)
+
+    returnflag = rng.integers(0, 2, size=n_rows, dtype=np.uint8).astype(bool)
+    linestatus = rng.integers(0, 2, size=n_rows, dtype=np.uint8).astype(bool)
+    quantity = rng.integers(1, 51, size=n_rows, dtype=np.int32)
+    extendedprice = rng.uniform(1000.0, 100_000.0, size=n_rows).astype(np.float32)
+    discount = rng.uniform(0.0, 0.10, size=n_rows).astype(np.float32)
+    tax = rng.uniform(0.0, 0.08, size=n_rows).astype(np.float32)
+    shipdate = rng.integers(_SHIPDATE_LO, _SHIPDATE_HI + 1, size=n_rows, dtype=np.int32)
+
+    disc_price = extendedprice * (1.0 - discount)
+    charge = disc_price * (1.0 + tax)
+
+    return pl.DataFrame(
+        {
+            "l_returnflag": returnflag,
+            "l_linestatus": linestatus,
+            "l_quantity": quantity,
+            "l_extendedprice": extendedprice,
+            "l_discount": discount,
+            "l_tax": tax,
+            "l_shipdate": shipdate,
+            "disc_price": disc_price.astype(np.float32),
+            "charge": charge.astype(np.float32),
+        }
+    )
+
+
 if __name__ == "__main__":
     df = make_lineitem(1_000_000)
     print(df.schema)

@@ -83,3 +83,48 @@ def test_q1_correctness(lineitem_10m: pl.DataFrame) -> None:
     cpu = _q1(lineitem_10m.lazy()).collect(engine="cpu")
     metal = _q1(lineitem_10m.lazy()).collect(engine=polars_metal.MetalEngine())
     assert_frame_equal(cpu, metal)
+
+
+# ---------------------------------------------------------------------------
+# Q1-32bit: all-GPU benchmark (Int32/Float32 value columns)
+# ---------------------------------------------------------------------------
+
+from tests.bench._lineitem_fixture import make_lineitem_32bit  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def lineitem_10m_32bit() -> pl.DataFrame:
+    """10M-row lineitem fixture with 32-bit numeric columns."""
+    return make_lineitem_32bit(n_rows=10_000_000, seed=0xC0FFEE)
+
+
+@pytest.mark.benchmark(group="tpch_q1_32bit")
+def test_bench_tpch_q1_32bit_cpu(benchmark, lineitem_10m_32bit: pl.DataFrame) -> None:
+    """32-bit Q1 baseline on CPU."""
+
+    def run() -> pl.DataFrame:
+        return _q1(lineitem_10m_32bit.lazy()).collect(engine="cpu")
+
+    out = benchmark(run)
+    assert out.height == 4, f"expected 4 groups, got {out.height}"
+
+
+@pytest.mark.benchmark(group="tpch_q1_32bit")
+def test_bench_tpch_q1_32bit_metal(benchmark, lineitem_10m_32bit: pl.DataFrame) -> None:
+    """32-bit Q1 on Metal — full GPU pipeline (no CPU finalize)."""
+    engine = polars_metal.MetalEngine()
+
+    def run() -> pl.DataFrame:
+        return _q1(lineitem_10m_32bit.lazy()).collect(engine=engine)
+
+    out = benchmark(run)
+    assert out.height == 4, f"expected 4 groups, got {out.height}"
+
+
+def test_q1_32bit_correctness(lineitem_10m_32bit: pl.DataFrame) -> None:
+    """Correctness on the 32-bit variant."""
+    from polars.testing import assert_frame_equal
+
+    cpu = _q1(lineitem_10m_32bit.lazy()).collect(engine="cpu")
+    metal = _q1(lineitem_10m_32bit.lazy()).collect(engine=polars_metal.MetalEngine())
+    assert_frame_equal(cpu, metal)

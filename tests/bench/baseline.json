@@ -37,6 +37,14 @@
       "n_rows": 10000000,
       "hardware": "M2 Ultra",
       "_notes": "Boolean l_returnflag/l_linestatus (encoder 128-bit budget). Filter routes to CPU per M2 cost model; groupby routes to GPU; sort routes to CPU. M2 perf gate: ratio < 1.0. Measured 2026-05-22; Metal median 309.5ms vs CPU median 338.8ms over 5 rounds."
+    },
+    "tpch_q1_modified_32bit": {
+      "cpu_ms": 26.75,
+      "metal_ms": 26.43,
+      "ratio_metal_over_cpu": 0.988,
+      "n_rows": 10000000,
+      "hardware": "M2 Ultra",
+      "_notes": "All-GPU comparison variant. Boolean l_returnflag/l_linestatus keys; Int32 quantity/shipdate and Float32 price/discount/tax/disc_price/charge value columns. Aggregations use GPU 32-bit dispatchers (no CPU finalize). Measured 2026-05-22; Metal median 26.4ms vs CPU median 26.8ms over 39/29 rounds. The 32-bit path roughly matches CPU latency — both run in ~27ms — because the 32-bit bottleneck shifts from CPU-finalize aggregation to the filter (CPU) and sort (CPU) phases. Without the filter+sort overhead, raw groupby-only timing would show larger GPU advantage."
     }
   }
 }
