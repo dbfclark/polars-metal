@@ -128,3 +128,67 @@ def test_q1_32bit_correctness(lineitem_10m_32bit: pl.DataFrame) -> None:
     cpu = _q1(lineitem_10m_32bit.lazy()).collect(engine="cpu")
     metal = _q1(lineitem_10m_32bit.lazy()).collect(engine=polars_metal.MetalEngine())
     assert_frame_equal(cpu, metal)
+
+
+# ---------------------------------------------------------------------------
+# Q1-32bit-high-card: high-cardinality groupby (~1024 groups, all-32-bit)
+# ---------------------------------------------------------------------------
+
+
+def _q1_high_card(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Q1-shaped query but grouped by l_part_class (~1024 groups).
+
+    Same filter + aggregations as _q1, but the group_by key is the
+    high-cardinality l_part_class. This tests the GPU aggregation
+    pipeline under low per-group contention, which is the case the
+    GPU should win at.
+    """
+    return (
+        lf.filter(pl.col("l_shipdate") <= _THRESHOLD)
+        .group_by("l_part_class")
+        .agg(
+            pl.col("l_quantity").sum().alias("sum_qty"),
+            pl.col("l_extendedprice").sum().alias("sum_base_price"),
+            pl.col("disc_price").sum().alias("sum_disc_price"),
+            pl.col("charge").sum().alias("sum_charge"),
+            pl.col("l_quantity").mean().alias("avg_qty"),
+            pl.col("l_extendedprice").mean().alias("avg_price"),
+            pl.col("l_discount").mean().alias("avg_disc"),
+            pl.len().alias("count_order"),
+        )
+        .sort("l_part_class")
+    )
+
+
+@pytest.mark.benchmark(group="tpch_q1_32bit_high_card")
+def test_bench_tpch_q1_32bit_high_card_cpu(benchmark, lineitem_10m_32bit: pl.DataFrame) -> None:
+    """32-bit Q1 high-cardinality (~1024 groups) baseline on CPU."""
+
+    def run() -> pl.DataFrame:
+        return _q1_high_card(lineitem_10m_32bit.lazy()).collect(engine="cpu")
+
+    out = benchmark(run)
+    # Loose bound — exact count depends on which 1024-bucket integers
+    # the shipdate filter happens to leave non-empty.
+    assert 900 <= out.height <= 1024
+
+
+@pytest.mark.benchmark(group="tpch_q1_32bit_high_card")
+def test_bench_tpch_q1_32bit_high_card_metal(benchmark, lineitem_10m_32bit: pl.DataFrame) -> None:
+    """32-bit Q1 high-cardinality on Metal — full GPU pipeline."""
+    engine = polars_metal.MetalEngine()
+
+    def run() -> pl.DataFrame:
+        return _q1_high_card(lineitem_10m_32bit.lazy()).collect(engine=engine)
+
+    out = benchmark(run)
+    assert 900 <= out.height <= 1024
+
+
+def test_q1_32bit_high_card_correctness(lineitem_10m_32bit: pl.DataFrame) -> None:
+    """Correctness: CPU and Metal produce identical results for high-card Q1."""
+    from polars.testing import assert_frame_equal
+
+    cpu = _q1_high_card(lineitem_10m_32bit.lazy()).collect(engine="cpu")
+    metal = _q1_high_card(lineitem_10m_32bit.lazy()).collect(engine=polars_metal.MetalEngine())
+    assert_frame_equal(cpu, metal)

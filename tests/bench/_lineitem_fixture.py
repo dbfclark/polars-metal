@@ -39,10 +39,13 @@ _SHIPDATE_HI = (date(1998, 12, 31) - date(1970, 1, 1)).days
 
 
 def make_lineitem(n_rows: int = 10_000_000, seed: int = 0xC0FFEE) -> pl.DataFrame:
-    """Build an n_rows x 9-column lineitem-shaped DataFrame.
+    """Build an n_rows x 10-column lineitem-shaped DataFrame.
 
     Returns columns matching modified Q1's input shape. Bit-reproducible
     across runs at the same seed.
+
+    Includes l_part_class (Int32, uniform in [0, 1024)) for the
+    high-cardinality groupby variant.
     """
     rng = np.random.default_rng(seed)
 
@@ -53,6 +56,7 @@ def make_lineitem(n_rows: int = 10_000_000, seed: int = 0xC0FFEE) -> pl.DataFram
     discount = rng.uniform(0.0, 0.10, size=n_rows).astype(np.float64)
     tax = rng.uniform(0.0, 0.08, size=n_rows).astype(np.float64)
     shipdate = rng.integers(_SHIPDATE_LO, _SHIPDATE_HI + 1, size=n_rows, dtype=np.int64)
+    part_class = rng.integers(0, 1024, size=n_rows, dtype=np.int32)
 
     disc_price = extendedprice * (1.0 - discount)
     charge = disc_price * (1.0 + tax)
@@ -68,6 +72,7 @@ def make_lineitem(n_rows: int = 10_000_000, seed: int = 0xC0FFEE) -> pl.DataFram
             "l_shipdate": shipdate,
             "disc_price": disc_price,
             "charge": charge,
+            "l_part_class": part_class,
         }
     )
 
@@ -79,6 +84,9 @@ def make_lineitem_32bit(n_rows: int = 10_000_000, seed: int = 0xC0FFEE) -> pl.Da
     This puts every aggregation on the GPU 32-bit dispatcher path; useful
     for measuring the upper bound of GPU groupby performance where the Metal
     toolchain's 32-bit atomics can be used directly (no CPU finalize step).
+
+    Includes l_part_class (Int32, uniform in [0, 1024)) for the
+    high-cardinality groupby variant.
     """
     rng = np.random.default_rng(seed)
 
@@ -89,6 +97,7 @@ def make_lineitem_32bit(n_rows: int = 10_000_000, seed: int = 0xC0FFEE) -> pl.Da
     discount = rng.uniform(0.0, 0.10, size=n_rows).astype(np.float32)
     tax = rng.uniform(0.0, 0.08, size=n_rows).astype(np.float32)
     shipdate = rng.integers(_SHIPDATE_LO, _SHIPDATE_HI + 1, size=n_rows, dtype=np.int32)
+    part_class = rng.integers(0, 1024, size=n_rows, dtype=np.int32)
 
     disc_price = extendedprice * (1.0 - discount)
     charge = disc_price * (1.0 + tax)
@@ -104,6 +113,7 @@ def make_lineitem_32bit(n_rows: int = 10_000_000, seed: int = 0xC0FFEE) -> pl.Da
             "l_shipdate": shipdate,
             "disc_price": disc_price.astype(np.float32),
             "charge": charge.astype(np.float32),
+            "l_part_class": part_class,
         }
     )
 
