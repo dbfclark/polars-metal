@@ -19,12 +19,21 @@ fn scan(n_rows: usize) -> MetalPlanNode {
 fn filter_over_scan_is_cpu_leave_throughout() {
     let plan = MetalPlanNode::Filter {
         input: Box::new(scan(1_000_000)),
-        predicate: PredicateAst::Column { name: "mask".into(), dtype: MetalDtype::Bool },
+        predicate: PredicateAst::Column {
+            name: "mask".into(),
+            dtype: MetalDtype::Bool,
+        },
     };
     let lifting = compute_lifting_plan(&plan);
     // Spec § "Routing decisions" — filter always CPU, scan inherits.
-    assert_eq!(lifting.get(&NodeId::new("Scan", 0)), Some(&NodeDecision::CpuLeave));
-    assert_eq!(lifting.get(&NodeId::new("Filter", 1)), Some(&NodeDecision::CpuLeave));
+    assert_eq!(
+        lifting.get(&NodeId::new("Scan", 0)),
+        Some(&NodeDecision::CpuLeave)
+    );
+    assert_eq!(
+        lifting.get(&NodeId::new("Filter", 1)),
+        Some(&NodeDecision::CpuLeave)
+    );
 }
 
 #[test]
@@ -34,8 +43,14 @@ fn project_over_scan_is_cpu_leave_throughout() {
         columns: vec!["a".into()],
     };
     let lifting = compute_lifting_plan(&plan);
-    assert_eq!(lifting.get(&NodeId::new("Scan", 0)), Some(&NodeDecision::CpuLeave));
-    assert_eq!(lifting.get(&NodeId::new("Project", 1)), Some(&NodeDecision::CpuLeave));
+    assert_eq!(
+        lifting.get(&NodeId::new("Scan", 0)),
+        Some(&NodeDecision::CpuLeave)
+    );
+    assert_eq!(
+        lifting.get(&NodeId::new("Project", 1)),
+        Some(&NodeDecision::CpuLeave)
+    );
 }
 
 #[test]
@@ -43,12 +58,18 @@ fn project_after_filter_inherits_filter_decision() {
     let plan = MetalPlanNode::Project {
         input: Box::new(MetalPlanNode::Filter {
             input: Box::new(scan(1_000_000)),
-            predicate: PredicateAst::Column { name: "mask".into(), dtype: MetalDtype::Bool },
+            predicate: PredicateAst::Column {
+                name: "mask".into(),
+                dtype: MetalDtype::Bool,
+            },
         }),
         columns: vec!["a".into()],
     };
     let lifting = compute_lifting_plan(&plan);
-    assert_eq!(lifting.get(&NodeId::new("Project", 2)), Some(&NodeDecision::CpuLeave));
+    assert_eq!(
+        lifting.get(&NodeId::new("Project", 2)),
+        Some(&NodeDecision::CpuLeave)
+    );
 }
 
 #[test]
@@ -58,7 +79,10 @@ fn lifting_plan_has_single_node_for_scan_only() {
     let plan = scan(1_000);
     let lifting = compute_lifting_plan(&plan);
     assert_eq!(lifting.len(), 1);
-    assert_eq!(lifting.get(&NodeId::new("Scan", 0)), Some(&NodeDecision::CpuLeave));
+    assert_eq!(
+        lifting.get(&NodeId::new("Scan", 0)),
+        Some(&NodeDecision::CpuLeave)
+    );
 }
 
 #[test]
@@ -68,7 +92,10 @@ fn node_ids_are_assigned_in_post_order() {
     // Scan first, Filter second.
     let plan = MetalPlanNode::Filter {
         input: Box::new(scan(100)),
-        predicate: PredicateAst::Column { name: "mask".into(), dtype: MetalDtype::Bool },
+        predicate: PredicateAst::Column {
+            name: "mask".into(),
+            dtype: MetalDtype::Bool,
+        },
     };
     let lifting = compute_lifting_plan(&plan);
     assert!(lifting.get(&NodeId::new("Scan", 0)).is_some());

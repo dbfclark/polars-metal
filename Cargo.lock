@@ -759,6 +759,7 @@ dependencies = [
  "polars-metal-buffer",
  "polars-metal-mlx-sys",
  "proptest",
+ "rayon",
  "thiserror",
 ]
 
