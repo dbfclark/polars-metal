@@ -376,6 +376,14 @@ fn compact_one_column(
             // `ceil(n_out / 8)` before calling PyArrow.
             Ok((result.data, result.valid))
         }
+        MetalDtype::I32 | MetalDtype::F32 => {
+            // I32/F32: not yet supported in the filter compaction path.
+            // The walker should fall back for filter on 32-bit columns;
+            // reaching here is a logic bug — surface clearly.
+            Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                "polars_metal: filter compaction for {column_name:?} (I32/F32) not yet implemented"
+            )))
+        }
     }
 }
 
@@ -572,6 +580,8 @@ fn parse_dtype(s: &str) -> PyResult<MetalDtype> {
         "I64" => Ok(MetalDtype::I64),
         "F64" => Ok(MetalDtype::F64),
         "Bool" => Ok(MetalDtype::Bool),
+        "I32" => Ok(MetalDtype::I32),
+        "F32" => Ok(MetalDtype::F32),
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "polars_metal: unknown MetalDtype tag {other:?}"
         ))),
@@ -1016,6 +1026,8 @@ fn metal_dtype_to_key_dtype(d: MetalDtype) -> KeyDtype {
         MetalDtype::I64 => KeyDtype::I64,
         MetalDtype::F64 => KeyDtype::F64,
         MetalDtype::Bool => KeyDtype::Bool,
+        MetalDtype::I32 => KeyDtype::I32,
+        MetalDtype::F32 => KeyDtype::F32,
     }
 }
 
@@ -1167,6 +1179,140 @@ fn build_agg_kind_and_vcol<'a>(
                 unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f64, n_rows) };
             Ok((AggKind::Count, ValueColumn::F64 { data: typed, valid }))
         }
+        // --- I32 variants ---
+        (AggOp::Sum, "I32") => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Sum/I32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: i32 has no invalid bit patterns; data.len() >= n_rows*4
+            // and Arrow buffers are 64-byte aligned.
+            let typed: &[i32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, n_rows) };
+            Ok((AggKind::SumI32, ValueColumn::I32 { data: typed, valid }))
+        }
+        (AggOp::Mean, "I32") => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Mean/I32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/I32.
+            let typed: &[i32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, n_rows) };
+            Ok((AggKind::MeanI32, ValueColumn::I32 { data: typed, valid }))
+        }
+        (AggOp::Min, "I32") => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Min/I32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/I32.
+            let typed: &[i32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, n_rows) };
+            Ok((AggKind::MinI32, ValueColumn::I32 { data: typed, valid }))
+        }
+        (AggOp::Max, "I32") => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Max/I32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/I32.
+            let typed: &[i32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, n_rows) };
+            Ok((AggKind::MaxI32, ValueColumn::I32 { data: typed, valid }))
+        }
+        (AggOp::Count, "I32") => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Count/I32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/I32.
+            let typed: &[i32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, n_rows) };
+            Ok((AggKind::Count, ValueColumn::I32 { data: typed, valid }))
+        }
+        // --- F32 variants ---
+        (AggOp::Sum, "F32") => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Sum/F32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: f32 has no invalid bit patterns; data.len() >= n_rows*4
+            // and Arrow buffers are 64-byte aligned.
+            let typed: &[f32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_rows) };
+            Ok((AggKind::SumF32, ValueColumn::F32 { data: typed, valid }))
+        }
+        (AggOp::Mean, "F32") => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Mean/F32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/F32.
+            let typed: &[f32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_rows) };
+            Ok((AggKind::MeanF32, ValueColumn::F32 { data: typed, valid }))
+        }
+        (AggOp::Min, "F32") => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Min/F32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/F32.
+            let typed: &[f32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_rows) };
+            Ok((AggKind::MinF32, ValueColumn::F32 { data: typed, valid }))
+        }
+        (AggOp::Max, "F32") => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Max/F32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/F32.
+            let typed: &[f32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_rows) };
+            Ok((AggKind::MaxF32, ValueColumn::F32 { data: typed, valid }))
+        }
+        (AggOp::Count, "F32") => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Count/F32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                )));
+            }
+            // SAFETY: see Sum/F32.
+            let typed: &[f32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_rows) };
+            Ok((AggKind::Count, ValueColumn::F32 { data: typed, valid }))
+        }
         (op, dtype) => Err(PyValueError::new_err(format!(
             "polars_metal: unsupported (agg_op, dtype) combination: {op:?} / {dtype}"
         ))),
@@ -1210,6 +1356,16 @@ fn encode_decoded_column(
             let v = pack_valid_bitmap(valid);
             ("Bool", data, v)
         }
+        DecodedColumn::I32 { values, valid } => {
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let v = pack_valid_bitmap(valid);
+            ("I32", data, v)
+        }
+        DecodedColumn::F32 { values, valid } => {
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let v = pack_valid_bitmap(valid);
+            ("F32", data, v)
+        }
     }
 }
 
@@ -1244,6 +1400,16 @@ fn encode_agg_output(
             let valid_bytes = (((n + 7) / 8 + 3) & !3).max(4);
             let valid = vec![0xFFu8; valid_bytes];
             ("U32", data, valid)
+        }
+        AggOutput::I32 { values, valid } => {
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let v = pack_valid_bitmap(valid);
+            ("I32", data, v)
+        }
+        AggOutput::F32 { values, valid } => {
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let v = pack_valid_bitmap(valid);
+            ("F32", data, v)
         }
     }
 }

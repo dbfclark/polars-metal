@@ -75,6 +75,7 @@ fn key_width_bits(dtype: MetalDtype) -> usize {
     match dtype {
         MetalDtype::Bool => 1 + 1,
         MetalDtype::I64 | MetalDtype::F64 => 1 + 64,
+        MetalDtype::I32 | MetalDtype::F32 => 1 + 32,
     }
 }
 

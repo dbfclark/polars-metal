@@ -293,7 +293,7 @@ def _dispatch_groupby(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
     for col_entry in out_columns:
         name, dtype_tag, data, valid = col_entry
         # Determine the row count from this column.
-        if dtype_tag == "U32":
+        if dtype_tag in ("U32", "I32", "F32"):
             n_this = len(data) // 4
         elif dtype_tag in ("I64", "F64"):
             n_this = len(data) // 8
@@ -465,6 +465,8 @@ _DTYPE_TO_TAG: dict[str, str] = {
     "Int64": "I64",
     "Float64": "F64",
     "Boolean": "Bool",
+    "Int32": "I32",
+    "Float32": "F32",
 }
 
 _TAG_TO_PA: dict[str, pa.DataType] = {
@@ -472,6 +474,8 @@ _TAG_TO_PA: dict[str, pa.DataType] = {
     "F64": pa.float64(),
     "Bool": pa.bool_(),
     "U32": pa.uint32(),
+    "I32": pa.int32(),
+    "F32": pa.float32(),
 }
 
 
@@ -537,6 +541,10 @@ def _data_and_valid_for_dtype(arr: pa.Array, n_rows: int, dtype_tag: str) -> tup
         expected_data = n_rows * 8
         if len(data) < expected_data:
             data = data + b"\x00" * (expected_data - len(data))
+    elif dtype_tag in ("I32", "F32"):
+        expected_data = n_rows * 4
+        if len(data) < expected_data:
+            data = data + b"\x00" * (expected_data - len(data))
     elif dtype_tag == "Bool":
         if len(data) < min_valid_bytes:
             data = data + b"\x00" * (min_valid_bytes - len(data))
@@ -578,8 +586,8 @@ def _assemble_series(name: str, dtype_tag: str, data: bytes, valid: bytes, n_out
     valid_trim = valid[:min_valid_bytes] if min_valid_bytes > 0 else b""
     if dtype_tag == "Bool":
         data_trim = data[:min_valid_bytes] if min_valid_bytes > 0 else b""
-    elif dtype_tag == "U32":
-        # U32: dense, exactly n_out * 4 bytes.
+    elif dtype_tag in ("U32", "I32", "F32"):
+        # 32-bit types: dense, exactly n_out * 4 bytes.
         data_trim = data[: n_out * 4]
     else:
         # I64/F64: dense, exactly n_out * 8 bytes.

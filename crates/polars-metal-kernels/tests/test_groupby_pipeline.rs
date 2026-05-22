@@ -87,6 +87,8 @@ fn canonicalize(
                 DecodedColumn::I64 { values, valid } => (valid[g], values[g]),
                 DecodedColumn::F64 { values, valid } => (valid[g], values[g].to_bits() as i64),
                 DecodedColumn::Bool { values, valid } => (valid[g], values[g] as i64),
+                DecodedColumn::I32 { values, valid } => (valid[g], values[g] as i64),
+                DecodedColumn::F32 { values, valid } => (valid[g], values[g].to_bits() as i64),
             })
             .collect();
         let agg_tuple: AggTuple = agg_outputs
@@ -101,6 +103,14 @@ fn canonicalize(
                     value_bits: values[g].to_bits(),
                 },
                 AggOutput::U64 { values } => AggOutputValue::U64(values[g]),
+                AggOutput::I32 { values, valid } => AggOutputValue::I64 {
+                    valid: valid[g],
+                    value: values[g] as i64,
+                },
+                AggOutput::F32 { values, valid } => AggOutputValue::F64 {
+                    valid: valid[g],
+                    value_bits: (values[g] as f64).to_bits(),
+                },
             })
             .collect();
         out.insert(key_tuple, agg_tuple);

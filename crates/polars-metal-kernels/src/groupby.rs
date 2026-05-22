@@ -40,6 +40,8 @@ pub enum KeyDtype {
     I64,
     F64,
     Bool,
+    I32,
+    F32,
 }
 
 impl KeyDtype {
@@ -48,6 +50,7 @@ impl KeyDtype {
         match self {
             KeyDtype::I64 | KeyDtype::F64 => 64,
             KeyDtype::Bool => 1,
+            KeyDtype::I32 | KeyDtype::F32 => 32,
         }
     }
 }
@@ -144,6 +147,7 @@ pub fn encode_keys(cols: &[KeyColumn<'_>]) -> Result<(Vec<u128>, KeySchema), Key
     for c in cols {
         let need_data = match c.dtype {
             KeyDtype::I64 | KeyDtype::F64 => n_rows * 8,
+            KeyDtype::I32 | KeyDtype::F32 => n_rows * 4,
             KeyDtype::Bool => min_valid_bytes,
         };
         if c.data.len() < need_data {
@@ -199,6 +203,16 @@ pub fn encode_keys(cols: &[KeyColumn<'_>]) -> Result<(Vec<u128>, KeySchema), Key
                     let mut bytes = [0u8; 8];
                     bytes.copy_from_slice(&c.data[row * 8..(row + 1) * 8]);
                     f64::from_le_bytes(bytes).to_bits() as u128
+                }
+                KeyDtype::I32 => {
+                    let mut bytes = [0u8; 4];
+                    bytes.copy_from_slice(&c.data[row * 4..(row + 1) * 4]);
+                    i32::from_le_bytes(bytes) as u32 as u128
+                }
+                KeyDtype::F32 => {
+                    let mut bytes = [0u8; 4];
+                    bytes.copy_from_slice(&c.data[row * 4..(row + 1) * 4]);
+                    f32::from_le_bytes(bytes).to_bits() as u128
                 }
                 KeyDtype::Bool => {
                     let byte = c.data[row >> 3];
@@ -1413,6 +1427,36 @@ pub fn compute_mean_i64(sums: &[i64], counts: &[u64]) -> Vec<Option<f64>> {
         .collect()
 }
 
+/// Compute per-group mean from f32 sum + count, returning f32.
+/// Returns `None` for groups where `count == 0`.
+pub fn compute_mean_f32(sums: &[f32], counts: &[u32]) -> Vec<Option<f32>> {
+    sums.iter()
+        .zip(counts.iter())
+        .map(|(s, c)| {
+            if *c == 0 {
+                None
+            } else {
+                Some(*s / (*c as f32))
+            }
+        })
+        .collect()
+}
+
+/// Compute per-group mean from i32 sum + count, returning f32.
+/// Returns `None` for groups where `count == 0`.
+pub fn compute_mean_i32(sums: &[i32], counts: &[u32]) -> Vec<Option<f32>> {
+    sums.iter()
+        .zip(counts.iter())
+        .map(|(s, c)| {
+            if *c == 0 {
+                None
+            } else {
+                Some(*s as f32 / (*c as f32))
+            }
+        })
+        .collect()
+}
+
 // -----------------------------------------------------------------------
 // Unit tests for compute_mean (T25)
 // -----------------------------------------------------------------------
@@ -1498,6 +1542,8 @@ pub enum DecodedColumn {
     I64 { values: Vec<i64>, valid: Vec<bool> },
     F64 { values: Vec<f64>, valid: Vec<bool> },
     Bool { values: Vec<bool>, valid: Vec<bool> },
+    I32 { values: Vec<i32>, valid: Vec<bool> },
+    F32 { values: Vec<f32>, valid: Vec<bool> },
 }
 
 /// Decode a u128-encoded composite-key stream back to per-column values.
@@ -1515,6 +1561,14 @@ pub fn decode_keys(encoded: &[u128], schema: &KeySchema) -> Vec<DecodedColumn> {
                 valid: Vec::with_capacity(encoded.len()),
             },
             KeyDtype::Bool => DecodedColumn::Bool {
+                values: Vec::with_capacity(encoded.len()),
+                valid: Vec::with_capacity(encoded.len()),
+            },
+            KeyDtype::I32 => DecodedColumn::I32 {
+                values: Vec::with_capacity(encoded.len()),
+                valid: Vec::with_capacity(encoded.len()),
+            },
+            KeyDtype::F32 => DecodedColumn::F32 {
                 values: Vec::with_capacity(encoded.len()),
                 valid: Vec::with_capacity(encoded.len()),
             },
@@ -1548,6 +1602,22 @@ pub fn decode_keys(encoded: &[u128], schema: &KeySchema) -> Vec<DecodedColumn> {
                     values.push(v);
                     valid.push(is_valid);
                 }
+                (DecodedColumn::I32 { values, valid }, KeyDtype::I32) => {
+                    let raw = (lane >> field.data_bit_offset) & ((1u128 << 32) - 1);
+                    let v = if is_valid { raw as u32 as i32 } else { 0 };
+                    values.push(v);
+                    valid.push(is_valid);
+                }
+                (DecodedColumn::F32 { values, valid }, KeyDtype::F32) => {
+                    let raw = (lane >> field.data_bit_offset) & ((1u128 << 32) - 1);
+                    let v = if is_valid {
+                        f32::from_bits(raw as u32)
+                    } else {
+                        0.0f32
+                    };
+                    values.push(v);
+                    valid.push(is_valid);
+                }
                 _ => unreachable!("decoded column dtype must match field dtype"),
             }
         }
@@ -1574,6 +1644,15 @@ pub enum AggKind {
     MaxF64,
     Count, // count of non-null values
     Len,   // total row count per group (pl.len())
+    // 32-bit GPU dispatcher variants
+    SumI32,
+    SumF32,
+    MeanI32, // sum_i32 / count → f32
+    MeanF32, // sum_f32 / count → f32
+    MinI32,
+    MaxI32,
+    MinF32,
+    MaxF32,
 }
 
 /// A single aggregation request.
@@ -1588,6 +1667,8 @@ pub struct AggRequest {
 pub enum ValueColumn<'a> {
     I64 { data: &'a [i64], valid: &'a [u8] },
     F64 { data: &'a [f64], valid: &'a [u8] },
+    I32 { data: &'a [i32], valid: &'a [u8] },
+    F32 { data: &'a [f32], valid: &'a [u8] },
 }
 
 /// One aggregation's output. Carries data + per-group null flags for ops
@@ -1597,6 +1678,8 @@ pub enum AggOutput {
     I64 { values: Vec<i64>, valid: Vec<bool> },
     F64 { values: Vec<f64>, valid: Vec<bool> },
     U64 { values: Vec<u64> },
+    I32 { values: Vec<i32>, valid: Vec<bool> },
+    F32 { values: Vec<f32>, valid: Vec<bool> },
 }
 
 /// The pipeline's complete result.
@@ -1655,6 +1738,8 @@ pub fn dispatch_groupby(
     let mut agg_outputs = Vec::with_capacity(agg_specs.len());
     for (req, vcol) in agg_specs {
         agg_outputs.push(run_one_agg(
+            device,
+            queue,
             req,
             vcol,
             &build.row_to_group,
@@ -1691,15 +1776,36 @@ fn empty_output_for(kind: AggKind) -> AggOutput {
             valid: vec![],
         },
         AggKind::Count | AggKind::Len => AggOutput::U64 { values: vec![] },
+        AggKind::SumI32 | AggKind::MinI32 | AggKind::MaxI32 => AggOutput::I32 {
+            values: vec![],
+            valid: vec![],
+        },
+        AggKind::SumF32
+        | AggKind::MeanI32
+        | AggKind::MeanF32
+        | AggKind::MinF32
+        | AggKind::MaxF32 => AggOutput::F32 {
+            values: vec![],
+            valid: vec![],
+        },
     }
 }
 
+/// Helper: build a per-group null-validity mask from a GPU count result.
+/// Groups with `count[g] == 0` are null (all input rows were null).
+fn count_to_valid(counts: &[u32]) -> Vec<bool> {
+    counts.iter().map(|&c| c > 0).collect()
+}
+
 fn run_one_agg(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
     req: &AggRequest,
     vcol: &ValueColumn<'_>,
     row_to_group: &[u32],
     n_groups: usize,
 ) -> Result<AggOutput, GroupByError> {
+    let n_rows = row_to_group.len();
     match (req.kind, vcol) {
         (AggKind::SumI64, ValueColumn::I64 { data, valid }) => {
             let values = aggregate_sum_i64_cpu(data, valid, row_to_group, n_groups);
@@ -1745,7 +1851,9 @@ fn run_one_agg(
             })
         }
         (AggKind::Count, ValueColumn::I64 { valid, .. })
-        | (AggKind::Count, ValueColumn::F64 { valid, .. }) => {
+        | (AggKind::Count, ValueColumn::F64 { valid, .. })
+        | (AggKind::Count, ValueColumn::I32 { valid, .. })
+        | (AggKind::Count, ValueColumn::F32 { valid, .. }) => {
             let values = aggregate_count_cpu(valid, row_to_group, n_groups);
             Ok(AggOutput::U64 { values })
         }
@@ -1775,10 +1883,220 @@ fn run_one_agg(
                 valid: valid_out,
             })
         }
+        // --- 32-bit GPU dispatcher paths ---
+        (AggKind::SumI32, ValueColumn::I32 { data, valid }) => {
+            let mut out = vec![0i32; n_groups];
+            dispatch_sum_i32(
+                device,
+                queue,
+                data,
+                valid,
+                row_to_group,
+                n_rows,
+                n_groups,
+                &mut out,
+            )?;
+            Ok(AggOutput::I32 {
+                valid: vec![true; n_groups],
+                values: out,
+            })
+        }
+        (AggKind::SumF32, ValueColumn::F32 { data, valid }) => {
+            let mut out = vec![0f32; n_groups];
+            dispatch_sum_f32(
+                device,
+                queue,
+                data,
+                valid,
+                row_to_group,
+                n_rows,
+                n_groups,
+                &mut out,
+            )?;
+            Ok(AggOutput::F32 {
+                valid: vec![true; n_groups],
+                values: out,
+            })
+        }
+        (AggKind::MinI32, ValueColumn::I32 { data, valid }) => {
+            let mut out = vec![i32::MAX; n_groups];
+            dispatch_min_i32(
+                device,
+                queue,
+                data,
+                valid,
+                row_to_group,
+                n_rows,
+                n_groups,
+                &mut out,
+            )?;
+            // Groups with no valid rows retain i32::MAX; detect via count.
+            let mut counts = vec![0u32; n_groups];
+            dispatch_count_u32(
+                device,
+                queue,
+                valid,
+                row_to_group,
+                n_rows,
+                n_groups,
+                &mut counts,
+            )?;
+            let valid_out = count_to_valid(&counts);
+            Ok(AggOutput::I32 {
+                values: out,
+                valid: valid_out,
+            })
+        }
+        (AggKind::MaxI32, ValueColumn::I32 { data, valid }) => {
+            let mut out = vec![i32::MIN; n_groups];
+            dispatch_max_i32(
+                device,
+                queue,
+                data,
+                valid,
+                row_to_group,
+                n_rows,
+                n_groups,
+                &mut out,
+            )?;
+            let mut counts = vec![0u32; n_groups];
+            dispatch_count_u32(
+                device,
+                queue,
+                valid,
+                row_to_group,
+                n_rows,
+                n_groups,
+                &mut counts,
+            )?;
+            let valid_out = count_to_valid(&counts);
+            Ok(AggOutput::I32 {
+                values: out,
+                valid: valid_out,
+            })
+        }
+        (AggKind::MinF32, ValueColumn::F32 { data, valid }) => {
+            let mut out = vec![f32::INFINITY; n_groups];
+            dispatch_min_f32(
+                device,
+                queue,
+                data,
+                valid,
+                row_to_group,
+                n_rows,
+                n_groups,
+                &mut out,
+            )?;
+            let mut counts = vec![0u32; n_groups];
+            dispatch_count_u32(
+                device,
+                queue,
+                valid,
+                row_to_group,
+                n_rows,
+                n_groups,
+                &mut counts,
+            )?;
+            let valid_out = count_to_valid(&counts);
+            Ok(AggOutput::F32 {
+                values: out,
+                valid: valid_out,
+            })
+        }
+        (AggKind::MaxF32, ValueColumn::F32 { data, valid }) => {
+            let mut out = vec![f32::NEG_INFINITY; n_groups];
+            dispatch_max_f32(
+                device,
+                queue,
+                data,
+                valid,
+                row_to_group,
+                n_rows,
+                n_groups,
+                &mut out,
+            )?;
+            let mut counts = vec![0u32; n_groups];
+            dispatch_count_u32(
+                device,
+                queue,
+                valid,
+                row_to_group,
+                n_rows,
+                n_groups,
+                &mut counts,
+            )?;
+            let valid_out = count_to_valid(&counts);
+            Ok(AggOutput::F32 {
+                values: out,
+                valid: valid_out,
+            })
+        }
+        (AggKind::MeanI32, ValueColumn::I32 { data, valid }) => {
+            let mut sums = vec![0i32; n_groups];
+            dispatch_sum_i32(
+                device,
+                queue,
+                data,
+                valid,
+                row_to_group,
+                n_rows,
+                n_groups,
+                &mut sums,
+            )?;
+            let mut counts = vec![0u32; n_groups];
+            dispatch_count_u32(
+                device,
+                queue,
+                valid,
+                row_to_group,
+                n_rows,
+                n_groups,
+                &mut counts,
+            )?;
+            let means = compute_mean_i32(&sums, &counts);
+            let values: Vec<f32> = means.iter().map(|m| m.unwrap_or(0.0f32)).collect();
+            let valid_out: Vec<bool> = means.iter().map(|m| m.is_some()).collect();
+            Ok(AggOutput::F32 {
+                values,
+                valid: valid_out,
+            })
+        }
+        (AggKind::MeanF32, ValueColumn::F32 { data, valid }) => {
+            let mut sums = vec![0f32; n_groups];
+            dispatch_sum_f32(
+                device,
+                queue,
+                data,
+                valid,
+                row_to_group,
+                n_rows,
+                n_groups,
+                &mut sums,
+            )?;
+            let mut counts = vec![0u32; n_groups];
+            dispatch_count_u32(
+                device,
+                queue,
+                valid,
+                row_to_group,
+                n_rows,
+                n_groups,
+                &mut counts,
+            )?;
+            let means = compute_mean_f32(&sums, &counts);
+            let values: Vec<f32> = means.iter().map(|m| m.unwrap_or(0.0f32)).collect();
+            let valid_out: Vec<bool> = means.iter().map(|m| m.is_some()).collect();
+            Ok(AggOutput::F32 {
+                values,
+                valid: valid_out,
+            })
+        }
         (kind, vcol) => {
             let vt = match vcol {
                 ValueColumn::I64 { .. } => "I64",
                 ValueColumn::F64 { .. } => "F64",
+                ValueColumn::I32 { .. } => "I32",
+                ValueColumn::F32 { .. } => "F32",
             };
             Err(GroupByError::AggTypeMismatch {
                 kind: format!("{kind:?}"),

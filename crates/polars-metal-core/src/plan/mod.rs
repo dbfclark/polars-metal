@@ -10,6 +10,8 @@ pub enum MetalDtype {
     I64,
     F64,
     Bool,
+    I32,
+    F32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +65,8 @@ impl MetalDtype {
             "I64" => Some(MetalDtype::I64),
             "F64" => Some(MetalDtype::F64),
             "Bool" => Some(MetalDtype::Bool),
+            "I32" => Some(MetalDtype::I32),
+            "F32" => Some(MetalDtype::F32),
             _ => None,
         }
     }
