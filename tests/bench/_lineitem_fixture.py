@@ -7,8 +7,8 @@ Matches spec § "Workload validated" with one deviation for the encoder's
   - l_linestatus (Boolean) — values {True, False} mapping to TPC-H's F/O
 
 Original TPC-H Q1 uses Utf8 keys; the M2 spec proposed i8 or i64 integer
-encoding. With our M2 encoder, 2 × i64 = 130 bits exceeds the 128-bit
-budget. We use Boolean (2 keys × 2 bits = 4 bits) which is the natural
+encoding. With our M2 encoder, 2 x i64 = 130 bits exceeds the 128-bit
+budget. We use Boolean (2 keys x 2 bits = 4 bits) which is the natural
 fit for the binary cardinality and stays well under budget.
 
 Other columns:
@@ -39,7 +39,7 @@ _SHIPDATE_HI = (date(1998, 12, 31) - date(1970, 1, 1)).days
 
 
 def make_lineitem(n_rows: int = 10_000_000, seed: int = 0xC0FFEE) -> pl.DataFrame:
-    """Build an n_rows × 9-column lineitem-shaped DataFrame.
+    """Build an n_rows x 9-column lineitem-shaped DataFrame.
 
     Returns columns matching modified Q1's input shape. Bit-reproducible
     across runs at the same seed.
@@ -57,17 +57,19 @@ def make_lineitem(n_rows: int = 10_000_000, seed: int = 0xC0FFEE) -> pl.DataFram
     disc_price = extendedprice * (1.0 - discount)
     charge = disc_price * (1.0 + tax)
 
-    return pl.DataFrame({
-        "l_returnflag": returnflag,
-        "l_linestatus": linestatus,
-        "l_quantity": quantity,
-        "l_extendedprice": extendedprice,
-        "l_discount": discount,
-        "l_tax": tax,
-        "l_shipdate": shipdate,
-        "disc_price": disc_price,
-        "charge": charge,
-    })
+    return pl.DataFrame(
+        {
+            "l_returnflag": returnflag,
+            "l_linestatus": linestatus,
+            "l_quantity": quantity,
+            "l_extendedprice": extendedprice,
+            "l_discount": discount,
+            "l_tax": tax,
+            "l_shipdate": shipdate,
+            "disc_price": disc_price,
+            "charge": charge,
+        }
+    )
 
 
 if __name__ == "__main__":

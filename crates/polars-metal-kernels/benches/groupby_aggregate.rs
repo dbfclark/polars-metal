@@ -53,10 +53,16 @@ fn bench_aggregate(c: &mut Criterion) {
                 |b, _| {
                     b.iter(|| {
                         dispatch_sum_i32(
-                            &device, &mut queue,
-                            black_box(&i32_vals), &valid, &row_to_group,
-                            n, n_groups as usize, &mut out,
-                        ).expect("dispatch_sum_i32");
+                            &device,
+                            &mut queue,
+                            black_box(&i32_vals),
+                            &valid,
+                            &row_to_group,
+                            n,
+                            n_groups as usize,
+                            &mut out,
+                        )
+                        .expect("dispatch_sum_i32");
                     });
                 },
             );
@@ -68,10 +74,16 @@ fn bench_aggregate(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("sum_f32_nulls=0.5", n), &n, |b, _| {
             b.iter(|| {
                 dispatch_sum_f32(
-                    &device, &mut queue,
-                    black_box(&f32_vals), &valid, &row_to_group,
-                    n, n_groups as usize, &mut out_f,
-                ).expect("dispatch_sum_f32");
+                    &device,
+                    &mut queue,
+                    black_box(&f32_vals),
+                    &valid,
+                    &row_to_group,
+                    n,
+                    n_groups as usize,
+                    &mut out_f,
+                )
+                .expect("dispatch_sum_f32");
             });
         });
 
@@ -79,9 +91,15 @@ fn bench_aggregate(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("count_u32_nulls=0.5", n), &n, |b, _| {
             b.iter(|| {
                 dispatch_count_u32(
-                    &device, &mut queue,
-                    &valid, &row_to_group, n, n_groups as usize, &mut out_c,
-                ).expect("dispatch_count_u32");
+                    &device,
+                    &mut queue,
+                    &valid,
+                    &row_to_group,
+                    n,
+                    n_groups as usize,
+                    &mut out_c,
+                )
+                .expect("dispatch_count_u32");
             });
         });
 
@@ -89,9 +107,14 @@ fn bench_aggregate(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("len_u32", n), &n, |b, _| {
             b.iter(|| {
                 dispatch_len_u32(
-                    &device, &mut queue,
-                    &row_to_group, n, n_groups as usize, &mut out_l,
-                ).expect("dispatch_len_u32");
+                    &device,
+                    &mut queue,
+                    &row_to_group,
+                    n,
+                    n_groups as usize,
+                    &mut out_l,
+                )
+                .expect("dispatch_len_u32");
             });
         });
     }
