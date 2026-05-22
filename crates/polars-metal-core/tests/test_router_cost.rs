@@ -6,6 +6,7 @@
 // that re-tune them update both the constants and the tests.
 #![allow(clippy::expect_used)]
 
+use polars_metal_native::plan::{AggSpec, MetalDtype};
 use polars_metal_native::router::cost;
 use polars_metal_native::router::NodeDecision;
 
@@ -60,4 +61,39 @@ fn thresholds_are_named_constants_for_pr_tuning() {
     // data and the implementation live in the same Rust module so they
     // evolve together by PR").
     assert_eq!(cost::GROUPBY_GPU_MIN_ROWS, 100_000);
+}
+
+#[test]
+fn groupby_with_composite_key_at_or_below_128_bits_routes_to_gpu() {
+    // Spec: Bool (1+1=2) + I64 (1+64=65) = 67 bits, within 128-bit budget.
+    let keys = vec![
+        ("category".into(), MetalDtype::Bool),
+        ("id".into(), MetalDtype::I64),
+    ];
+    let aggs: Vec<AggSpec> = vec![];
+    let d = cost::decide_groupby_with_keys(1_000_000, &keys, &aggs);
+    assert_eq!(d, NodeDecision::GpuLift);
+}
+
+#[test]
+fn groupby_with_oversized_composite_key_falls_back_at_plan_time() {
+    // Spec: 3 × I64 = 3 × (1+64) = 195 bits, exceeds 128-bit budget.
+    let keys = vec![
+        ("a".into(), MetalDtype::I64),
+        ("b".into(), MetalDtype::I64),
+        ("c".into(), MetalDtype::I64),
+    ];
+    let aggs: Vec<AggSpec> = vec![];
+    let d = cost::decide_groupby_with_keys(1_000_000, &keys, &aggs);
+    assert!(matches!(&d, NodeDecision::Fallback(_)));
+    if let NodeDecision::Fallback(reason) = d {
+        assert!(
+            reason.contains("128"),
+            "reason should mention 128-bit limit: {reason}"
+        );
+        assert!(
+            reason.contains("195"),
+            "reason should mention total bits 195: {reason}"
+        );
+    }
 }

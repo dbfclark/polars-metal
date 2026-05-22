@@ -21,8 +21,16 @@
 //! crossover is empirically near 100K rows on M2 Ultra for low-
 //! cardinality keys (Q1's shape). The constant is a starting point;
 //! M2's per-kernel benchmarks (Phase 10) inform PR-level tuning.
+//!
+//! Composite-key width limits
+//! --------------------------
+//! GroupBy keys are packed into u128 by the encoder (T13). Each key gets
+//! 1 bit for the null flag plus its data width. Max supported: 128 bits
+//! total. Queries exceeding this fall back to CPU at plan time rather than
+//! failing at dispatch.
 
 use super::NodeDecision;
+use crate::plan::{AggSpec, MetalDtype};
 
 /// Smallest input row count at which the GroupBy kernel is expected to
 /// beat the CPU implementation on M2 Ultra. Tuned by criterion benches
@@ -59,4 +67,30 @@ pub fn decide_project(input: &NodeDecision) -> NodeDecision {
 /// hint). Default CpuLeave; affinity may upgrade to GpuLift in Task 5.
 pub fn decide_scan_initial() -> NodeDecision {
     NodeDecision::CpuLeave
+}
+
+/// Per-key width in bits, including the 1-bit null flag the encoder adds.
+/// Must match `polars_metal_kernels::groupby::KeyDtype::data_bits` + 1.
+fn key_width_bits(dtype: MetalDtype) -> usize {
+    match dtype {
+        MetalDtype::Bool => 1 + 1,
+        MetalDtype::I64 | MetalDtype::F64 => 1 + 64,
+    }
+}
+
+/// GroupBy decision including the plan-time composite-key width check.
+/// Returns `Fallback` when keys would exceed the 128-bit encoder budget,
+/// even if the row count would otherwise route to GPU.
+pub fn decide_groupby_with_keys(
+    n_rows: usize,
+    keys: &[(String, MetalDtype)],
+    _aggs: &[AggSpec],
+) -> NodeDecision {
+    let total_bits: usize = keys.iter().map(|(_, d)| key_width_bits(*d)).sum();
+    if total_bits > 128 {
+        return NodeDecision::Fallback(format!(
+            "composite key total {total_bits} bits; M2 supports ≤ 128"
+        ));
+    }
+    decide_groupby(n_rows)
 }

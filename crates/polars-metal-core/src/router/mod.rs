@@ -134,12 +134,15 @@ fn walk(node: &MetalPlanNode, plan: &mut LiftingPlan, next_seq: &mut u32) -> Nod
             plan.set(id.clone(), cost::decide_filter(0));
             id
         }
-        MetalPlanNode::GroupBy { input, .. } => {
+        MetalPlanNode::GroupBy { input, keys, aggs } => {
             let n_rows = input_row_count(input);
             let _ = walk(input, plan, next_seq);
             let id = NodeId::new("GroupBy", *next_seq);
             *next_seq += 1;
-            plan.set(id.clone(), cost::decide_groupby(n_rows));
+            plan.set(
+                id.clone(),
+                cost::decide_groupby_with_keys(n_rows, keys, aggs),
+            );
             id
         }
     }
