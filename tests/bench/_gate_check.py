@@ -27,7 +27,7 @@ def check_baseline(baseline: dict[str, Any]) -> list[str]:
         if not isinstance(entry, dict):
             continue
         gate = entry.get("_gate")
-        if not gate:
+        if gate is None:
             continue
         if "ratio_lt" in gate:
             actual = entry.get("ratio_metal_over_cpu")
