@@ -299,15 +299,16 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 
 ## Phase 1 — Smaller-integer composite key dtypes (capability F)
 
-M2's composite-key encoder supports `i64`, `f64`, `bool`. M3 extends to `i8`, `i16`, `i32`, `u8`, `u16`, `u32`. This is a contained extension to `crates/polars-metal-kernels/src/groupby.rs` (encoder) and `crates/polars-metal-core/src/plan/mod.rs` (`KeyDtype` enum), with proptest coverage per new dtype.
+M2's composite-key encoder supports `i64`, `f64`, `bool`, `i32`, `f32` (5 variants). M3 extends to `i8`, `i16`, `u8`, `u16`, `u32`. This is a contained extension to `crates/polars-metal-kernels/src/groupby.rs` (where `KeyDtype` actually lives — the plan originally referenced `polars-metal-core/src/plan/mod.rs` but the real definition is in the kernels crate), with proptest coverage per new dtype.
 
 This phase is foundational for downstream phases — A's hash kernels, B's fused agg, and D's string-dict path all consume the encoder.
+
+**Note on sort-order preservation.** M2's encoder does *not* sort-bias signed integers (I32/I64 cast through their unsigned bit pattern: `i32 as u32 as u128`). Groupby is hash-based — sort order doesn't matter for finding duplicates. M3 follows M2's convention: signed-int variants pass through their unsigned bit pattern.
 
 ### Task 4: Extend `KeyDtype` enum
 
 **Files:**
-- Modify: `crates/polars-metal-core/src/plan/mod.rs`
-- Modify: `crates/polars-metal-kernels/src/groupby.rs` (encoder dispatch)
+- Modify: `crates/polars-metal-kernels/src/groupby.rs` (the `KeyDtype` enum + `data_bits()` + encoder dispatch in `encode_keys` + decoder dispatch in `decode_keys` — all in one file)
 
 - [ ] **Step 1: Read M2's existing `KeyDtype`**
 
@@ -451,14 +452,17 @@ proptest! {
     }
 
     #[test]
-    fn signed_int_sort_order_preserved(values in proptest::collection::vec(any::<i32>(), 2..64)) {
-        // Encoding should preserve total order: a < b in i32 ⇒ encoded[a] < encoded[b] in u128.
+    fn duplicate_signed_values_encode_identically(values in proptest::collection::vec(any::<i32>(), 2..64)) {
+        // Groupby relies on identical keys producing identical encoded u128s.
+        // Sort order is NOT preserved (M2's convention; groupby is hash-based).
         let col = KeyColumn::from_i32(&values);
         let (encoded, _schema) = encode_keys(&[col]);
-        let mut paired: Vec<_> = values.iter().zip(encoded.iter()).collect();
-        paired.sort_by(|(a, _), (b, _)| a.cmp(b));
-        for w in paired.windows(2) {
-            prop_assert!(w[0].1 <= w[1].1);
+        for i in 0..values.len() {
+            for j in 0..values.len() {
+                if values[i] == values[j] {
+                    prop_assert_eq!(encoded[i], encoded[j]);
+                }
+            }
         }
     }
 }
