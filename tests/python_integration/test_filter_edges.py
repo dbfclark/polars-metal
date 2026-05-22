@@ -1,9 +1,11 @@
-"""Explicit edge-case differential tests for M1's scan/project/filter path.
+"""Filter edge-case tests, migrated from `tests/diff/test_filter_edges.py`.
 
-These are the named cases from Section 6 Layer 2 of the M1 spec. Each
-case exercises a corner that random hypothesis generation either won't
-hit reliably (e.g. exactly all-null) or that surfaces a known semantic
-boundary worth pinning down.
+Lives in `tests/python_integration/` per the M2 testing taxonomy: explicit
+Python cases for engine-boundary correctness live here; property-based
+testing lives in `crates/polars-metal-kernels/tests/`.
+
+See `docs/superpowers/specs/2026-05-21-m2-design.md` § "Testing strategy"
+for the full taxonomy.
 """
 
 from __future__ import annotations
