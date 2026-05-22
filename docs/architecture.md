@@ -454,6 +454,160 @@ tests/
                             dispatch, monkey-patch).
 ```
 
+## M2: routing layer and hash groupby
+
+M2 extends the engine with two major additions: a per-op routing layer
+that decides GPU vs CPU per node, and a hash groupby kernel pipeline.
+The M1 walker and UDF plumbing remain the structural foundation; M2
+layers policy and new dispatch on top.
+
+### The router as the new policy layer
+
+Before M2, the walker took a binary view: if the entire plan subtree is
+in the closed set, lift it all to GPU; otherwise fall back entirely.
+Unified memory makes this wrong for many operators (see
+[`open-questions.md` § Routing layer pivot](open-questions.md)).
+
+M2's design separates concerns:
+
+- **Walker** stays minimal: walks the Polars IR, recognises node types,
+  serialises the tree into a `MetalPlanNode` dict. No routing decisions.
+- **Router** (`crates/polars-metal-core/src/router/mod.rs`) walks the
+  `MetalPlanNode` tree bottom-up and calls a per-op cost function at
+  each node. The result is a `LiftingPlan`: a per-node map from
+  `NodeId` to `NodeDecision` (`GpuLift | CpuLeave | Fallback`).
+- **Callback** (`python/polars_metal/_callback.py::execute_with_metal`)
+  calls `_native.compute_lifting_plan(wire_plan)`, reads the root node's
+  decision, and either installs a UDF (for `GpuLift` subtrees) or
+  returns early to let Polars CPU run the query.
+
+`crates/polars-metal-core/src/router/mod.rs::compute_lifting_plan` is
+the entry point; it returns a `LiftingPlan`. The Python side reads the
+root decision and acts on it in `_callback.py::execute_with_metal`.
+
+### Per-op cost rules
+
+All rules live in `crates/polars-metal-core/src/router/cost.rs`.
+Thresholds are `pub const`; PR-level tuning changes one line and cites
+new criterion data.
+
+- **Filter → CPU always.** `decide_filter` returns `CpuLeave`
+  regardless of row count. Memory-bound workloads on unified memory
+  see no GPU bandwidth advantage; Polars' SIMD-tuned CPU filter already
+  approaches theoretical DRAM bandwidth. The M1 E2E gap (5.3–17.6×
+  slower) for filter-only queries is the empirical basis.
+- **GroupBy → GPU iff n_rows > 100K.** `decide_groupby` returns
+  `GpuLift` above `GROUPBY_GPU_MIN_ROWS = 100_000`. The build phase has
+  fixed overhead (kernel launches, hash-table allocation) that dominates
+  at small row counts; the empirical crossover is ~100K rows on M2 Ultra
+  for low-cardinality keys (Q1 shape). Additionally,
+  `decide_groupby_with_keys` returns `Fallback` when the composite key
+  width exceeds 128 bits.
+- **Project / SimpleProjection → follow input.** `decide_project`
+  inherits its child's decision verbatim. Column re-selection is
+  metadata-only on our dispatch path.
+- **Scan → follow output.** `decide_scan_initial` defaults to
+  `CpuLeave`; the affinity smoothing pass upgrades it to `GpuLift` when
+  the parent is a `GpuLift` GroupBy.
+
+### Affinity smoothing
+
+`crates/polars-metal-core/src/router/affinity.rs` is a second pass over
+the `LiftingPlan`. After the bottom-up cost pass, a Scan under a
+`GpuLift` GroupBy would be `CpuLeave` (the default). On discrete memory
+that would require a host→device copy; on unified memory it's free, but
+leaving it `CpuLeave` produces confusing debug logs and could become
+non-trivial if M3 targets heterogeneous operation pipelines.
+
+The smoothing pass upgrades child `CpuLeave` nodes to `GpuLift` when
+their parent is `GpuLift` and the child is a Scan or Project that has
+no cost of its own. This keeps GpuLift subtrees contiguous in the plan
+tree, simplifies the UDF dispatch, and means `make lint --features debug`
+logs a single "GpuLift: GroupBy(Scan(…))" line rather than
+"GpuLift(GroupBy) / CpuLeave(Scan)" noise.
+
+### The groupby pipeline
+
+Hash groupby uses a two-pass count-then-fill approach, ported from cuDF
+(`references/cudf/cpp/src/groupby/`). The pipeline is implemented across
+`shaders/groupby_hash.metal`, `shaders/aggregate.metal`,
+`shaders/groupby_build.metal`, and
+`crates/polars-metal-kernels/src/groupby.rs::dispatch_groupby`.
+
+**Composite-key encoding (CPU, pre-dispatch).** Key columns are packed
+into `u128` values by `encode_keys` (`groupby.rs::encode_keys`). Each
+key column contributes `1 + data_bits` bits (1 null flag + data width);
+the total must not exceed 128 bits or `KeyEncodeError::TooWide` is
+returned and the query falls back to CPU at plan time. The encoded
+`Vec<u128>` and a `KeySchema` are the only key representation the
+kernel layer ever sees.
+
+**Build phase (CPU, HashMap-based).** M2 originally planned a GPU
+atomic-CAS hash-table build kernel. During Task 20 development a
+SIMD-group lockstep deadlock was discovered: one thread in a SIMD group
+cannot spin-wait on a write from a sibling thread because all threads
+in the group advance together — spin-wait never terminates. After a
+failed redesign to a 3-state non-spinning machine, the build phase was
+moved to CPU. It now uses a Rust `HashMap<u128, u32>` find-or-insert
+pass over the encoded key vector, producing:
+- `row_to_group: Vec<u32>` — maps each input row to a group index.
+- `group_count: Vec<u32>` — number of rows per group.
+- `first_row_per_group: Vec<u32>` — representative row index for key decoding.
+
+**Hash kernel (GPU, `shaders/groupby_hash.metal`).** `dispatch_hash`
+runs a u128 → u32 hash via an xxhash-style mixer. In M2 the hash is
+used only to supply a GPU-side reference; the actual group assignment
+comes from the CPU build phase. The kernel is retained because M3's
+planned GPU build redesign (sort-then-segment-reduce, avoiding CAS
+atomics entirely) will consume the hashes directly.
+
+**Aggregation: 32-bit dtypes on GPU, 64-bit on CPU.**
+`shaders/aggregate.metal` contains one kernel entry point per (op ×
+dtype) pair for `i32` / `f32` aggregations, using `atomic_uint` /
+`atomic_int` fetch-add. 64-bit dtypes (`i64` / `f64`) aggregate through
+CPU Rayon loops (`groupby.rs::aggregate_sum_i64_cpu` etc.) because the
+Metal toolchain (32023.883) does not support `atomic_fetch_add_explicit`
+on `atomic_long` or `atomic_ulong`. See
+[`docs/kernel-authoring.md` § Apple Silicon Metal atomic ops constraint](kernel-authoring.md)
+for the full constraint matrix.
+
+**Mean computation (host-side).** After sum and count are available,
+`compute_mean` divides sum / count element-wise on the CPU, propagating
+null where count is zero. This matches Polars' semantics: mean of an
+all-null group is null, not NaN.
+
+### End-to-end Q1 path
+
+The modified TPC-H Q1 (`tests/bench/test_tpch_q1.py`,
+`tests/bench/baseline.json::tpch_q1_modified`) is the primary M2
+validation query. Its execution path through the engine:
+
+1. **LazyFrame → walker → plan dict.** `_walker.walk(nt)` recognises a
+   plan of shape `GroupBy(Filter(DataFrameScan))`. The walker emits
+   `Handled({"kind": "GroupBy", "input": {"kind": "Filter", …}})`.
+2. **Walker → `_native.compute_lifting_plan` → LiftingPlan.**
+   `_callback.execute_with_metal` calls the router. GroupBy has > 100K
+   rows → `GpuLift`; Filter → `CpuLeave` (always); Scan follows parent
+   after affinity smoothing → `GpuLift`.
+3. **UDF installed on the GroupBy node.** `nt.set_udf` is called on the
+   `GpuLift` subtree (GroupBy + Scan). The Filter remains `CpuLeave` and
+   executes in Polars' CPU path, producing a filtered DataFrame before
+   the UDF receives it.
+4. **Polars executes the plan.** CPU filter runs first, reducing the 10M
+   row table. The UDF receives the filtered DataFrame and calls
+   `_native.execute_groupby(wire_plan, n_rows, columns)`.
+5. **Rust groupby pipeline.** `dispatch_groupby` encodes keys, builds
+   the CPU hash table, dispatches GPU aggregation kernels for 32-bit
+   columns (sum_qty as i32), falls back to CPU Rayon for 64-bit
+   columns (sum_base_price etc.), computes mean, decodes group keys,
+   and returns a `pl.DataFrame`.
+6. **Polars CPU sort on the result.** The engine returns the grouped
+   DataFrame; Polars' CPU executor applies the final `sort_by` clause.
+
+The M2 perf gate is `ratio_metal_over_cpu < 1.0` (Metal faster than
+CPU). `tests/bench/baseline.json::tpch_q1_modified` records 0.914 on
+M2 Ultra — gate met.
+
 ## Open caveats
 
 Forward-pointers to [`open-questions.md`](open-questions.md):
