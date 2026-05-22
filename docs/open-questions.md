@@ -107,6 +107,15 @@ Initially missing on the dev host: T19's MLX build had to use `-DMLX_BUILD_METAL
 - The `pyo3 0.22` macro emits `useless_conversion` clippy warnings in `polars-metal-core`; suppressed file-scoped with `#![allow(clippy::useless_conversion)]`. Revisit when pyo3 is upgraded.
 - ~~The hypothesis differential harness in `tests/diff/` generates bare scans (no varied operations), so it's only really testing fallback parity. Add filter/select/groupby strategies once M1 has kernels producing real GPU output.~~ Filter+select portion done in T21 (M1). `tests/diff/` retired in M2 T33–T35: property tests migrated to `crates/polars-metal-kernels/tests/test_compaction_pipeline.rs` (Rust proptest); explicit edge cases migrated to `tests/python_integration/test_filter_edges.py`. Groupby differential strategies remain deferred to M3 — see "Groupby differential strategies still missing" under "M1 retrospective notes" below.
 
+## ~~Routing layer: per-op GPU-vs-CPU dispatch on unified memory (M1, post-T30 2026-05-21)~~
+
+_Resolved in M2 Phases 1–2._ Per-op routing layer shipped in production.
+Walker emits `MetalPlanNode` trees; `compute_lifting_plan` in
+`crates/polars-metal-core/src/router/` walks the tree, applies cost rules,
+and returns a `LiftingPlan`. Python callback reads the root decision and
+either lifts to GPU (via UDF) or returns to CPU. See
+`docs/architecture.md` § M2: routing layer and hash groupby.
+
 ## Routing layer: per-op GPU-vs-CPU dispatch on unified memory (M1, post-T30 2026-05-21)
 
 The M1 perf investigation surfaced an architectural assumption we'd been carrying from cuDF without noticing. On a discrete GPU, the dispatch decision is dominated by "is this data already on the GPU?" because PCIe transfer costs swamp everything — so cuDF keeps everything on GPU. On Apple Silicon's unified memory that constraint vanishes: the same bytes are equally addressable from both processors with zero transfer cost.
@@ -125,6 +134,16 @@ Concrete design items for M2:
 The M1 filter kernels are not wasted under this framing — they're the reference for what GPU filter looks like when it's competitive (large-N, chained with other GPU ops, etc.). They're called when the cost model says yes; they sit dormant when it says no.
 
 **Mission reframe.** CLAUDE.md says "Match cuDF-Polars-on-a-4090 performance for realistic analytical workloads." That survives intact: cuDF wins on a 4090 because of dedicated VRAM bandwidth on bandwidth-bound ops; we win on Apple Silicon by routing to whichever processor is best per-op. Same end result (best-available perf on the user's hardware) without pretending the GPU is always the right answer. *Owner:* M2 design spec — this is the dominant architectural input.
+
+## ~~M1 end-to-end performance gap (M1, T24 2026-05-21)~~
+
+_Resolved for M2's stated workload._ M2 confirms filter belongs on CPU under
+unified memory; the router routes it to CPU at all sizes. The modified TPC-H
+Q1 benchmark (Metal-routed GroupBy, CPU-routed Filter + Sort) records
+`ratio_metal_over_cpu = 0.914` in `tests/bench/baseline.json::tpch_q1_modified`
+— Metal 8.6% faster than CPU, meeting the M2 perf gate (`ratio < 1.0`).
+M1-only filter queries remain 5–17× slower on Metal; the router suppresses
+that path in production.
 
 ## M1 end-to-end performance gap (M1, T24 2026-05-21)
 
@@ -163,3 +182,79 @@ This is a placeholder structure for T28's full retrospective. T27 captures only 
 - **BumpArena wiring.** Implemented but unwired in the M1 hot path — see dedicated entry above.
 - **Groupby differential strategies still missing.** T21 closed the filter/select half of the M0-era harness gap; groupby strategies wait on M3 kernels producing real GPU output, just as filter/select did for M1.
 - **Threadgroup tuning per device class.** `cmp_i64` and `filter_scatter` use portable defaults from `MTLDevice.maxThreadsPerThreadgroup()` (per CLAUDE.md), but the ~5 GB/s effective throughput on M2 Ultra suggests these are leaving silicon on the table. M2 owns the per-device-class tuning pass — not before, because we don't yet have a profiling story.
+
+## M2 new open questions (2026-05-22)
+
+### Apple Silicon Metal 64-bit atomics gap
+
+The current Metal toolchain (32023.883) supports `atomic_uint` /
+`atomic_int` fully but does not support `atomic_fetch_add_explicit` or
+`atomic_compare_exchange_weak_explicit` on `atomic_long` / `atomic_ulong`.
+M2 routes 64-bit aggregation through a CPU finalise path
+(`aggregate_sum_i64_cpu` etc. in `crates/polars-metal-kernels/src/groupby.rs`).
+
+Open question: when Apple ships the wider atomic set, should we add native
+64-bit kernels behind a build-time toolchain probe + runtime feature flag,
+or remain CPU-finalise for simplicity? The CPU path is not obviously a
+bottleneck at M2 scale (10M rows, low cardinality); the answer depends on
+M3's high-cardinality and multi-column benchmarks. *Owner:* M3+ design.
+
+### GroupBy build phase on CPU
+
+M2 originally planned a GPU atomic-CAS build phase for the hash table.
+The design deadlocked due to SIMD-group lockstep execution: one thread in
+a SIMD group cannot spin-wait on a sibling thread's write to advance. After
+a failed redesign to a 3-state non-spinning machine (Task 20), the build
+was moved to CPU HashMap-based find-or-insert.
+
+Open question: for high-cardinality groupby (1M+ unique groups), the CPU
+HashMap build may become the bottleneck (large map, cache-hostile random
+access). An alternative is GPU sort-then-segment-reduce, which avoids CAS
+atomics entirely — each row writes to a sorted position, then a prefix scan
+identifies group boundaries. This is the planned M3 redesign; the hash
+kernel (`shaders/groupby_hash.metal`) is retained because M3's sort-based
+build would consume the hashes. *Owner:* M3 design.
+
+### String-key groupby
+
+Out of scope for M2. M3 must decide: dictionary-encode string keys at the
+buffer bridge so the existing u128 encoder can handle them (dictionary
+index is an i32 or i64, fits the current `KeyDtype` set), or run a
+dedicated string-hash kernel that bypasses the encoder? Likely both: bridge
+handles the common case where cardinality is low (dictionary fits in memory);
+kernel handles large-cardinality string keys where dictionary encoding would
+itself be expensive. *Owner:* M3 design, after multi-chunk Series support.
+
+### Multi-chunk Series support
+
+M2 falls back to CPU for any input Series with more than one Arrow chunk
+(T31 — `dispatch_groupby` checks `series.n_chunks() > 1` and raises
+`EngineError` which surfaces as `ComputeError`). Full multi-chunk support
+is deferred to M3+ and likely belongs at the buffer-bridge layer
+(`crates/polars-metal-buffer/`): the bridge would concatenate chunks into
+a single contiguous `MTLBuffer` before handing to the kernel layer, hiding
+the chunking from all kernels. *Owner:* M3+ (prerequisite for string-key
+groupby).
+
+### Composite key 128-bit limit
+
+M2's `encode_keys` caps composite key width at 128 bits. Q1's original
+spec called for `i64` keys (`l_returnflag`, `l_linestatus`); two `i64`
+columns require 130 bits (65 bits × 2), exceeding the cap. The M2
+benchmark fixture uses `Boolean` keys (2 bits × 2 = 4 bits total) to
+avoid the overflow. A more principled fix is to extend `KeyDtype` with
+`I8` / `I16` / `I32` variants that consume 9 / 17 / 33 bits respectively,
+allowing common low-cardinality categorical keys to fit. *Owner:* M3 (the
+string-key work will force a `KeyDtype` extension anyway).
+
+### Conformance baseline drift on upstream Polars updates
+
+When `make refresh-refs` bumps the pinned Polars rev in `references/`, the
+`tests/conformance/_polars_known_failures_*.txt` baselines may need
+recapture because tests that previously passed may fail on the new rev (new
+test preconditions, renamed APIs) or vice versa. Currently the recapture
+procedure is documented in the `test_polars_suite.py` module docstring and
+must be run manually. Consider automating: a CI job that runs on rev bumps,
+diffs the captured baseline against the committed one, and either updates
+the baseline or reports drift as a review item. *Owner:* post-M2 CI
+infrastructure.
