@@ -73,10 +73,12 @@ If `polars_metal` import fails: `make wheel` to rebuild.
 - [ ] **Step 4: Record M2 baseline values**
 
 ```bash
-python -c "import json; d=json.load(open('tests/bench/baseline.json')); print(d['tpch_q1_modified'])"
+python -c "import json; d=json.load(open('tests/bench/baseline.json')); print(d['queries']['tpch_q1_modified'])"
 ```
 
 Expected: prints `ratio_metal_over_cpu ≈ 0.914` (or whatever the current M2 value is). Record this value; M3's perf gate verifies M2 doesn't regress.
+
+**Note:** `baseline.json` nests query entries under a top-level `queries` key. Top-level fields are `_units`, `_notes`, `machine`, `git_sha`, `date`, `queries`. Task 2's gate-check helper iterates `baseline["queries"]`, not the top-level dict.
 
 Nothing to commit in Task 1.
 
@@ -99,12 +101,13 @@ import pytest
 from tests.bench._gate_check import check_baseline
 
 
-def _baseline_with(entries):
+def _baseline_with(queries):
+    """Build a fixture mirroring real baseline.json: queries nested under top-level key."""
     return {
         "_notes": "test fixture",
         "git_sha": "deadbeef",
         "date": "2026-05-22",
-        **entries,
+        "queries": queries,
     }
 
 
@@ -172,10 +175,15 @@ from typing import Any
 
 
 def check_baseline(baseline: dict[str, Any]) -> list[str]:
-    """Return a list of failure messages; empty list = pass."""
+    """Return a list of failure messages; empty list = pass.
+
+    Iterates baseline["queries"]; top-level keys (_units, _notes, machine,
+    git_sha, date) are metadata and skipped.
+    """
     failures: list[str] = []
-    for name, entry in baseline.items():
-        if not isinstance(entry, dict) or name.startswith("_"):
+    queries = baseline.get("queries", {})
+    for name, entry in queries.items():
+        if not isinstance(entry, dict):
             continue
         gate = entry.get("_gate")
         if not gate:
@@ -195,9 +203,26 @@ def check_baseline(baseline: dict[str, Any]) -> list[str]:
     return failures
 ```
 
-- [ ] **Step 4: Add `_gate` block to M2's existing entry**
+- [ ] **Step 4: Add `_gate` block to M2's existing entries**
 
-Edit `tests/bench/baseline.json`: add `"_gate": {"ratio_lt": 1.0}` to the `tpch_q1_modified` entry. (Same pattern for `tpch_q1_32bit` and `tpch_q1_32bit_highcard` if those exist — preserve their M2 values; the gate records "no regression.")
+Edit `tests/bench/baseline.json`. The file structure is:
+
+```json
+{
+  "_units": "...",
+  "machine": "...",
+  "git_sha": "...",
+  "date": "...",
+  "queries": {
+    "tpch_q1_modified": { "cpu_ms": ..., "metal_ms": ..., "ratio_metal_over_cpu": 0.914 },
+    "tpch_q1_modified_32bit": { ..., "ratio_metal_over_cpu": 0.988 },
+    "tpch_q1_modified_32bit_high_card": { ..., "ratio_metal_over_cpu": 0.991 },
+    "filter_*": { ... }   // these are filter-only baselines; no _gate
+  }
+}
+```
+
+Add `"_gate": {"ratio_lt": 1.0}` inside each of the three `tpch_q1_modified*` entries (under `queries.<name>`). Leave the `filter_*` entries without a `_gate` — they're informational. Preserve all existing `cpu_ms`/`metal_ms`/`ratio_metal_over_cpu` values exactly.
 
 - [ ] **Step 5: Run tests again to verify pass**
 
