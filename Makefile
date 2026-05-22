@@ -11,11 +11,11 @@ wheel:
 	VIRTUAL_ENV=$$(python3 -c "import sys; print(sys.prefix)") maturin develop --release
 
 test-unit:
-	cargo test --workspace
+	cargo test --workspace -- --test-threads=1
 
 test-kernel:
 	@echo "test-kernel target expands as crates land"
-	cargo test -p polars-metal-kernels
+	cargo test -p polars-metal-kernels -- --test-threads=1
 
 test-conformance:
 	pytest tests/conformance -k "not skip_metal"
