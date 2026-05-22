@@ -33,6 +33,7 @@ thiserror = "1"
 [dev-dependencies]
 criterion = "0.5"
 proptest = "1"
+rand = "0.8"
 
 [[bench]]
 name = "cmp_i64"
@@ -52,6 +53,14 @@ harness = false
 
 [[bench]]
 name = "filter_scatter"
+harness = false
+
+[[bench]]
+name = "groupby_hash"
+harness = false
+
+[[bench]]
+name = "groupby_aggregate"
 harness = false
 
 [lints]
