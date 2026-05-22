@@ -42,6 +42,12 @@ pub enum KeyDtype {
     Bool,
     I32,
     F32,
+    // M3 additions
+    I8,
+    I16,
+    U8,
+    U16,
+    U32,
 }
 
 impl KeyDtype {
@@ -50,7 +56,9 @@ impl KeyDtype {
         match self {
             KeyDtype::I64 | KeyDtype::F64 => 64,
             KeyDtype::Bool => 1,
-            KeyDtype::I32 | KeyDtype::F32 => 32,
+            KeyDtype::I32 | KeyDtype::F32 | KeyDtype::U32 => 32,
+            KeyDtype::I16 | KeyDtype::U16 => 16,
+            KeyDtype::I8 | KeyDtype::U8 => 8,
         }
     }
 }
@@ -147,7 +155,9 @@ pub fn encode_keys(cols: &[KeyColumn<'_>]) -> Result<(Vec<u128>, KeySchema), Key
     for c in cols {
         let need_data = match c.dtype {
             KeyDtype::I64 | KeyDtype::F64 => n_rows * 8,
-            KeyDtype::I32 | KeyDtype::F32 => n_rows * 4,
+            KeyDtype::I32 | KeyDtype::F32 | KeyDtype::U32 => n_rows * 4,
+            KeyDtype::I16 | KeyDtype::U16 => n_rows * 2,
+            KeyDtype::I8 | KeyDtype::U8 => n_rows,
             KeyDtype::Bool => min_valid_bytes,
         };
         if c.data.len() < need_data {
@@ -213,6 +223,29 @@ pub fn encode_keys(cols: &[KeyColumn<'_>]) -> Result<(Vec<u128>, KeySchema), Key
                     let mut bytes = [0u8; 4];
                     bytes.copy_from_slice(&c.data[row * 4..(row + 1) * 4]);
                     f32::from_le_bytes(bytes).to_bits() as u128
+                }
+                KeyDtype::U32 => {
+                    let mut bytes = [0u8; 4];
+                    bytes.copy_from_slice(&c.data[row * 4..(row + 1) * 4]);
+                    u32::from_le_bytes(bytes) as u128
+                }
+                KeyDtype::I16 => {
+                    let mut bytes = [0u8; 2];
+                    bytes.copy_from_slice(&c.data[row * 2..(row + 1) * 2]);
+                    i16::from_le_bytes(bytes) as u16 as u128
+                }
+                KeyDtype::U16 => {
+                    let mut bytes = [0u8; 2];
+                    bytes.copy_from_slice(&c.data[row * 2..(row + 1) * 2]);
+                    u16::from_le_bytes(bytes) as u128
+                }
+                KeyDtype::I8 => {
+                    let byte = c.data[row];
+                    i8::from_le_bytes([byte]) as u8 as u128
+                }
+                KeyDtype::U8 => {
+                    let byte = c.data[row];
+                    u8::from_le_bytes([byte]) as u128
                 }
                 KeyDtype::Bool => {
                     let byte = c.data[row >> 3];
@@ -1544,6 +1577,12 @@ pub enum DecodedColumn {
     Bool { values: Vec<bool>, valid: Vec<bool> },
     I32 { values: Vec<i32>, valid: Vec<bool> },
     F32 { values: Vec<f32>, valid: Vec<bool> },
+    // M3 additions
+    I8 { values: Vec<i8>, valid: Vec<bool> },
+    I16 { values: Vec<i16>, valid: Vec<bool> },
+    U8 { values: Vec<u8>, valid: Vec<bool> },
+    U16 { values: Vec<u16>, valid: Vec<bool> },
+    U32 { values: Vec<u32>, valid: Vec<bool> },
 }
 
 /// Decode a u128-encoded composite-key stream back to per-column values.
@@ -1569,6 +1608,26 @@ pub fn decode_keys(encoded: &[u128], schema: &KeySchema) -> Vec<DecodedColumn> {
                 valid: Vec::with_capacity(encoded.len()),
             },
             KeyDtype::F32 => DecodedColumn::F32 {
+                values: Vec::with_capacity(encoded.len()),
+                valid: Vec::with_capacity(encoded.len()),
+            },
+            KeyDtype::I8 => DecodedColumn::I8 {
+                values: Vec::with_capacity(encoded.len()),
+                valid: Vec::with_capacity(encoded.len()),
+            },
+            KeyDtype::I16 => DecodedColumn::I16 {
+                values: Vec::with_capacity(encoded.len()),
+                valid: Vec::with_capacity(encoded.len()),
+            },
+            KeyDtype::U8 => DecodedColumn::U8 {
+                values: Vec::with_capacity(encoded.len()),
+                valid: Vec::with_capacity(encoded.len()),
+            },
+            KeyDtype::U16 => DecodedColumn::U16 {
+                values: Vec::with_capacity(encoded.len()),
+                valid: Vec::with_capacity(encoded.len()),
+            },
+            KeyDtype::U32 => DecodedColumn::U32 {
                 values: Vec::with_capacity(encoded.len()),
                 valid: Vec::with_capacity(encoded.len()),
             },
@@ -1615,6 +1674,36 @@ pub fn decode_keys(encoded: &[u128], schema: &KeySchema) -> Vec<DecodedColumn> {
                     } else {
                         0.0f32
                     };
+                    values.push(v);
+                    valid.push(is_valid);
+                }
+                (DecodedColumn::U32 { values, valid }, KeyDtype::U32) => {
+                    let raw = (lane >> field.data_bit_offset) & ((1u128 << 32) - 1);
+                    let v = if is_valid { raw as u32 } else { 0u32 };
+                    values.push(v);
+                    valid.push(is_valid);
+                }
+                (DecodedColumn::I16 { values, valid }, KeyDtype::I16) => {
+                    let raw = (lane >> field.data_bit_offset) & ((1u128 << 16) - 1);
+                    let v = if is_valid { raw as u16 as i16 } else { 0i16 };
+                    values.push(v);
+                    valid.push(is_valid);
+                }
+                (DecodedColumn::U16 { values, valid }, KeyDtype::U16) => {
+                    let raw = (lane >> field.data_bit_offset) & ((1u128 << 16) - 1);
+                    let v = if is_valid { raw as u16 } else { 0u16 };
+                    values.push(v);
+                    valid.push(is_valid);
+                }
+                (DecodedColumn::I8 { values, valid }, KeyDtype::I8) => {
+                    let raw = (lane >> field.data_bit_offset) & ((1u128 << 8) - 1);
+                    let v = if is_valid { raw as u8 as i8 } else { 0i8 };
+                    values.push(v);
+                    valid.push(is_valid);
+                }
+                (DecodedColumn::U8 { values, valid }, KeyDtype::U8) => {
+                    let raw = (lane >> field.data_bit_offset) & ((1u128 << 8) - 1);
+                    let v = if is_valid { raw as u8 } else { 0u8 };
                     values.push(v);
                     valid.push(is_valid);
                 }

@@ -89,6 +89,11 @@ fn canonicalize(
                 DecodedColumn::Bool { values, valid } => (valid[g], values[g] as i64),
                 DecodedColumn::I32 { values, valid } => (valid[g], values[g] as i64),
                 DecodedColumn::F32 { values, valid } => (valid[g], values[g].to_bits() as i64),
+                DecodedColumn::I8 { values, valid } => (valid[g], values[g] as i64),
+                DecodedColumn::I16 { values, valid } => (valid[g], values[g] as i64),
+                DecodedColumn::U8 { values, valid } => (valid[g], values[g] as i64),
+                DecodedColumn::U16 { values, valid } => (valid[g], values[g] as i64),
+                DecodedColumn::U32 { values, valid } => (valid[g], values[g] as i64),
             })
             .collect();
         let agg_tuple: AggTuple = agg_outputs
