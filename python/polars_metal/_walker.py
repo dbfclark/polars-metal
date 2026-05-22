@@ -139,6 +139,29 @@ def _walk_dataframe_scan(nt: Any, node: Any) -> WalkResult:
     if getattr(node, "selection", None) is not None:
         return FallBack(reason="DataFrameScan with pushed-down predicate")
 
+    # Multi-chunk Series are not yet supported. Convert the PyDataFrame to a
+    # pl.DataFrame and check each column's chunk count.
+    df = getattr(node, "df", None)
+    if df is not None:
+        try:
+            import polars as pl
+
+            polars_df = pl.DataFrame._from_pydf(df)
+            for col_name in polars_df.columns:
+                try:
+                    n_chunks = polars_df[col_name].n_chunks()
+                    if n_chunks > 1:
+                        return FallBack(
+                            reason=f"multi-chunk Series not yet supported (column {col_name!r} has {n_chunks} chunks)"
+                        )
+                except Exception:
+                    # If n_chunks() raises (shouldn't happen), assume single chunk
+                    pass
+        except Exception:
+            # If we can't convert or inspect the DataFrame, just proceed; the
+            # kernel will handle it or the UDF fallback will catch it.
+            pass
+
     schema = dict(nt.get_schema())
     columns: list[tuple[str, str]] = []
     for name, dtype in schema.items():
