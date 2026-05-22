@@ -56,6 +56,33 @@ pub enum AggOp {
     Len,
 }
 
+impl MetalDtype {
+    /// Parse the wire string emitted by the Python walker.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "I64" => Some(MetalDtype::I64),
+            "F64" => Some(MetalDtype::F64),
+            "Bool" => Some(MetalDtype::Bool),
+            _ => None,
+        }
+    }
+}
+
+impl AggOp {
+    /// Parse the wire string emitted by the Python walker.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "Sum" => Some(AggOp::Sum),
+            "Mean" => Some(AggOp::Mean),
+            "Count" => Some(AggOp::Count),
+            "Min" => Some(AggOp::Min),
+            "Max" => Some(AggOp::Max),
+            "Len" => Some(AggOp::Len),
+            _ => None,
+        }
+    }
+}
+
 /// One aggregation expression in a GroupBy. `input_col` is empty for
 /// `AggOp::Len` (the kernel doesn't read a value column for row count).
 #[derive(Debug, Clone, PartialEq, Eq)]
