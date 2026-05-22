@@ -12,6 +12,14 @@ pub enum MetalDtype {
     Bool,
     I32,
     F32,
+    // M3 capability F additions: smaller-integer key dtypes.
+    // These are accepted as composite-key components only; aggregation
+    // value columns of these dtypes are not supported (router falls back).
+    I8,
+    I16,
+    U8,
+    U16,
+    U32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +75,11 @@ impl MetalDtype {
             "Bool" => Some(MetalDtype::Bool),
             "I32" => Some(MetalDtype::I32),
             "F32" => Some(MetalDtype::F32),
+            "I8" => Some(MetalDtype::I8),
+            "I16" => Some(MetalDtype::I16),
+            "U8" => Some(MetalDtype::U8),
+            "U16" => Some(MetalDtype::U16),
+            "U32" => Some(MetalDtype::U32),
             _ => None,
         }
     }

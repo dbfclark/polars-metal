@@ -715,9 +715,9 @@ def _leaf_dtype(pred: dict) -> str | None:
 def _map_dtype(dt: Any) -> str | None:
     """Map a Polars DataType to a MetalDtype tag, or None if unsupported.
 
-    The current closed set: Int64 (i64), Float64 (f64), Boolean, Int32 (i32),
-    Float32 (f32). Everything else (String, Categorical, List, Struct, etc.)
-    is a fallback.
+    M2 set: Int64, Float64, Boolean, Int32, Float32.
+    M3 adds: Int8, Int16, UInt8, UInt16, UInt32 (capability F).
+    Everything else (String, Categorical, List, Struct, etc.) is a fallback.
     """
     s = str(dt)
     if s == "Int64":
@@ -730,4 +730,14 @@ def _map_dtype(dt: Any) -> str | None:
         return "I32"
     if s == "Float32":
         return "F32"
+    if s == "Int8":
+        return "I8"
+    if s == "Int16":
+        return "I16"
+    if s == "UInt8":
+        return "U8"
+    if s == "UInt16":
+        return "U16"
+    if s == "UInt32":
+        return "U32"
     return None

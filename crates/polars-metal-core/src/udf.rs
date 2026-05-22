@@ -384,6 +384,15 @@ fn compact_one_column(
                 "polars_metal: filter compaction for {column_name:?} (I32/F32) not yet implemented"
             )))
         }
+        // M3 capability F: small-integer key dtypes. Not supported in the
+        // filter compaction path — filter is CPU-routed for these and the
+        // walker should never lift a filter over such a column. Surface as
+        // PyNotImplementedError so a router bug is visible.
+        MetalDtype::I8 | MetalDtype::I16 | MetalDtype::U8 | MetalDtype::U16 | MetalDtype::U32 => {
+            Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                "polars_metal: filter compaction for {column_name:?} ({dtype:?}) not supported; filter should route CPU"
+            )))
+        }
     }
 }
 
@@ -576,16 +585,11 @@ fn deserialize_predicate(dict: &Bound<PyDict>) -> PyResult<PredicateAst> {
 }
 
 fn parse_dtype(s: &str) -> PyResult<MetalDtype> {
-    match s {
-        "I64" => Ok(MetalDtype::I64),
-        "F64" => Ok(MetalDtype::F64),
-        "Bool" => Ok(MetalDtype::Bool),
-        "I32" => Ok(MetalDtype::I32),
-        "F32" => Ok(MetalDtype::F32),
-        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "polars_metal: unknown MetalDtype tag {other:?}"
-        ))),
-    }
+    MetalDtype::from_wire(s).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "polars_metal: unknown MetalDtype tag {s:?}"
+        ))
+    })
 }
 
 /// Parse the wire-format op tag (matching `CompareOp::Eq/Ne/Lt/Le/Gt/Ge`)
@@ -1028,6 +1032,11 @@ fn metal_dtype_to_key_dtype(d: MetalDtype) -> KeyDtype {
         MetalDtype::Bool => KeyDtype::Bool,
         MetalDtype::I32 => KeyDtype::I32,
         MetalDtype::F32 => KeyDtype::F32,
+        MetalDtype::I8 => KeyDtype::I8,
+        MetalDtype::I16 => KeyDtype::I16,
+        MetalDtype::U8 => KeyDtype::U8,
+        MetalDtype::U16 => KeyDtype::U16,
+        MetalDtype::U32 => KeyDtype::U32,
     }
 }
 
@@ -1365,6 +1374,31 @@ fn encode_decoded_column(
             let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
             let v = pack_valid_bitmap(valid);
             ("F32", data, v)
+        }
+        DecodedColumn::I8 { values, valid } => {
+            let data: Vec<u8> = values.iter().map(|v| *v as u8).collect();
+            let v = pack_valid_bitmap(valid);
+            ("I8", data, v)
+        }
+        DecodedColumn::I16 { values, valid } => {
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let v = pack_valid_bitmap(valid);
+            ("I16", data, v)
+        }
+        DecodedColumn::U8 { values, valid } => {
+            let data: Vec<u8> = values.to_vec();
+            let v = pack_valid_bitmap(valid);
+            ("U8", data, v)
+        }
+        DecodedColumn::U16 { values, valid } => {
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let v = pack_valid_bitmap(valid);
+            ("U16", data, v)
+        }
+        DecodedColumn::U32 { values, valid } => {
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let v = pack_valid_bitmap(valid);
+            ("U32", data, v)
         }
     }
 }
