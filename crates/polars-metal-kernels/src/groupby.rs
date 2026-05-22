@@ -243,6 +243,8 @@ pub enum GroupByError {
     OutputTooShort { got: usize, need: usize },
     #[error("n_rows {n_rows} exceeds u32::MAX")]
     RowCountOverflow { n_rows: usize },
+    #[error("aggregation kind {kind} not compatible with value dtype {value_dtype}")]
+    AggTypeMismatch { kind: String, value_dtype: String },
 }
 
 /// Dispatch the `groupby_hash` kernel.
@@ -1604,4 +1606,236 @@ pub fn decode_keys(encoded: &[u128], schema: &KeySchema) -> Vec<DecodedColumn> {
     }
 
     out
+}
+
+// -----------------------------------------------------------------------
+// T26: dispatch_groupby orchestrator
+// -----------------------------------------------------------------------
+
+/// Which aggregation kernel to run. Mirrors `polars-metal-core::plan::AggOp`
+/// but is defined here to keep the dep direction one-way (core → kernels).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggKind {
+    SumI64,
+    SumF64,
+    MeanI64, // sum_i64 / count → Option<f64>
+    MeanF64, // sum_f64 / count → Option<f64>
+    MinI64,
+    MaxI64,
+    MinF64,
+    MaxF64,
+    Count, // count of non-null values
+    Len,   // total row count per group (pl.len())
+}
+
+/// A single aggregation request.
+#[derive(Debug, Clone)]
+pub struct AggRequest {
+    pub kind: AggKind,
+    /// Index into the `value_cols` slice. Ignored for `AggKind::Len`.
+    pub input_col_idx: usize,
+}
+
+/// One value column passed to the pipeline (typed view).
+pub enum ValueColumn<'a> {
+    I64 { data: &'a [i64], valid: &'a [u8] },
+    F64 { data: &'a [f64], valid: &'a [u8] },
+}
+
+/// One aggregation's output. Carries data + per-group null flags for ops
+/// that can produce null per-group (min/max/mean on all-null groups).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggOutput {
+    I64 { values: Vec<i64>, valid: Vec<bool> },
+    F64 { values: Vec<f64>, valid: Vec<bool> },
+    U64 { values: Vec<u64> },
+}
+
+/// The pipeline's complete result.
+#[derive(Debug)]
+pub struct GroupByResult {
+    /// One entry per key column, in input order.
+    pub decoded_keys: Vec<DecodedColumn>,
+    /// One entry per AggRequest, in input order.
+    pub agg_outputs: Vec<AggOutput>,
+    /// Distinct group count.
+    pub n_groups: u32,
+}
+
+/// Full groupby pipeline: encode → hash → build → aggregate → decode.
+///
+/// Handles i64/f64 value columns via CPU-finalize aggregators (Metal toolchain
+/// 32023.883 lacks 64-bit atomics). i32/f32 paths are wired through GPU
+/// dispatchers in a future task.
+pub fn dispatch_groupby(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    key_cols: &[KeyColumn<'_>],
+    agg_specs: &[(AggRequest, ValueColumn<'_>)],
+    n_rows: usize,
+) -> Result<GroupByResult, GroupByError> {
+    // Defensive: every key column reports the same n_rows.
+    for kc in key_cols {
+        if kc.n_rows != n_rows {
+            return Err(GroupByError::OutputTooShort {
+                got: kc.n_rows,
+                need: n_rows,
+            });
+        }
+    }
+
+    let (encoded, schema) = encode_keys(key_cols)?;
+
+    if n_rows == 0 {
+        let decoded_keys = decode_keys(&[], &schema);
+        let agg_outputs = agg_specs
+            .iter()
+            .map(|(req, _)| empty_output_for(req.kind))
+            .collect();
+        return Ok(GroupByResult {
+            decoded_keys,
+            agg_outputs,
+            n_groups: 0,
+        });
+    }
+
+    let mut hashes = vec![0u32; n_rows];
+    dispatch_hash(device, queue, &encoded, n_rows, &mut hashes)?;
+    let build = dispatch_build(device, queue, &encoded, &hashes, n_rows)?;
+    let n_groups = build.group_count;
+
+    let mut agg_outputs = Vec::with_capacity(agg_specs.len());
+    for (req, vcol) in agg_specs {
+        agg_outputs.push(run_one_agg(
+            req,
+            vcol,
+            &build.row_to_group,
+            n_groups as usize,
+        )?);
+    }
+
+    let representative_keys: Vec<u128> = build
+        .first_row_per_group
+        .iter()
+        .map(|&row| encoded[row as usize])
+        .collect();
+    let decoded_keys = decode_keys(&representative_keys, &schema);
+
+    Ok(GroupByResult {
+        decoded_keys,
+        agg_outputs,
+        n_groups,
+    })
+}
+
+fn empty_output_for(kind: AggKind) -> AggOutput {
+    match kind {
+        AggKind::SumI64 | AggKind::MinI64 | AggKind::MaxI64 => AggOutput::I64 {
+            values: vec![],
+            valid: vec![],
+        },
+        AggKind::SumF64
+        | AggKind::MeanI64
+        | AggKind::MeanF64
+        | AggKind::MinF64
+        | AggKind::MaxF64 => AggOutput::F64 {
+            values: vec![],
+            valid: vec![],
+        },
+        AggKind::Count | AggKind::Len => AggOutput::U64 { values: vec![] },
+    }
+}
+
+fn run_one_agg(
+    req: &AggRequest,
+    vcol: &ValueColumn<'_>,
+    row_to_group: &[u32],
+    n_groups: usize,
+) -> Result<AggOutput, GroupByError> {
+    match (req.kind, vcol) {
+        (AggKind::SumI64, ValueColumn::I64 { data, valid }) => {
+            let values = aggregate_sum_i64_cpu(data, valid, row_to_group, n_groups);
+            // Polars sum of an all-null group returns 0 (not null).
+            Ok(AggOutput::I64 {
+                valid: vec![true; n_groups],
+                values,
+            })
+        }
+        (AggKind::SumF64, ValueColumn::F64 { data, valid }) => {
+            let values = aggregate_sum_f64_cpu(data, valid, row_to_group, n_groups);
+            Ok(AggOutput::F64 {
+                valid: vec![true; n_groups],
+                values,
+            })
+        }
+        (AggKind::MinI64, ValueColumn::I64 { data, valid }) => {
+            let (values, valid_out) = aggregate_min_i64_cpu(data, valid, row_to_group, n_groups);
+            Ok(AggOutput::I64 {
+                values,
+                valid: valid_out,
+            })
+        }
+        (AggKind::MaxI64, ValueColumn::I64 { data, valid }) => {
+            let (values, valid_out) = aggregate_max_i64_cpu(data, valid, row_to_group, n_groups);
+            Ok(AggOutput::I64 {
+                values,
+                valid: valid_out,
+            })
+        }
+        (AggKind::MinF64, ValueColumn::F64 { data, valid }) => {
+            let (values, valid_out) = aggregate_min_f64_cpu(data, valid, row_to_group, n_groups);
+            Ok(AggOutput::F64 {
+                values,
+                valid: valid_out,
+            })
+        }
+        (AggKind::MaxF64, ValueColumn::F64 { data, valid }) => {
+            let (values, valid_out) = aggregate_max_f64_cpu(data, valid, row_to_group, n_groups);
+            Ok(AggOutput::F64 {
+                values,
+                valid: valid_out,
+            })
+        }
+        (AggKind::Count, ValueColumn::I64 { valid, .. })
+        | (AggKind::Count, ValueColumn::F64 { valid, .. }) => {
+            let values = aggregate_count_cpu(valid, row_to_group, n_groups);
+            Ok(AggOutput::U64 { values })
+        }
+        (AggKind::Len, _) => {
+            let values = aggregate_len_cpu(row_to_group, n_groups);
+            Ok(AggOutput::U64 { values })
+        }
+        (AggKind::MeanI64, ValueColumn::I64 { data, valid }) => {
+            let sums = aggregate_sum_i64_cpu(data, valid, row_to_group, n_groups);
+            let counts = aggregate_count_cpu(valid, row_to_group, n_groups);
+            let means = compute_mean_i64(&sums, &counts);
+            let values: Vec<f64> = means.iter().map(|m| m.unwrap_or(0.0)).collect();
+            let valid_out: Vec<bool> = means.iter().map(|m| m.is_some()).collect();
+            Ok(AggOutput::F64 {
+                values,
+                valid: valid_out,
+            })
+        }
+        (AggKind::MeanF64, ValueColumn::F64 { data, valid }) => {
+            let sums = aggregate_sum_f64_cpu(data, valid, row_to_group, n_groups);
+            let counts = aggregate_count_cpu(valid, row_to_group, n_groups);
+            let means = compute_mean_f64(&sums, &counts);
+            let values: Vec<f64> = means.iter().map(|m| m.unwrap_or(0.0)).collect();
+            let valid_out: Vec<bool> = means.iter().map(|m| m.is_some()).collect();
+            Ok(AggOutput::F64 {
+                values,
+                valid: valid_out,
+            })
+        }
+        (kind, vcol) => {
+            let vt = match vcol {
+                ValueColumn::I64 { .. } => "I64",
+                ValueColumn::F64 { .. } => "F64",
+            };
+            Err(GroupByError::AggTypeMismatch {
+                kind: format!("{kind:?}"),
+                value_dtype: vt.to_string(),
+            })
+        }
+    }
 }
