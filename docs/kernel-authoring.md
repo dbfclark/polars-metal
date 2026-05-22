@@ -392,6 +392,128 @@ relies on to keep `out_idx < n_out` for every thread.
   `filter.rs` ends with `queue.wait_until_complete()?` before
   `copy_from_slice` on the output.
 
+## M2 additions
+
+The sections below document patterns and constraints introduced in M2 that
+every kernel author working on groupby, aggregation, or future hash-based
+operations must know before writing code.
+
+### Apple Silicon Metal atomic ops constraint
+
+**This is the most important M2 constraint.** The Metal toolchain version
+32023.883 (current as of M2) does not support the following operations:
+
+- `atomic_fetch_add_explicit` on `atomic_long` / `atomic_ulong`
+- `atomic_compare_exchange_weak_explicit` on `atomic_ulong`
+- `double` in compute kernels (bind as `ulong` and compare on the bit pattern — see `cmp_f64.metal`)
+
+Only `atomic_uint` and `atomic_int` (32-bit) have the full atomic op set.
+
+Practical consequences for kernel authoring:
+
+- **64-bit aggregation runs on CPU.** `crates/polars-metal-kernels/src/groupby.rs`
+  contains `aggregate_sum_i64_cpu`, `aggregate_min_i64_cpu`,
+  `aggregate_max_i64_cpu`, `aggregate_sum_f64_cpu`, etc. — Rayon-parallel
+  CPU loops over the `row_to_group` array produced by the GPU build phase.
+  These are not performance fallbacks; they are the correct dispatch for
+  64-bit dtypes until Apple ships wider atomics.
+- **32-bit aggregation has GPU kernels.** `shaders/aggregate.metal` provides
+  `agg_sum_i32`, `agg_sum_u32`, `agg_sum_f32`, `agg_min_i32`, `agg_max_i32`,
+  `agg_min_u32`, `agg_max_u32`, `agg_min_f32`, `agg_max_f32`, `agg_count`,
+  and `agg_len`. Each uses `atomic_int*` or `atomic_uint*` exclusively.
+- **Any kernel pattern that needs 64-bit fetch_add or 64-bit CAS is out of
+  scope until Apple ships the wider atomic set.** Do not attempt to work
+  around this with spin-wait loops — SIMD-group lockstep execution means one
+  thread cannot wait for a sibling thread's write to advance. The M2 groupby
+  build phase started as a GPU atomic-CAS design, hit exactly this deadlock,
+  was redesigned to a 3-state non-spinning machine, and still deadlocked. It
+  was ultimately moved to CPU (see
+  [§ Two-pass groupby idiom](#two-pass-groupby-idiom-overview) below).
+  This is a cautionary tale: the deadlock is structural, not a bug.
+- **The dispatch matrix.** When adding a new aggregation op or dtype, first
+  check whether the op requires 64-bit atomics. If yes, write a CPU finalise
+  function in `groupby.rs` following the `aggregate_sum_i64_cpu` pattern.
+  If no, write an MSL kernel in `shaders/aggregate.metal` following the
+  `agg_sum_i32` pattern.
+
+### Two-pass groupby idiom (overview)
+
+The M2 hash groupby uses a two-pass discipline. The split is CPU / GPU,
+not pass-1 / pass-2 in the traditional GPU sense:
+
+**Pass 1 — build (CPU, `groupby.rs`).** A Rust `HashMap<u128, u32>`
+find-or-insert over the encoded key vector (`Vec<u128>` produced by
+`encode_keys`) identifies unique groups and assigns each row a group index.
+Outputs:
+- `row_to_group: Vec<u32>` — one entry per input row, value = group index.
+- `group_count: Vec<u32>` — one entry per unique group, value = row count.
+- `first_row_per_group: Vec<u32>` — one entry per unique group, value =
+  index of the first row in that group (used for key decoding).
+
+This build lives on CPU for the reasons described in § Apple Silicon Metal
+atomic ops constraint above. Future M3 work may replace it with a GPU
+sort-then-segment-reduce approach that avoids CAS entirely; see
+[`docs/open-questions.md` § GroupBy build phase on CPU](open-questions.md).
+
+**Pass 2 — aggregate (GPU for 32-bit dtypes, CPU for 64-bit).** For each
+(value column, aggregation op) pair, dispatch one kernel:
+- 32-bit dtypes: one of the `agg_*` kernels in `shaders/aggregate.metal`.
+  Thread-per-row atomic-OP into `output[row_to_group[gid]]`.
+- 64-bit dtypes: corresponding `aggregate_*_cpu` function in `groupby.rs`.
+
+The caller must seed output buffers with the operator's identity element
+before dispatch (0 for sum/count, INT32_MAX for min_i32, etc. — see the
+`shaders/aggregate.metal` header comment for the full table).
+
+### Per-aggregation MSL kernel pattern
+
+`shaders/aggregate.metal` does not use the `#define` macro pattern because
+the entry points differ in their buffer types (`atomic_int*` vs
+`atomic_uint*`) and each is short enough to be explicit. This is the one
+place where the macro pattern would reduce readability rather than improve it.
+
+The structure of each kernel is identical:
+1. Early-exit guard: `if (gid >= n_rows) return;`
+2. Validity check: `if (!get_valid(valid, gid)) return;`
+3. Group lookup: `uint g = row_to_group[gid];`
+4. Atomic op: `atomic_fetch_add_explicit(&out[g], values[gid], memory_order_relaxed);`
+   (or fetch_min / fetch_max / CAS-loop for f32).
+
+New kernel families that follow a similar thread-per-row → atomic-OP-into-
+output pattern should adopt this explicit-per-entry-point style (not the
+macro pattern) when the number of entry points is small (≤ 3) or when
+buffer types differ across entry points. Use the macro pattern from
+`cmp_i64.metal` when there are ≥ 4 entry points with identical signatures
+differing only by a single operator token.
+
+Cite `shaders/aggregate.metal` for the full list of entry points and their
+dispatcher contracts.
+
+### Composite key encoding contract
+
+CPU-side code packs N key columns into a single `u128` per row via
+`crates/polars-metal-kernels/src/groupby.rs::encode_keys`. The contract:
+
+- Each key column contributes `1 (null flag) + data_bits` bits to the
+  packed u128, in column order from LSB to MSB.
+- Supported key dtypes (`KeyDtype`): `Bool` (2 bits), `I64` / `F64` (65
+  bits each).
+- Total bit width must not exceed 128 bits. If it does, `encode_keys`
+  returns `Err(KeyEncodeError::TooWide)` and the caller must fall back.
+- The matching `decode_keys` function inverts the encoding to recover key
+  column values for the output DataFrame.
+
+The hash kernel (`shaders/groupby_hash.metal`) only ever sees `u128`
+values. It does not know the `KeySchema`; that lives entirely on the Rust
+side. Adding a new key dtype requires extending `KeyDtype`, updating the
+`key_width_bits` helper in `cost.rs`, updating `encode_keys` /
+`decode_keys` in `groupby.rs`, and adding round-trip proptest cases in
+the test suite. The hash kernel does not need changes (it operates on
+the raw `u128` bit pattern).
+
+The 128-bit cap is tracked as a known limitation in
+[`docs/open-questions.md` § Composite key 128-bit limit](open-questions.md).
+
 ## Process
 
 1. **Read the cuDF source.** Don't reinvent the algorithm.
