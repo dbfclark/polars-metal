@@ -394,69 +394,150 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ```rust
 // crates/polars-metal-kernels/tests/test_key_encoding_small_ints.rs
 //! Proptest: encode → decode roundtrip for the M3-added KeyDtype variants.
-//! Verifies that any vector of typed values survives the round trip
-//! byte-exact, and that the sort order of encoded u128 values matches
-//! Polars' total ordering on the original typed values.
+//! Follows M2's pattern: struct-literal KeyColumn with `data: &[u8]` and
+//! `valid: &[u8]` (no constructor helpers exist).
 
-use polars_metal_core::plan::KeyDtype;
-use polars_metal_kernels::groupby::{encode_keys, decode_keys, KeyColumn};
+use polars_metal_kernels::groupby::{
+    decode_keys, encode_keys, DecodedColumn, KeyColumn, KeyDtype,
+};
 use proptest::prelude::*;
+
+fn bytes_i8(values: &[i8]) -> Vec<u8> {
+    values.iter().map(|v| *v as u8).collect()
+}
+fn bytes_i16(values: &[i16]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+fn bytes_i32(values: &[i32]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+fn bytes_u8(values: &[u8]) -> Vec<u8> {
+    values.to_vec()
+}
+fn bytes_u16(values: &[u16]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+fn bytes_u32(values: &[u32]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+fn all_valid(n_rows: usize) -> Vec<u8> {
+    vec![0xFFu8; (n_rows + 7) / 8]
+}
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
     #[test]
     fn i8_roundtrip(values in proptest::collection::vec(any::<i8>(), 1..256)) {
-        let col = KeyColumn::from_i8(&values);
-        let (encoded, schema) = encode_keys(&[col]);
+        let data = bytes_i8(&values);
+        let valid = all_valid(values.len());
+        let col = KeyColumn { name: "k".into(), dtype: KeyDtype::I8, data: &data, valid: &valid, n_rows: values.len() };
+        let (encoded, schema) = encode_keys(&[col]).expect("encode");
         let decoded = decode_keys(&encoded, &schema);
-        let decoded_i8: Vec<i8> = decoded[0].as_i8_slice().to_vec();
-        prop_assert_eq!(decoded_i8, values);
+        match &decoded[0] {
+            DecodedColumn::I8 { values: out, valid: ovalid } => {
+                prop_assert_eq!(out, &values);
+                prop_assert!(ovalid.iter().all(|&v| v));
+            }
+            _ => prop_assert!(false, "expected DecodedColumn::I8"),
+        }
     }
 
     #[test]
     fn i16_roundtrip(values in proptest::collection::vec(any::<i16>(), 1..256)) {
-        let col = KeyColumn::from_i16(&values);
-        let (encoded, schema) = encode_keys(&[col]);
+        let data = bytes_i16(&values);
+        let valid = all_valid(values.len());
+        let col = KeyColumn { name: "k".into(), dtype: KeyDtype::I16, data: &data, valid: &valid, n_rows: values.len() };
+        let (encoded, schema) = encode_keys(&[col]).expect("encode");
         let decoded = decode_keys(&encoded, &schema);
-        let decoded_i16: Vec<i16> = decoded[0].as_i16_slice().to_vec();
-        prop_assert_eq!(decoded_i16, values);
+        match &decoded[0] {
+            DecodedColumn::I16 { values: out, .. } => prop_assert_eq!(out, &values),
+            _ => prop_assert!(false, "expected DecodedColumn::I16"),
+        }
     }
 
     #[test]
-    fn i32_roundtrip(values in proptest::collection::vec(any::<i32>(), 1..256)) {
-        let col = KeyColumn::from_i32(&values);
-        let (encoded, schema) = encode_keys(&[col]);
+    fn u8_roundtrip(values in proptest::collection::vec(any::<u8>(), 1..256)) {
+        let data = bytes_u8(&values);
+        let valid = all_valid(values.len());
+        let col = KeyColumn { name: "k".into(), dtype: KeyDtype::U8, data: &data, valid: &valid, n_rows: values.len() };
+        let (encoded, schema) = encode_keys(&[col]).expect("encode");
         let decoded = decode_keys(&encoded, &schema);
-        let decoded_i32: Vec<i32> = decoded[0].as_i32_slice().to_vec();
-        prop_assert_eq!(decoded_i32, values);
+        match &decoded[0] {
+            DecodedColumn::U8 { values: out, .. } => prop_assert_eq!(out, &values),
+            _ => prop_assert!(false, "expected DecodedColumn::U8"),
+        }
     }
 
     #[test]
-    fn u8_u16_u32_roundtrip(
-        u8_vals  in proptest::collection::vec(any::<u8>(),  1..64),
-        u16_vals in proptest::collection::vec(any::<u16>(), 1..64),
-        u32_vals in proptest::collection::vec(any::<u32>(), 1..64),
+    fn u16_roundtrip(values in proptest::collection::vec(any::<u16>(), 1..256)) {
+        let data = bytes_u16(&values);
+        let valid = all_valid(values.len());
+        let col = KeyColumn { name: "k".into(), dtype: KeyDtype::U16, data: &data, valid: &valid, n_rows: values.len() };
+        let (encoded, schema) = encode_keys(&[col]).expect("encode");
+        let decoded = decode_keys(&encoded, &schema);
+        match &decoded[0] {
+            DecodedColumn::U16 { values: out, .. } => prop_assert_eq!(out, &values),
+            _ => prop_assert!(false, "expected DecodedColumn::U16"),
+        }
+    }
+
+    #[test]
+    fn u32_roundtrip(values in proptest::collection::vec(any::<u32>(), 1..256)) {
+        let data = bytes_u32(&values);
+        let valid = all_valid(values.len());
+        let col = KeyColumn { name: "k".into(), dtype: KeyDtype::U32, data: &data, valid: &valid, n_rows: values.len() };
+        let (encoded, schema) = encode_keys(&[col]).expect("encode");
+        let decoded = decode_keys(&encoded, &schema);
+        match &decoded[0] {
+            DecodedColumn::U32 { values: out, .. } => prop_assert_eq!(out, &values),
+            _ => prop_assert!(false, "expected DecodedColumn::U32"),
+        }
+    }
+
+    #[test]
+    fn multi_dtype_composite_under_128_bits(
+        i8_vals  in proptest::collection::vec(any::<i8>(),  4..32),
+        i16_vals in proptest::collection::vec(any::<i16>(), 4..32),
+        u32_vals in proptest::collection::vec(any::<u32>(), 4..32),
     ) {
-        prop_assume!(u8_vals.len() == u16_vals.len() && u16_vals.len() == u32_vals.len());
+        let n = i8_vals.len().min(i16_vals.len()).min(u32_vals.len());
+        let i8_vals = &i8_vals[..n];
+        let i16_vals = &i16_vals[..n];
+        let u32_vals = &u32_vals[..n];
+        let valid = all_valid(n);
+        let d8 = bytes_i8(i8_vals);
+        let d16 = bytes_i16(i16_vals);
+        let d32 = bytes_u32(u32_vals);
+        // Total: 3*1 + 8 + 16 + 32 = 59 bits (well under 128)
         let cols = vec![
-            KeyColumn::from_u8(&u8_vals),
-            KeyColumn::from_u16(&u16_vals),
-            KeyColumn::from_u32(&u32_vals),
+            KeyColumn { name: "a".into(), dtype: KeyDtype::I8,  data: &d8,  valid: &valid, n_rows: n },
+            KeyColumn { name: "b".into(), dtype: KeyDtype::I16, data: &d16, valid: &valid, n_rows: n },
+            KeyColumn { name: "c".into(), dtype: KeyDtype::U32, data: &d32, valid: &valid, n_rows: n },
         ];
-        let (encoded, schema) = encode_keys(&cols);
+        let (encoded, schema) = encode_keys(&cols).expect("encode");
         let decoded = decode_keys(&encoded, &schema);
-        prop_assert_eq!(decoded[0].as_u8_slice(),  u8_vals.as_slice());
-        prop_assert_eq!(decoded[1].as_u16_slice(), u16_vals.as_slice());
-        prop_assert_eq!(decoded[2].as_u32_slice(), u32_vals.as_slice());
+        match (&decoded[0], &decoded[1], &decoded[2]) {
+            (DecodedColumn::I8 { values: out_a, .. },
+             DecodedColumn::I16 { values: out_b, .. },
+             DecodedColumn::U32 { values: out_c, .. }) => {
+                prop_assert_eq!(out_a.as_slice(), i8_vals);
+                prop_assert_eq!(out_b.as_slice(), i16_vals);
+                prop_assert_eq!(out_c.as_slice(), u32_vals);
+            }
+            _ => prop_assert!(false, "unexpected decoded variants"),
+        }
     }
 
     #[test]
     fn duplicate_signed_values_encode_identically(values in proptest::collection::vec(any::<i32>(), 2..64)) {
         // Groupby relies on identical keys producing identical encoded u128s.
         // Sort order is NOT preserved (M2's convention; groupby is hash-based).
-        let col = KeyColumn::from_i32(&values);
-        let (encoded, _schema) = encode_keys(&[col]);
+        let data = bytes_i32(&values);
+        let valid = all_valid(values.len());
+        let col = KeyColumn { name: "k".into(), dtype: KeyDtype::I32, data: &data, valid: &valid, n_rows: values.len() };
+        let (encoded, _schema) = encode_keys(&[col]).expect("encode");
         for i in 0..values.len() {
             for j in 0..values.len() {
                 if values[i] == values[j] {
@@ -468,9 +549,9 @@ proptest! {
 }
 ```
 
-- [ ] **Step 2: Add `KeyColumn::from_*` constructors and `as_*_slice` decoders**
+- [ ] **Step 2: No constructor helpers needed**
 
-In `crates/polars-metal-kernels/src/groupby.rs`, extend `KeyColumn`'s constructor enum and the `DecodedColumn` accessor methods to cover i8/i16/i32/u8/u16/u32. Pattern matches M2's i64 implementation 1:1 with narrower types.
+The test uses M2's existing struct-literal pattern. `KeyColumn` already has all required fields (`name`, `dtype`, `data`, `valid`, `n_rows`). `DecodedColumn` variants are pattern-matched directly (no accessor methods).
 
 - [ ] **Step 3: Run the test**
 
