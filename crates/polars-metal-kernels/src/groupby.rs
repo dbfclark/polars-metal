@@ -1464,6 +1464,54 @@ pub fn compute_mean_i64(sums: &[i64], counts: &[u64]) -> Vec<Option<f64>> {
 }
 
 // -----------------------------------------------------------------------
+// Unit tests for compute_mean (T25)
+// -----------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod mean_tests {
+    use super::{compute_mean_f64, compute_mean_i64};
+
+    #[test]
+    fn compute_mean_f64_handles_empty_group() {
+        let m = compute_mean_f64(&[10.0, 0.0], &[2, 0]);
+        assert_eq!(m, vec![Some(5.0), None]);
+    }
+
+    #[test]
+    fn compute_mean_i64_returns_f64_with_division() {
+        let m = compute_mean_i64(&[10, 7], &[4, 2]);
+        assert_eq!(m, vec![Some(2.5), Some(3.5)]);
+    }
+
+    #[test]
+    fn compute_mean_f64_all_null_groups_are_none() {
+        let m = compute_mean_f64(&[0.0, 0.0, 0.0], &[0, 0, 0]);
+        assert_eq!(m, vec![None, None, None]);
+    }
+
+    #[test]
+    fn compute_mean_i64_single_row_groups() {
+        let m = compute_mean_i64(&[3, -6, 0], &[1, 1, 1]);
+        assert_eq!(m, vec![Some(3.0), Some(-6.0), Some(0.0)]);
+    }
+
+    #[test]
+    fn compute_mean_f64_single_element() {
+        let m = compute_mean_f64(&[7.5], &[1]);
+        assert_eq!(m, vec![Some(7.5)]);
+    }
+
+    #[test]
+    fn compute_mean_i64_integer_division_produces_f64() {
+        // 1 / 3 = 0.333... (not truncated to 0)
+        let m = compute_mean_i64(&[1], &[3]);
+        let v = m[0].expect("count=3 must yield Some");
+        assert!((v - 1.0 / 3.0).abs() < 1e-15);
+    }
+}
+
+// -----------------------------------------------------------------------
 
 /// Pure-Rust reference implementation of `hash_u128` from `shaders/_groupby.metal`.
 ///
