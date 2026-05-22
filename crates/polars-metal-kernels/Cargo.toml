@@ -27,6 +27,7 @@ objc2-metal = { version = "0.2", features = [
 objc2-foundation = { version = "0.2", features = ["NSURL", "NSString", "NSError"] }
 polars-metal-buffer = { path = "../polars-metal-buffer" }
 polars-metal-mlx-sys = { path = "../polars-metal-mlx-sys" }
+rayon = "1"
 thiserror = "1"
 
 [dev-dependencies]

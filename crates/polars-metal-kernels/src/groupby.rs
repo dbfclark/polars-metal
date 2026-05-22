@@ -470,6 +470,1001 @@ fn read_u32_vec(
     Ok(out)
 }
 
+// -----------------------------------------------------------------------
+// 32-bit GPU aggregation dispatchers
+// -----------------------------------------------------------------------
+
+/// Shared helper: seed + dispatch an i32 aggregation kernel, copy results back.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_agg_i32(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    values: &[i32],
+    valid: &[u8],
+    row_to_group: &[u32],
+    n_rows: usize,
+    n_groups: usize,
+    out: &mut [i32],
+    kernel_name: &str,
+    init_value: i32,
+) -> Result<(), GroupByError> {
+    if n_rows == 0 {
+        return Ok(());
+    }
+    let n_rows_u32: u32 =
+        u32::try_from(n_rows).map_err(|_| GroupByError::RowCountOverflow { n_rows })?;
+    let valid_bytes = (n_rows + 7) / 8;
+    if values.len() < n_rows {
+        return Err(GroupByError::OutputTooShort {
+            got: values.len(),
+            need: n_rows,
+        });
+    }
+    if row_to_group.len() < n_rows {
+        return Err(GroupByError::OutputTooShort {
+            got: row_to_group.len(),
+            need: n_rows,
+        });
+    }
+    if valid.len() < valid_bytes {
+        return Err(GroupByError::OutputTooShort {
+            got: valid.len(),
+            need: valid_bytes,
+        });
+    }
+    if out.len() < n_groups {
+        return Err(GroupByError::OutputTooShort {
+            got: out.len(),
+            need: n_groups,
+        });
+    }
+
+    // SAFETY: `i32` is plain-old-data; reinterpret as bytes for the duration
+    // of this call. `new_buffer_from_bytes` copies synchronously.
+    let values_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, n_rows * 4) };
+    let r2g_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(row_to_group.as_ptr() as *const u8, n_rows * 4) };
+
+    let init_buf: Vec<i32> = vec![init_value; n_groups];
+    // SAFETY: `i32` plain-old-data; same as above.
+    let init_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(init_buf.as_ptr() as *const u8, n_groups * 4) };
+
+    let lib = shared_library(device)?;
+    let pso = lib.pipeline(kernel_name)?;
+
+    let vals_buf = device.new_buffer_from_bytes(values_bytes)?;
+    let valid_buf = device.new_buffer_from_bytes(&valid[..valid_bytes])?;
+    let r2g_buf = device.new_buffer_from_bytes(r2g_bytes)?;
+    let out_buf = device.new_buffer_from_bytes(init_bytes)?;
+    let n_rows_buf = device.new_buffer_from_bytes(&n_rows_u32.to_le_bytes())?;
+
+    queue.dispatch_1d(
+        &pso,
+        &[&vals_buf, &valid_buf, &r2g_buf, &out_buf, &n_rows_buf],
+        n_rows,
+    )?;
+    queue.wait_until_complete()?;
+
+    let out_bytes = out_buf.as_slice();
+    let need_bytes = n_groups * 4;
+    if out_bytes.len() < need_bytes {
+        return Err(GroupByError::OutputTooShort {
+            got: out_bytes.len(),
+            need: need_bytes,
+        });
+    }
+    for (i, v) in out.iter_mut().take(n_groups).enumerate() {
+        let b = &out_bytes[i * 4..(i + 1) * 4];
+        *v = i32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    }
+    Ok(())
+}
+
+/// Dispatch `agg_sum_i32`.
+///
+/// `values`, `valid`, `row_to_group` are slices of length ≥ `n_rows`.
+/// `out` is a slice of length ≥ `n_groups`, value on entry is overwritten
+/// with the per-group sum (null rows contribute 0, all-null group → 0).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_sum_i32(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    values: &[i32],
+    valid: &[u8],
+    row_to_group: &[u32],
+    n_rows: usize,
+    n_groups: usize,
+    out: &mut [i32],
+) -> Result<(), GroupByError> {
+    dispatch_agg_i32(
+        device,
+        queue,
+        values,
+        valid,
+        row_to_group,
+        n_rows,
+        n_groups,
+        out,
+        "agg_sum_i32",
+        0,
+    )
+}
+
+/// Dispatch `agg_min_i32`. Seeded with `i32::MAX`; groups with no valid rows
+/// retain `i32::MAX` — callers must apply a validity mask (see
+/// `dispatch_count_u32`) to detect all-null groups.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_min_i32(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    values: &[i32],
+    valid: &[u8],
+    row_to_group: &[u32],
+    n_rows: usize,
+    n_groups: usize,
+    out: &mut [i32],
+) -> Result<(), GroupByError> {
+    dispatch_agg_i32(
+        device,
+        queue,
+        values,
+        valid,
+        row_to_group,
+        n_rows,
+        n_groups,
+        out,
+        "agg_min_i32",
+        i32::MAX,
+    )
+}
+
+/// Dispatch `agg_max_i32`. Seeded with `i32::MIN`; groups with no valid rows
+/// retain `i32::MIN`.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_max_i32(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    values: &[i32],
+    valid: &[u8],
+    row_to_group: &[u32],
+    n_rows: usize,
+    n_groups: usize,
+    out: &mut [i32],
+) -> Result<(), GroupByError> {
+    dispatch_agg_i32(
+        device,
+        queue,
+        values,
+        valid,
+        row_to_group,
+        n_rows,
+        n_groups,
+        out,
+        "agg_max_i32",
+        i32::MIN,
+    )
+}
+
+// ---- u32 GPU aggregation ----
+
+/// Shared helper for u32 aggregation kernels.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_agg_u32(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    values: &[u32],
+    valid: &[u8],
+    row_to_group: &[u32],
+    n_rows: usize,
+    n_groups: usize,
+    out: &mut [u32],
+    kernel_name: &str,
+    init_value: u32,
+) -> Result<(), GroupByError> {
+    if n_rows == 0 {
+        return Ok(());
+    }
+    let n_rows_u32: u32 =
+        u32::try_from(n_rows).map_err(|_| GroupByError::RowCountOverflow { n_rows })?;
+    let valid_bytes = (n_rows + 7) / 8;
+    if values.len() < n_rows {
+        return Err(GroupByError::OutputTooShort {
+            got: values.len(),
+            need: n_rows,
+        });
+    }
+    if row_to_group.len() < n_rows {
+        return Err(GroupByError::OutputTooShort {
+            got: row_to_group.len(),
+            need: n_rows,
+        });
+    }
+    if valid.len() < valid_bytes {
+        return Err(GroupByError::OutputTooShort {
+            got: valid.len(),
+            need: valid_bytes,
+        });
+    }
+    if out.len() < n_groups {
+        return Err(GroupByError::OutputTooShort {
+            got: out.len(),
+            need: n_groups,
+        });
+    }
+
+    // SAFETY: `u32` is plain-old-data.
+    let values_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, n_rows * 4) };
+    let r2g_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(row_to_group.as_ptr() as *const u8, n_rows * 4) };
+    let init_buf: Vec<u32> = vec![init_value; n_groups];
+    // SAFETY: `u32` plain-old-data.
+    let init_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(init_buf.as_ptr() as *const u8, n_groups * 4) };
+
+    let lib = shared_library(device)?;
+    let pso = lib.pipeline(kernel_name)?;
+
+    let vals_buf = device.new_buffer_from_bytes(values_bytes)?;
+    let valid_buf = device.new_buffer_from_bytes(&valid[..valid_bytes])?;
+    let r2g_buf = device.new_buffer_from_bytes(r2g_bytes)?;
+    let out_buf = device.new_buffer_from_bytes(init_bytes)?;
+    let n_rows_buf = device.new_buffer_from_bytes(&n_rows_u32.to_le_bytes())?;
+
+    queue.dispatch_1d(
+        &pso,
+        &[&vals_buf, &valid_buf, &r2g_buf, &out_buf, &n_rows_buf],
+        n_rows,
+    )?;
+    queue.wait_until_complete()?;
+
+    let out_bytes = out_buf.as_slice();
+    let need_bytes = n_groups * 4;
+    if out_bytes.len() < need_bytes {
+        return Err(GroupByError::OutputTooShort {
+            got: out_bytes.len(),
+            need: need_bytes,
+        });
+    }
+    for (i, v) in out.iter_mut().take(n_groups).enumerate() {
+        let b = &out_bytes[i * 4..(i + 1) * 4];
+        *v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    }
+    Ok(())
+}
+
+/// Dispatch `agg_sum_u32`.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_sum_u32(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    values: &[u32],
+    valid: &[u8],
+    row_to_group: &[u32],
+    n_rows: usize,
+    n_groups: usize,
+    out: &mut [u32],
+) -> Result<(), GroupByError> {
+    dispatch_agg_u32(
+        device,
+        queue,
+        values,
+        valid,
+        row_to_group,
+        n_rows,
+        n_groups,
+        out,
+        "agg_sum_u32",
+        0,
+    )
+}
+
+/// Dispatch `agg_min_u32`. Seeded with `u32::MAX`.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_min_u32(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    values: &[u32],
+    valid: &[u8],
+    row_to_group: &[u32],
+    n_rows: usize,
+    n_groups: usize,
+    out: &mut [u32],
+) -> Result<(), GroupByError> {
+    dispatch_agg_u32(
+        device,
+        queue,
+        values,
+        valid,
+        row_to_group,
+        n_rows,
+        n_groups,
+        out,
+        "agg_min_u32",
+        u32::MAX,
+    )
+}
+
+/// Dispatch `agg_max_u32`. Seeded with `0`.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_max_u32(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    values: &[u32],
+    valid: &[u8],
+    row_to_group: &[u32],
+    n_rows: usize,
+    n_groups: usize,
+    out: &mut [u32],
+) -> Result<(), GroupByError> {
+    dispatch_agg_u32(
+        device,
+        queue,
+        values,
+        valid,
+        row_to_group,
+        n_rows,
+        n_groups,
+        out,
+        "agg_max_u32",
+        0,
+    )
+}
+
+// ---- f32 GPU aggregation ----
+
+/// Shared helper for f32 aggregation kernels.
+/// The MSL kernels use `atomic_uint` as a bit-pattern container for f32;
+/// the init value is passed as the bit pattern of the f32 identity element.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_agg_f32(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    values: &[f32],
+    valid: &[u8],
+    row_to_group: &[u32],
+    n_rows: usize,
+    n_groups: usize,
+    out: &mut [f32],
+    kernel_name: &str,
+    init_bits: u32,
+) -> Result<(), GroupByError> {
+    if n_rows == 0 {
+        return Ok(());
+    }
+    let n_rows_u32: u32 =
+        u32::try_from(n_rows).map_err(|_| GroupByError::RowCountOverflow { n_rows })?;
+    let valid_bytes = (n_rows + 7) / 8;
+    if values.len() < n_rows {
+        return Err(GroupByError::OutputTooShort {
+            got: values.len(),
+            need: n_rows,
+        });
+    }
+    if row_to_group.len() < n_rows {
+        return Err(GroupByError::OutputTooShort {
+            got: row_to_group.len(),
+            need: n_rows,
+        });
+    }
+    if valid.len() < valid_bytes {
+        return Err(GroupByError::OutputTooShort {
+            got: valid.len(),
+            need: valid_bytes,
+        });
+    }
+    if out.len() < n_groups {
+        return Err(GroupByError::OutputTooShort {
+            got: out.len(),
+            need: n_groups,
+        });
+    }
+
+    // SAFETY: `f32` is plain-old-data; bit patterns are stable.
+    let values_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, n_rows * 4) };
+    let r2g_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(row_to_group.as_ptr() as *const u8, n_rows * 4) };
+    // Seed as u32 bit patterns; the kernel interprets them as f32 via as_type<float>.
+    let init_buf: Vec<u32> = vec![init_bits; n_groups];
+    // SAFETY: `u32` plain-old-data.
+    let init_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(init_buf.as_ptr() as *const u8, n_groups * 4) };
+
+    let lib = shared_library(device)?;
+    let pso = lib.pipeline(kernel_name)?;
+
+    let vals_buf = device.new_buffer_from_bytes(values_bytes)?;
+    let valid_buf = device.new_buffer_from_bytes(&valid[..valid_bytes])?;
+    let r2g_buf = device.new_buffer_from_bytes(r2g_bytes)?;
+    let out_buf = device.new_buffer_from_bytes(init_bytes)?;
+    let n_rows_buf = device.new_buffer_from_bytes(&n_rows_u32.to_le_bytes())?;
+
+    queue.dispatch_1d(
+        &pso,
+        &[&vals_buf, &valid_buf, &r2g_buf, &out_buf, &n_rows_buf],
+        n_rows,
+    )?;
+    queue.wait_until_complete()?;
+
+    let out_bytes = out_buf.as_slice();
+    let need_bytes = n_groups * 4;
+    if out_bytes.len() < need_bytes {
+        return Err(GroupByError::OutputTooShort {
+            got: out_bytes.len(),
+            need: need_bytes,
+        });
+    }
+    for (i, v) in out.iter_mut().take(n_groups).enumerate() {
+        let b = &out_bytes[i * 4..(i + 1) * 4];
+        *v = f32::from_bits(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    }
+    Ok(())
+}
+
+/// Dispatch `agg_sum_f32`. Seeded with 0.0.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_sum_f32(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    values: &[f32],
+    valid: &[u8],
+    row_to_group: &[u32],
+    n_rows: usize,
+    n_groups: usize,
+    out: &mut [f32],
+) -> Result<(), GroupByError> {
+    dispatch_agg_f32(
+        device,
+        queue,
+        values,
+        valid,
+        row_to_group,
+        n_rows,
+        n_groups,
+        out,
+        "agg_sum_f32",
+        0u32, // 0.0f32.to_bits()
+    )
+}
+
+/// Dispatch `agg_min_f32`. Seeded with +INFINITY.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_min_f32(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    values: &[f32],
+    valid: &[u8],
+    row_to_group: &[u32],
+    n_rows: usize,
+    n_groups: usize,
+    out: &mut [f32],
+) -> Result<(), GroupByError> {
+    dispatch_agg_f32(
+        device,
+        queue,
+        values,
+        valid,
+        row_to_group,
+        n_rows,
+        n_groups,
+        out,
+        "agg_min_f32",
+        f32::INFINITY.to_bits(),
+    )
+}
+
+/// Dispatch `agg_max_f32`. Seeded with -INFINITY.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_max_f32(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    values: &[f32],
+    valid: &[u8],
+    row_to_group: &[u32],
+    n_rows: usize,
+    n_groups: usize,
+    out: &mut [f32],
+) -> Result<(), GroupByError> {
+    dispatch_agg_f32(
+        device,
+        queue,
+        values,
+        valid,
+        row_to_group,
+        n_rows,
+        n_groups,
+        out,
+        "agg_max_f32",
+        f32::NEG_INFINITY.to_bits(),
+    )
+}
+
+// ---- count / len GPU dispatchers ----
+
+/// Dispatch `agg_count`: per-group count of non-null rows.
+pub fn dispatch_count_u32(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    valid: &[u8],
+    row_to_group: &[u32],
+    n_rows: usize,
+    n_groups: usize,
+    out: &mut [u32],
+) -> Result<(), GroupByError> {
+    if n_rows == 0 {
+        return Ok(());
+    }
+    let n_rows_u32: u32 =
+        u32::try_from(n_rows).map_err(|_| GroupByError::RowCountOverflow { n_rows })?;
+    let valid_bytes = (n_rows + 7) / 8;
+    if row_to_group.len() < n_rows {
+        return Err(GroupByError::OutputTooShort {
+            got: row_to_group.len(),
+            need: n_rows,
+        });
+    }
+    if valid.len() < valid_bytes {
+        return Err(GroupByError::OutputTooShort {
+            got: valid.len(),
+            need: valid_bytes,
+        });
+    }
+    if out.len() < n_groups {
+        return Err(GroupByError::OutputTooShort {
+            got: out.len(),
+            need: n_groups,
+        });
+    }
+
+    // SAFETY: `u32` plain-old-data.
+    let r2g_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(row_to_group.as_ptr() as *const u8, n_rows * 4) };
+    let init_bytes: Vec<u8> = vec![0u8; n_groups * 4];
+
+    let lib = shared_library(device)?;
+    let pso = lib.pipeline("agg_count")?;
+
+    let valid_buf = device.new_buffer_from_bytes(&valid[..valid_bytes])?;
+    let r2g_buf = device.new_buffer_from_bytes(r2g_bytes)?;
+    let out_buf = device.new_buffer_from_bytes(&init_bytes)?;
+    let n_rows_buf = device.new_buffer_from_bytes(&n_rows_u32.to_le_bytes())?;
+
+    queue.dispatch_1d(&pso, &[&valid_buf, &r2g_buf, &out_buf, &n_rows_buf], n_rows)?;
+    queue.wait_until_complete()?;
+
+    let out_bytes = out_buf.as_slice();
+    let need_bytes = n_groups * 4;
+    if out_bytes.len() < need_bytes {
+        return Err(GroupByError::OutputTooShort {
+            got: out_bytes.len(),
+            need: need_bytes,
+        });
+    }
+    for (i, v) in out.iter_mut().take(n_groups).enumerate() {
+        let b = &out_bytes[i * 4..(i + 1) * 4];
+        *v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    }
+    Ok(())
+}
+
+/// Dispatch `agg_len`: per-group total row count (includes null rows).
+pub fn dispatch_len_u32(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    row_to_group: &[u32],
+    n_rows: usize,
+    n_groups: usize,
+    out: &mut [u32],
+) -> Result<(), GroupByError> {
+    if n_rows == 0 {
+        return Ok(());
+    }
+    let n_rows_u32: u32 =
+        u32::try_from(n_rows).map_err(|_| GroupByError::RowCountOverflow { n_rows })?;
+    if row_to_group.len() < n_rows {
+        return Err(GroupByError::OutputTooShort {
+            got: row_to_group.len(),
+            need: n_rows,
+        });
+    }
+    if out.len() < n_groups {
+        return Err(GroupByError::OutputTooShort {
+            got: out.len(),
+            need: n_groups,
+        });
+    }
+
+    // SAFETY: `u32` plain-old-data.
+    let r2g_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(row_to_group.as_ptr() as *const u8, n_rows * 4) };
+    let init_bytes: Vec<u8> = vec![0u8; n_groups * 4];
+
+    let lib = shared_library(device)?;
+    let pso = lib.pipeline("agg_len")?;
+
+    let r2g_buf = device.new_buffer_from_bytes(r2g_bytes)?;
+    let out_buf = device.new_buffer_from_bytes(&init_bytes)?;
+    let n_rows_buf = device.new_buffer_from_bytes(&n_rows_u32.to_le_bytes())?;
+
+    queue.dispatch_1d(&pso, &[&r2g_buf, &out_buf, &n_rows_buf], n_rows)?;
+    queue.wait_until_complete()?;
+
+    let out_bytes = out_buf.as_slice();
+    let need_bytes = n_groups * 4;
+    if out_bytes.len() < need_bytes {
+        return Err(GroupByError::OutputTooShort {
+            got: out_bytes.len(),
+            need: need_bytes,
+        });
+    }
+    for (i, v) in out.iter_mut().take(n_groups).enumerate() {
+        let b = &out_bytes[i * 4..(i + 1) * 4];
+        *v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    }
+    Ok(())
+}
+
+// -----------------------------------------------------------------------
+// CPU-finalize aggregators for 64-bit dtypes
+//
+// GPU produced `row_to_group` in Phase 5. For i64/f64/u64 dtypes the
+// aggregation runs in Rust+Rayon because the Metal toolchain 32023.883
+// does not support 64-bit atomic ops in compute kernels.
+//
+// Null semantics match Polars CPU exactly:
+//   - sum:   null rows skipped; all-null group → 0 (i64) / 0.0 (f64).
+//   - count: null rows skipped; all-null group → 0.
+//   - len:   all rows counted (ignores validity).
+//   - min/max: null rows skipped; all-null group → None.
+// -----------------------------------------------------------------------
+
+/// Sum f64 values by group. Null rows skipped. All-null group → 0.0.
+///
+/// Uses AtomicU64 CAS loops (Rayon parallel) because AtomicF64 doesn't
+/// exist in stable `std`.
+pub fn aggregate_sum_f64_cpu(
+    values: &[f64],
+    valid: &[u8],
+    row_to_group: &[u32],
+    n_groups: usize,
+) -> Vec<f64> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let slots: Vec<AtomicU64> = (0..n_groups).map(|_| AtomicU64::new(0)).collect();
+    let n = values.len().min(row_to_group.len());
+    values[..n].par_iter().enumerate().for_each(|(i, &v)| {
+        let byte = valid.get(i >> 3).copied().unwrap_or(0);
+        if (byte >> (i & 7)) & 1 == 0 {
+            return;
+        }
+        let g = row_to_group[i] as usize;
+        if g >= n_groups {
+            return;
+        }
+        let mut old_bits = slots[g].load(Ordering::Relaxed);
+        loop {
+            let cur = f64::from_bits(old_bits);
+            let next_bits = (cur + v).to_bits();
+            match slots[g].compare_exchange_weak(
+                old_bits,
+                next_bits,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(latest) => old_bits = latest,
+            }
+        }
+    });
+    slots
+        .into_iter()
+        .map(|a| f64::from_bits(a.into_inner()))
+        .collect()
+}
+
+/// Sum i64 values by group. Null rows skipped. All-null group → 0.
+pub fn aggregate_sum_i64_cpu(
+    values: &[i64],
+    valid: &[u8],
+    row_to_group: &[u32],
+    n_groups: usize,
+) -> Vec<i64> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    let slots: Vec<AtomicI64> = (0..n_groups).map(|_| AtomicI64::new(0)).collect();
+    let n = values.len().min(row_to_group.len());
+    values[..n].par_iter().enumerate().for_each(|(i, &v)| {
+        let byte = valid.get(i >> 3).copied().unwrap_or(0);
+        if (byte >> (i & 7)) & 1 == 0 {
+            return;
+        }
+        let g = row_to_group[i] as usize;
+        if g >= n_groups {
+            return;
+        }
+        slots[g].fetch_add(v, Ordering::Relaxed);
+    });
+    slots.into_iter().map(|a| a.into_inner()).collect()
+}
+
+/// Min i64 values by group. Null rows skipped.
+/// Returns `(values, valid)`: `valid[g]` is false when group `g` had no non-null rows.
+pub fn aggregate_min_i64_cpu(
+    values: &[i64],
+    valid: &[u8],
+    row_to_group: &[u32],
+    n_groups: usize,
+) -> (Vec<i64>, Vec<bool>) {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+
+    let slots: Vec<AtomicI64> = (0..n_groups).map(|_| AtomicI64::new(i64::MAX)).collect();
+    let has_value: Vec<AtomicBool> = (0..n_groups).map(|_| AtomicBool::new(false)).collect();
+    let n = values.len().min(row_to_group.len());
+    values[..n].par_iter().enumerate().for_each(|(i, &v)| {
+        let byte = valid.get(i >> 3).copied().unwrap_or(0);
+        if (byte >> (i & 7)) & 1 == 0 {
+            return;
+        }
+        let g = row_to_group[i] as usize;
+        if g >= n_groups {
+            return;
+        }
+        has_value[g].store(true, Ordering::Relaxed);
+        let mut old = slots[g].load(Ordering::Relaxed);
+        while v < old {
+            match slots[g].compare_exchange_weak(old, v, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(cur) => old = cur,
+            }
+        }
+    });
+    let vals: Vec<i64> = slots.into_iter().map(|a| a.into_inner()).collect();
+    let valid_out: Vec<bool> = has_value.into_iter().map(|a| a.into_inner()).collect();
+    (vals, valid_out)
+}
+
+/// Max i64 values by group. Null rows skipped.
+/// Returns `(values, valid)`: `valid[g]` is false when group `g` had no non-null rows.
+pub fn aggregate_max_i64_cpu(
+    values: &[i64],
+    valid: &[u8],
+    row_to_group: &[u32],
+    n_groups: usize,
+) -> (Vec<i64>, Vec<bool>) {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+
+    let slots: Vec<AtomicI64> = (0..n_groups).map(|_| AtomicI64::new(i64::MIN)).collect();
+    let has_value: Vec<AtomicBool> = (0..n_groups).map(|_| AtomicBool::new(false)).collect();
+    let n = values.len().min(row_to_group.len());
+    values[..n].par_iter().enumerate().for_each(|(i, &v)| {
+        let byte = valid.get(i >> 3).copied().unwrap_or(0);
+        if (byte >> (i & 7)) & 1 == 0 {
+            return;
+        }
+        let g = row_to_group[i] as usize;
+        if g >= n_groups {
+            return;
+        }
+        has_value[g].store(true, Ordering::Relaxed);
+        let mut old = slots[g].load(Ordering::Relaxed);
+        while v > old {
+            match slots[g].compare_exchange_weak(old, v, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(cur) => old = cur,
+            }
+        }
+    });
+    let vals: Vec<i64> = slots.into_iter().map(|a| a.into_inner()).collect();
+    let valid_out: Vec<bool> = has_value.into_iter().map(|a| a.into_inner()).collect();
+    (vals, valid_out)
+}
+
+/// Min f64 values by group. Null rows skipped.
+/// NaN poisoning: if any non-null value in the group is NaN, result is NaN
+/// (Polars CPU behaviour for min on a group containing NaN).
+/// Returns `(values, valid)`: `valid[g]` is false when group `g` had no non-null rows.
+pub fn aggregate_min_f64_cpu(
+    values: &[f64],
+    valid: &[u8],
+    row_to_group: &[u32],
+    n_groups: usize,
+) -> (Vec<f64>, Vec<bool>) {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    // Seeded with +INFINITY bit pattern so any real value wins.
+    let slots: Vec<AtomicU64> = (0..n_groups)
+        .map(|_| AtomicU64::new(f64::INFINITY.to_bits()))
+        .collect();
+    let has_value: Vec<AtomicBool> = (0..n_groups).map(|_| AtomicBool::new(false)).collect();
+    let n = values.len().min(row_to_group.len());
+    values[..n].par_iter().enumerate().for_each(|(i, &v)| {
+        let byte = valid.get(i >> 3).copied().unwrap_or(0);
+        if (byte >> (i & 7)) & 1 == 0 {
+            return;
+        }
+        let g = row_to_group[i] as usize;
+        if g >= n_groups {
+            return;
+        }
+        has_value[g].store(true, Ordering::Relaxed);
+        // NaN poisons: if we see a NaN, force NaN into the slot permanently.
+        if v.is_nan() {
+            slots[g].store(v.to_bits(), Ordering::Relaxed);
+            return;
+        }
+        let mut old_bits = slots[g].load(Ordering::Relaxed);
+        loop {
+            let cur = f64::from_bits(old_bits);
+            // If the slot is already NaN (from a prior NaN row), leave it.
+            if cur.is_nan() {
+                break;
+            }
+            // v is non-NaN (checked above) and cur is non-NaN (checked here),
+            // so plain >= is safe and well-defined.
+            if v >= cur {
+                break;
+            }
+            match slots[g].compare_exchange_weak(
+                old_bits,
+                v.to_bits(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(latest) => old_bits = latest,
+            }
+        }
+    });
+    let vals: Vec<f64> = slots
+        .into_iter()
+        .map(|a| f64::from_bits(a.into_inner()))
+        .collect();
+    let valid_out: Vec<bool> = has_value.into_iter().map(|a| a.into_inner()).collect();
+    (vals, valid_out)
+}
+
+/// Max f64 values by group. Null rows skipped.
+/// NaN poisoning: same as `aggregate_min_f64_cpu`.
+/// Returns `(values, valid)`: `valid[g]` is false when group `g` had no non-null rows.
+pub fn aggregate_max_f64_cpu(
+    values: &[f64],
+    valid: &[u8],
+    row_to_group: &[u32],
+    n_groups: usize,
+) -> (Vec<f64>, Vec<bool>) {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    // Seeded with -INFINITY bit pattern so any real value wins.
+    let slots: Vec<AtomicU64> = (0..n_groups)
+        .map(|_| AtomicU64::new(f64::NEG_INFINITY.to_bits()))
+        .collect();
+    let has_value: Vec<AtomicBool> = (0..n_groups).map(|_| AtomicBool::new(false)).collect();
+    let n = values.len().min(row_to_group.len());
+    values[..n].par_iter().enumerate().for_each(|(i, &v)| {
+        let byte = valid.get(i >> 3).copied().unwrap_or(0);
+        if (byte >> (i & 7)) & 1 == 0 {
+            return;
+        }
+        let g = row_to_group[i] as usize;
+        if g >= n_groups {
+            return;
+        }
+        has_value[g].store(true, Ordering::Relaxed);
+        if v.is_nan() {
+            slots[g].store(v.to_bits(), Ordering::Relaxed);
+            return;
+        }
+        let mut old_bits = slots[g].load(Ordering::Relaxed);
+        loop {
+            let cur = f64::from_bits(old_bits);
+            if cur.is_nan() {
+                break;
+            }
+            // v is non-NaN (checked above) and cur is non-NaN (checked here).
+            if v <= cur {
+                break;
+            }
+            match slots[g].compare_exchange_weak(
+                old_bits,
+                v.to_bits(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(latest) => old_bits = latest,
+            }
+        }
+    });
+    let vals: Vec<f64> = slots
+        .into_iter()
+        .map(|a| f64::from_bits(a.into_inner()))
+        .collect();
+    let valid_out: Vec<bool> = has_value.into_iter().map(|a| a.into_inner()).collect();
+    (vals, valid_out)
+}
+
+/// Count of non-null rows per group (CPU path).
+pub fn aggregate_count_cpu(valid: &[u8], row_to_group: &[u32], n_groups: usize) -> Vec<u64> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let n = row_to_group.len();
+    let slots: Vec<AtomicU64> = (0..n_groups).map(|_| AtomicU64::new(0)).collect();
+    (0..n).into_par_iter().for_each(|i| {
+        let byte = valid.get(i >> 3).copied().unwrap_or(0);
+        if (byte >> (i & 7)) & 1 == 0 {
+            return;
+        }
+        let g = row_to_group[i] as usize;
+        if g >= n_groups {
+            return;
+        }
+        slots[g].fetch_add(1, Ordering::Relaxed);
+    });
+    slots.into_iter().map(|a| a.into_inner()).collect()
+}
+
+/// Total row count per group, ignoring validity (CPU path).
+pub fn aggregate_len_cpu(row_to_group: &[u32], n_groups: usize) -> Vec<u64> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let slots: Vec<AtomicU64> = (0..n_groups).map(|_| AtomicU64::new(0)).collect();
+    row_to_group.par_iter().for_each(|&g| {
+        let g = g as usize;
+        if g < n_groups {
+            slots[g].fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    slots.into_iter().map(|a| a.into_inner()).collect()
+}
+
+// -----------------------------------------------------------------------
+// compute_mean — host-side post-processor
+// -----------------------------------------------------------------------
+
+/// Compute per-group mean from sum + count.
+/// Returns `None` for groups where `count == 0` (empty / all-null).
+/// Polars semantic: mean of empty/all-null group is null.
+pub fn compute_mean_f64(sums: &[f64], counts: &[u64]) -> Vec<Option<f64>> {
+    sums.iter()
+        .zip(counts.iter())
+        .map(|(s, c)| {
+            if *c == 0 {
+                None
+            } else {
+                Some(*s / (*c as f64))
+            }
+        })
+        .collect()
+}
+
+/// Compute per-group mean from i64 sum + count, returning f64.
+/// Returns `None` for groups where `count == 0`.
+pub fn compute_mean_i64(sums: &[i64], counts: &[u64]) -> Vec<Option<f64>> {
+    sums.iter()
+        .zip(counts.iter())
+        .map(|(s, c)| {
+            if *c == 0 {
+                None
+            } else {
+                Some(*s as f64 / *c as f64)
+            }
+        })
+        .collect()
+}
+
+// -----------------------------------------------------------------------
+
 /// Pure-Rust reference implementation of `hash_u128` from `shaders/_groupby.metal`.
 ///
 /// Must stay byte-for-byte in sync with the MSL `hash_u128` function. Used by
