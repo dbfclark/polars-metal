@@ -216,7 +216,7 @@ def _build_groupby(plan: dict) -> Any:
 
 def _dispatch_groupby(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
     """Run the GroupBy pipeline against ``df_pydf`` and return a Polars
-    DataFrame of (groups × (keys + aggs)) computed on Metal.
+    DataFrame of (groups x (keys + aggs)) computed on Metal.
 
     Steps:
       1. Convert df_pydf → pl.DataFrame for column iteration.
@@ -299,12 +299,9 @@ def _dispatch_groupby(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
             n_this = len(data) // 8
         elif dtype_tag == "Bool":
             # Bool data is bit-packed; use n_out from a previous column if
-            # available, otherwise estimate from valid-bitmap byte count.
-            if n_out is not None:
-                n_this = n_out
-            else:
-                # Conservative upper bound — refined once we see a non-Bool col.
-                n_this = len(valid) * 8
+            # available, otherwise estimate from valid-bitmap byte count
+            # (conservative upper bound, refined once we see a non-Bool col).
+            n_this = n_out if n_out is not None else len(valid) * 8
         else:
             raise RuntimeError(f"polars_metal: unexpected dtype_tag {dtype_tag!r}")
 
