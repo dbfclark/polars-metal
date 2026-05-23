@@ -481,8 +481,7 @@ def _walk_agg_expression(
 
     if inner_cls == "Len":
         return {
-            "input_col": "",
-            "op": "Len",
+            "kind": "Length",
             "output_alias": output_alias or "len",
         }
 
@@ -523,6 +522,7 @@ def _walk_agg_expression(
         return None
 
     return {
+        "kind": "Simple",
         "input_col": str(col_name),
         "op": op,
         "output_alias": output_alias or f"{col_name}_{op.lower()}",

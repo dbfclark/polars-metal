@@ -21,7 +21,7 @@
 //! directly via PyO3 `call_method1`. `PyDataFrame.select` is a synchronous,
 //! in-place column reorder/subset that bypasses the lazy plan entirely.
 
-use crate::plan::{AggOp, MetalDtype, MetalPlanNode, PredicateAst};
+use crate::plan::{AggExpr, AggOp, BinaryOp, MetalDtype, MetalPlanNode, PredicateAst};
 use polars_metal_buffer::MetalDevice;
 use polars_metal_kernels::cmp::{
     dispatch_cmp_f64, dispatch_cmp_f64_scalar, dispatch_cmp_i64, dispatch_cmp_i64_scalar, CompareOp,
@@ -915,12 +915,35 @@ pub struct ParsedKey {
     pub dtype: MetalDtype,
 }
 
-/// One aggregation descriptor from the wire plan.
-#[derive(Debug)]
-pub struct ParsedAgg {
-    pub input_col: String,
-    pub op: AggOp,
-    pub output_alias: String,
+/// One aggregation descriptor from the wire plan. Mirrors the
+/// [`crate::plan::AggSpec`] enum (Simple / Expression / Length).
+#[derive(Debug, Clone)]
+pub enum ParsedAgg {
+    Simple {
+        input_col: String,
+        op: AggOp,
+        output_alias: String,
+    },
+    Expression {
+        expr: AggExpr,
+        op: AggOp,
+        output_alias: String,
+    },
+    Length {
+        output_alias: String,
+    },
+}
+
+impl ParsedAgg {
+    /// Convenience: the output alias regardless of variant. Every variant
+    /// carries one; dispatch reads this for result-column naming.
+    pub fn output_alias(&self) -> &str {
+        match self {
+            ParsedAgg::Simple { output_alias, .. }
+            | ParsedAgg::Expression { output_alias, .. }
+            | ParsedAgg::Length { output_alias } => output_alias,
+        }
+    }
 }
 
 /// Errors produced while parsing the Python groupby plan dict.
@@ -994,31 +1017,78 @@ pub fn parse_groupby_plan(plan: &Bound<PyDict>) -> Result<ParsedGroupByPlan, Gro
         let entry: Bound<PyDict> = item
             .downcast_into()
             .map_err(|_| GroupByParseError::WrongType("agg entry"))?;
-        // input_col is empty string for Len; default to empty if absent.
-        let input_col: String = entry
-            .get_item("input_col")
+
+        // Backwards-compatible read: missing "kind" means M2-shape Simple/Length
+        // (the existing wire format). Explicit "kind" means M3-shape; the
+        // "Expression" arm requires an "expr" sub-dict whose parser lands
+        // in Task 9 (Phase 2 Task 8 leaves it as a stub error).
+        let kind: String = entry
+            .get_item("kind")
             .ok()
             .flatten()
             .and_then(|v| v.extract().ok())
-            .unwrap_or_default();
-        let op_str: String = entry
-            .get_item("op")
-            .ok()
-            .flatten()
-            .and_then(|v| v.extract().ok())
-            .ok_or(GroupByParseError::WrongType("op"))?;
-        let op = AggOp::from_wire(&op_str).ok_or(GroupByParseError::UnknownOp(op_str))?;
+            .unwrap_or_else(|| {
+                // Legacy shape: infer Length from op=="Len", Simple otherwise.
+                let op_str: String = entry
+                    .get_item("op")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.extract().ok())
+                    .unwrap_or_default();
+                if op_str == "Len" {
+                    "Length".into()
+                } else {
+                    "Simple".into()
+                }
+            });
+
         let output_alias: String = entry
             .get_item("output_alias")
             .ok()
             .flatten()
             .and_then(|v| v.extract().ok())
             .ok_or(GroupByParseError::WrongType("output_alias"))?;
-        aggs.push(ParsedAgg {
-            input_col,
-            op,
-            output_alias,
-        });
+
+        let parsed = match kind.as_str() {
+            "Length" => ParsedAgg::Length { output_alias },
+            "Simple" => {
+                // input_col is empty string for Len legacy; default empty if absent.
+                let input_col: String = entry
+                    .get_item("input_col")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.extract().ok())
+                    .unwrap_or_default();
+                let op_str: String = entry
+                    .get_item("op")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.extract().ok())
+                    .ok_or(GroupByParseError::WrongType("op"))?;
+                let op = AggOp::from_wire(&op_str).ok_or(GroupByParseError::UnknownOp(op_str))?;
+                ParsedAgg::Simple {
+                    input_col,
+                    op,
+                    output_alias,
+                }
+            }
+            "Expression" => {
+                // Expression-shape parser lands in Task 9 (recursive AggExpr
+                // dict reader). Task 8 leaves a stub that returns an error
+                // so callers can detect it without a panic. The router's
+                // Task 10 gate prevents this branch from ever firing at
+                // runtime once the walker emits Expression specs.
+                let _ = BinaryOp::Add; // keep BinaryOp import live for T9
+                let _ = AggExpr::Column(String::new()); // ditto AggExpr
+                return Err(GroupByParseError::WrongType(
+                    "AggSpec::Expression parsing not implemented until Task 9",
+                ));
+            }
+            other => {
+                return Err(GroupByParseError::UnknownOp(format!("kind={other}")));
+            }
+        };
+        aggs.push(parsed);
     }
 
     Ok(ParsedGroupByPlan { keys, aggs })
@@ -1569,54 +1639,74 @@ pub fn execute_groupby<'py>(
 
     let mut agg_byte_refs: Vec<Option<AggByteRef<'_>>> = Vec::with_capacity(parsed.aggs.len());
     for agg in &parsed.aggs {
-        if matches!(agg.op, AggOp::Len) {
-            agg_byte_refs.push(None);
-            continue;
+        match agg {
+            ParsedAgg::Length { .. } => {
+                agg_byte_refs.push(None);
+            }
+            ParsedAgg::Simple { input_col, .. } => {
+                let (dtype_tag, data_py, valid_py) = by_name.get(input_col).ok_or_else(|| {
+                    PyKeyError::new_err(format!(
+                        "polars_metal: agg input column {input_col:?} not found in upstream columns"
+                    ))
+                })?;
+                agg_byte_refs.push(Some((
+                    data_py.as_bytes(),
+                    valid_py.as_bytes(),
+                    dtype_tag.clone(),
+                )));
+            }
+            ParsedAgg::Expression { .. } => {
+                // Phase 3 wires the fused-kernel consumer; the Task 10
+                // router gate ensures we never reach here at runtime.
+                // Defensively reject if we do.
+                return Err(PyValueError::new_err(
+                    "polars_metal: AggSpec::Expression dispatch awaits Phase 3 fused-kernel consumer",
+                ));
+            }
         }
-        let (dtype_tag, data_py, valid_py) = by_name.get(&agg.input_col).ok_or_else(|| {
-            PyKeyError::new_err(format!(
-                "polars_metal: agg input column {:?} not found in upstream columns",
-                agg.input_col
-            ))
-        })?;
-        agg_byte_refs.push(Some((
-            data_py.as_bytes(),
-            valid_py.as_bytes(),
-            dtype_tag.clone(),
-        )));
     }
 
     let mut agg_specs: Vec<(AggRequest, ValueColumn<'_>)> = Vec::with_capacity(parsed.aggs.len());
     for (i, agg) in parsed.aggs.iter().enumerate() {
-        if matches!(agg.op, AggOp::Len) {
-            agg_specs.push((
-                AggRequest {
-                    kind: AggKind::Len,
-                    input_col_idx: i,
-                },
-                ValueColumn::I64 {
-                    data: empty_i64,
-                    valid: empty_valid,
-                },
-            ));
-            continue;
+        match agg {
+            ParsedAgg::Length { .. } => {
+                agg_specs.push((
+                    AggRequest {
+                        kind: AggKind::Len,
+                        input_col_idx: i,
+                    },
+                    ValueColumn::I64 {
+                        data: empty_i64,
+                        valid: empty_valid,
+                    },
+                ));
+            }
+            ParsedAgg::Simple { op, .. } => {
+                // This entry was populated in the previous loop (Length was already
+                // handled via the matching arm), so `None` here is a logic bug
+                // rather than a runtime condition — surface it as an internal error.
+                let (data, valid, dtype_tag) = agg_byte_refs[i].as_ref().ok_or_else(|| {
+                    PyValueError::new_err(
+                        "polars_metal: internal error: missing agg byte ref for Simple agg",
+                    )
+                })?;
+                let (kind, vcol) = build_agg_kind_and_vcol(*op, dtype_tag, data, valid, n_rows)?;
+                agg_specs.push((
+                    AggRequest {
+                        kind,
+                        input_col_idx: i,
+                    },
+                    vcol,
+                ));
+            }
+            ParsedAgg::Expression { .. } => {
+                // Same defence-in-depth as the byte-ref pass; router gate
+                // (Task 10) prevents reaching here at runtime.
+                return Err(PyValueError::new_err(
+                    "polars_metal: AggSpec::Expression dispatch awaits Phase 3 fused-kernel consumer",
+                ));
+            }
         }
-        // This entry was populated in the previous loop (Len was already
-        // handled via `continue`), so `None` here is a logic bug rather than
-        // a runtime condition — surface it as an internal error.
-        let (data, valid, dtype_tag) = agg_byte_refs[i].as_ref().ok_or_else(|| {
-            PyValueError::new_err(
-                "polars_metal: internal error: missing agg byte ref for non-Len agg",
-            )
-        })?;
-        let (kind, vcol) = build_agg_kind_and_vcol(agg.op, dtype_tag, data, valid, n_rows)?;
-        agg_specs.push((
-            AggRequest {
-                kind,
-                input_col_idx: i,
-            },
-            vcol,
-        ));
     }
 
     // 5. Acquire device + queue.
@@ -1656,7 +1746,7 @@ pub fn execute_groupby<'py>(
         let tup = PyTuple::new_bound(
             py,
             [
-                agg.output_alias.clone().into_py(py),
+                agg.output_alias().to_string().into_py(py),
                 dtype_tag.into_py(py),
                 PyBytes::new_bound(py, &data).into_py(py),
                 PyBytes::new_bound(py, &valid).into_py(py),

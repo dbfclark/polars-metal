@@ -100,18 +100,100 @@ impl AggOp {
     }
 }
 
-/// One aggregation expression in a GroupBy. `input_col` is empty for
-/// `AggOp::Len` (the kernel doesn't read a value column for row count).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AggSpec {
-    /// Column the aggregation reads. Empty string for `AggOp::Len`.
-    pub input_col: String,
-    pub op: AggOp,
-    /// Output column name in the result DataFrame. Polars users set this
-    /// via `.agg(pl.col(x).sum().alias("foo"))`; if no alias, Polars
-    /// synthesises one (e.g. `"v_sum"`). The walker fills it from the
-    /// Polars IR.
-    pub output_alias: String,
+/// Binary operations supported in inline aggregation expressions.
+/// Capability G's scope: arithmetic only; no comparison / boolean / function calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+/// Expression tree consumed by the fused aggregation kernel.
+/// Operands are columns or literals; operations are binary arithmetic.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggExpr {
+    Column(String),
+    LiteralF64(f64),
+    LiteralI64(i64),
+    Binary {
+        op: BinaryOp,
+        lhs: Box<AggExpr>,
+        rhs: Box<AggExpr>,
+    },
+}
+
+impl AggExpr {
+    /// All columns referenced anywhere in the tree, in left-to-right order,
+    /// deduplicated. Used by the kernel template engine to know which
+    /// buffers to bind.
+    pub fn referenced_columns(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        self.walk(&mut |e| {
+            if let AggExpr::Column(name) = e {
+                if !out.iter().any(|n| n == name) {
+                    out.push(name.clone());
+                }
+            }
+        });
+        out
+    }
+
+    /// Depth of the binary-expression tree. Leaves (columns / literals) have
+    /// depth 0; a `Binary { lhs, rhs, .. }` has depth `1 + max(lhs, rhs)`.
+    pub fn depth(&self) -> usize {
+        match self {
+            AggExpr::Column(_) | AggExpr::LiteralF64(_) | AggExpr::LiteralI64(_) => 0,
+            AggExpr::Binary { lhs, rhs, .. } => 1 + lhs.depth().max(rhs.depth()),
+        }
+    }
+
+    /// Apply M3's depth cap (4) to keep MSL emission bounded. Returns a
+    /// human-readable error string on violation.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.depth() > 4 {
+            return Err(format!(
+                "expression depth {} exceeds M3 cap of 4",
+                self.depth()
+            ));
+        }
+        Ok(())
+    }
+
+    fn walk<F: FnMut(&AggExpr)>(&self, f: &mut F) {
+        f(self);
+        if let AggExpr::Binary { lhs, rhs, .. } = self {
+            lhs.walk(f);
+            rhs.walk(f);
+        }
+    }
+}
+
+/// Aggregation specification. Three variants:
+/// - `Simple` — aggregate one input column (M2 shape).
+/// - `Expression` — aggregate the value of an inline binary-arithmetic
+///   expression (M3, capability G). Phase 2 lands the IR; Phase 3 supplies
+///   the fused-kernel consumer.
+/// - `Length` — `pl.len()`, counts rows per group; no input column read.
+///
+/// Output dtype is **not** carried here. The kernel layer derives it from
+/// the input column dtype(s) + op semantics at dispatch / signature time.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggSpec {
+    Simple {
+        input_col: String,
+        op: AggOp,
+        output_alias: String,
+    },
+    Expression {
+        expr: AggExpr,
+        op: AggOp,
+        output_alias: String,
+    },
+    Length {
+        output_alias: String,
+    },
 }
 
 /// Lowered IR — one variant per accepted Polars IR node type.

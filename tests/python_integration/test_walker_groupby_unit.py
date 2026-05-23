@@ -53,7 +53,9 @@ def test_groupby_single_i64_key_sum_emits_plan() -> None:
     assert plan is not None
     assert plan["kind"] == "GroupBy"
     assert plan["keys"] == [["k", "I64"]]
-    assert plan["aggs"] == [{"input_col": "v", "op": "Sum", "output_alias": "sum_v"}]
+    assert plan["aggs"] == [
+        {"kind": "Simple", "input_col": "v", "op": "Sum", "output_alias": "sum_v"}
+    ]
     assert plan["input"]["kind"] == "Scan"
 
 
@@ -64,7 +66,7 @@ def test_groupby_composite_key_two_i64_keys_emits_plan() -> None:
     assert plan is not None
     assert plan["kind"] == "GroupBy"
     assert plan["keys"] == [["a", "I64"], ["b", "I64"]]
-    assert plan["aggs"] == [{"input_col": "v", "op": "Sum", "output_alias": "s"}]
+    assert plan["aggs"] == [{"kind": "Simple", "input_col": "v", "op": "Sum", "output_alias": "s"}]
 
 
 def test_groupby_multiple_aggs_emits_all() -> None:
@@ -83,11 +85,13 @@ def test_groupby_multiple_aggs_emits_all() -> None:
     )
     assert fallback is None, f"unexpected fallback: {fallback}"
     assert plan is not None
-    ops_seen = [a["op"] for a in plan["aggs"]]
+    # Simple specs carry "op"; Length specs do not (their wire format is
+    # {kind: "Length", output_alias: ...}).
+    ops_seen = [a["op"] if a["kind"] == "Simple" else "Len" for a in plan["aggs"]]
     assert sorted(ops_seen) == sorted(["Sum", "Mean", "Min", "Max", "Count", "Len"])
-    # Len has no input_col.
-    len_spec = next(a for a in plan["aggs"] if a["op"] == "Len")
-    assert len_spec["input_col"] == ""
+    # Len becomes a Length spec — no input_col, no op fields.
+    len_spec = next(a for a in plan["aggs"] if a["kind"] == "Length")
+    assert "input_col" not in len_spec
     assert len_spec["output_alias"] == "rows"
 
 
