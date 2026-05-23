@@ -1134,17 +1134,14 @@ M2 already pattern-matches `BinaryExpr` for filter predicates (`_walk_predicate`
 In `python/polars_metal/_walker.py`, alongside `_walk_agg_expression` (the function that currently returns Simple/Length dicts), add:
 
 ```python
-# Polars' BinaryExpr op names. Mirrors the table M2 uses for predicate
-# binary ops; agg unfolding only supports the four arithmetic ops.
-# Use the same op-name discovery that the predicate path uses (M2 keys
-# off str(op) yielding "Operator.Multiply" / "Operator.Plus" etc., or
-# a function-name attribute — match the existing pattern).
+# Polars' BinaryExpr op names — verified against py-1.40.1 (probed
+# 2026-05-23 from a real BinaryExpr inside an Agg). M2's predicate path
+# uses the same `str(op)` discovery against the `Operator` enum.
 _AGG_BINARY_OP_NAMES: dict[str, str] = {
-    "Operator.Multiply": "Mul",
-    "Operator.Plus":     "Add",
-    "Operator.Minus":    "Sub",
-    "Operator.Divide":   "Div",
-    "Operator.TrueDivide": "Div",  # py-1.40.1 emits this for `/` on floats
+    "Operator.Multiply":   "Mul",
+    "Operator.Plus":       "Add",
+    "Operator.Minus":      "Sub",
+    "Operator.TrueDivide": "Div",  # `/` on float columns
 }
 
 _AGG_EXPR_MAX_DEPTH = 4
@@ -1206,7 +1203,7 @@ def _walk_agg_expr_node(nt, node_id, in_schema, depth):
     return None
 ```
 
-**Implementation note:** M2's predicate walker uses `str(op)` to key into a name table (see `_CMP_OP_NAMES` and `_LOGICAL_OP_NAMES`). The exact strings (`"Operator.Multiply"` etc.) need to be verified against the running py-1.40.1 — if py-1.40.1 emits something different (e.g. `"Operator.Mul"`), update `_AGG_BINARY_OP_NAMES` to match. Run `python -c "import polars as pl; e = pl.col('a') * pl.col('b'); print(...)" ` style probes if uncertain.
+**Implementation note:** the op-name table above was probed against py-1.40.1 on 2026-05-23 (see commit message for this plan patch). Confirmed BinaryExpr shapes for the four supported ops: `pl.col("a") * pl.col("b")` → `Operator.Multiply`; `pl.col("a") + 1.0` → `Operator.Plus`; `pl.col("a") - pl.col("b")` → `Operator.Minus`; `pl.col("a") / pl.col("b")` → `Operator.TrueDivide`. Nested expressions (`pl.col("a") * (1.0 - pl.col("b"))`) recurse correctly through `inner.left`/`inner.right` (each is an int node id; `nt.view_expression(id)` returns the child). Literals appear as `Literal` nodes (not `LiteralIR`).
 
 - [ ] **Step 3: Wire the Expression branch into `_walk_agg_expression`**
 
