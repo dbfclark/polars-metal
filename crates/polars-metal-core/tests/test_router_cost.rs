@@ -4,9 +4,9 @@
 // (op_kind, n_rows) → NodeDecision. The thresholds here are M2's
 // starting point per the spec § "Routing decisions (cost model)"; PRs
 // that re-tune them update both the constants and the tests.
-#![allow(clippy::expect_used)]
+#![allow(clippy::expect_used, clippy::panic)]
 
-use polars_metal_native::plan::{AggSpec, MetalDtype};
+use polars_metal_native::plan::{AggExpr, AggOp, AggSpec, BinaryOp, MetalDtype};
 use polars_metal_native::router::cost;
 use polars_metal_native::router::NodeDecision;
 
@@ -96,4 +96,58 @@ fn groupby_with_oversized_composite_key_falls_back_at_plan_time() {
             "reason should mention total bits 195: {reason}"
         );
     }
+}
+
+#[test]
+fn router_falls_back_when_any_agg_is_expression() {
+    // Phase 2 gate (Task 10): any AggSpec::Expression in the agg list
+    // must route to CPU until the Phase 3 fused-kernel consumer lands.
+    // Row count is well above GROUPBY_GPU_MIN_ROWS, key width is
+    // trivially in budget — only the Expression spec triggers fallback.
+    let keys = vec![("k".to_string(), MetalDtype::I64)];
+    let aggs = vec![
+        AggSpec::Simple {
+            input_col: "v".into(),
+            op: AggOp::Sum,
+            output_alias: "v_sum".into(),
+        },
+        AggSpec::Expression {
+            expr: AggExpr::Binary {
+                op: BinaryOp::Mul,
+                lhs: Box::new(AggExpr::Column("a".into())),
+                rhs: Box::new(AggExpr::Column("b".into())),
+            },
+            op: AggOp::Sum,
+            output_alias: "sum_ab".into(),
+        },
+    ];
+    let decision = cost::decide_groupby_with_keys(1_000_000, &keys, &aggs);
+    match decision {
+        NodeDecision::Fallback(reason) => {
+            assert!(
+                reason.contains("Expression"),
+                "expected Expression reason, got: {reason}"
+            );
+        }
+        other => panic!("expected Fallback, got: {other:?}"),
+    }
+}
+
+#[test]
+fn router_passes_when_only_simple_and_length_aggs() {
+    // Counter-test: with no Expression specs, the router still lifts
+    // GroupBy to GPU at large row counts (M2-shape queries unchanged).
+    let keys = vec![("k".to_string(), MetalDtype::I64)];
+    let aggs = vec![
+        AggSpec::Simple {
+            input_col: "v".into(),
+            op: AggOp::Sum,
+            output_alias: "v_sum".into(),
+        },
+        AggSpec::Length {
+            output_alias: "n".into(),
+        },
+    ];
+    let decision = cost::decide_groupby_with_keys(1_000_000, &keys, &aggs);
+    assert!(matches!(decision, NodeDecision::GpuLift));
 }

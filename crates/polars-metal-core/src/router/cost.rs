@@ -87,8 +87,20 @@ fn key_width_bits(dtype: MetalDtype) -> usize {
 pub fn decide_groupby_with_keys(
     n_rows: usize,
     keys: &[(String, MetalDtype)],
-    _aggs: &[AggSpec],
+    aggs: &[AggSpec],
 ) -> NodeDecision {
+    // Phase 2 gate: Expression specs require the Phase 3 fused-kernel
+    // consumer. Until that lands, fall back at plan time so callers
+    // see a deterministic CPU path rather than a runtime panic. This
+    // check fires BEFORE the key-width check so an Expression query
+    // with an oversize composite key still surfaces the Expression-
+    // specific diagnostic.
+    if aggs.iter().any(|a| matches!(a, AggSpec::Expression { .. })) {
+        return NodeDecision::Fallback(
+            "AggSpec::Expression awaiting Phase 3 fused-kernel consumer".into(),
+        );
+    }
+
     let total_bits: usize = keys.iter().map(|(_, d)| key_width_bits(*d)).sum();
     if total_bits > 128 {
         return NodeDecision::Fallback(format!(
