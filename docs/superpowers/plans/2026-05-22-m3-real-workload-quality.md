@@ -711,17 +711,31 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 
 This phase only lands the *plan-time representation* and walker rewriter. The *kernel-side consumption* lands in Phase 3.
 
-### Task 8: Define `AggExpr` IR + `AggSpec::Expression` variant
+**Plan-vs-code starting state (M2):**
+- `AggSpec` in `crates/polars-metal-core/src/plan/mod.rs` is a **struct**: `pub struct AggSpec { pub input_col: String, pub op: AggOp, pub output_alias: String }`. `AggOp::Len` is a variant of `AggOp` (input_col convention: empty string).
+- `ParsedAgg` in `crates/polars-metal-core/src/udf.rs` lines ~918–924 is the wire-format-parsed twin (same fields).
+- The dispatch hot path (`dispatch_groupby` ~lines 1572–1659 in `udf.rs`) reads `agg.input_col`, `agg.op`, `agg.output_alias` directly.
+- The walker (`python/polars_metal/_walker.py` `_walk_agg_expression`) emits `{"input_col", "op", "output_alias"}` per agg; `op=="Len"` with `input_col==""` for `pl.len()`.
+- `output_dtype` does **not** exist on AggSpec/ParsedAgg in M2; per-agg output type is computed at dispatch time from the input column's dtype + op semantics. **Phase 2 preserves this — we do not add `output_dtype` to the IR.** Phase 3's `AggSignature` will compute it from the input dtypes already carried in the kernel layer (see Phase 3 patch).
+
+Phase 2 converts `AggSpec` and `ParsedAgg` to **enums** with three variants — `Simple`, `Expression`, `Length` — and threads the change through the wire format, the parser, the dispatch loop, and the existing tests. This is the same "enum with three variants, no `output_dtype`" choice agreed for Phase 2; Phase 3 patches its own `AggSignature` to match.
+
+### Task 8: Convert `AggSpec` to enum + define `AggExpr` IR
 
 **Files:**
-- Modify: `crates/polars-metal-core/src/plan/mod.rs`
-- Create: `crates/polars-metal-core/tests/test_agg_expr.rs`
+- Modify: `crates/polars-metal-core/src/plan/mod.rs` — add `BinaryOp`/`AggExpr`, convert `AggSpec` struct → enum
+- Modify: `crates/polars-metal-core/src/udf.rs` — convert `ParsedAgg` struct → enum, update `parse_groupby_plan` to dispatch on `"kind"`, update `dispatch_groupby` field accesses to match arms
+- Modify: `crates/polars-metal-core/tests/test_plan_groupby.rs` — existing struct-literal `AggSpec { ... }` constructions become `AggSpec::Simple { ... }` / `AggSpec::Length { ... }`
+- Modify: `python/polars_metal/_walker.py` — emit a `"kind"` discriminator on agg dicts (`"Simple"` for column inputs, `"Length"` for `op=="Len"`; `"Expression"` lands in Task 9)
+- Create: `crates/polars-metal-core/tests/test_agg_expr.rs` — new tests for the AggExpr IR
 
-- [ ] **Step 1: Write the failing test**
+**Note on `output_dtype`:** intentionally omitted from every variant. Phase 3 computes output dtype from the input column dtype (already carried in the wire format as the column's metadata) + op semantics. Do not add an `output_dtype` field even though earlier drafts of the plan included one.
+
+- [ ] **Step 1: Write the failing AggExpr test**
 
 ```rust
 // crates/polars-metal-core/tests/test_agg_expr.rs
-use polars_metal_core::plan::{AggExpr, AggOp, AggSpec, BinaryOp, MetalDtype};
+use polars_metal_native::plan::{AggExpr, AggOp, AggSpec, BinaryOp};
 
 #[test]
 fn agg_expr_column_literal_constructs() {
@@ -734,7 +748,8 @@ fn agg_expr_column_literal_constructs() {
             rhs: Box::new(AggExpr::Column("l_discount".into())),
         }),
     };
-    assert_eq!(expr.referenced_columns(), &["l_extendedprice", "l_discount"]);
+    let cols = expr.referenced_columns();
+    assert_eq!(cols, vec!["l_extendedprice".to_string(), "l_discount".to_string()]);
 }
 
 #[test]
@@ -743,7 +758,6 @@ fn agg_spec_expression_carries_op_and_alias() {
         expr: AggExpr::Column("v".into()),
         op: AggOp::Sum,
         output_alias: "sum_v".into(),
-        output_dtype: MetalDtype::F64,
     };
     match &spec {
         AggSpec::Expression { op, output_alias, .. } => {
@@ -751,6 +765,32 @@ fn agg_spec_expression_carries_op_and_alias() {
             assert_eq!(output_alias, "sum_v");
         }
         _ => panic!("expected Expression variant"),
+    }
+}
+
+#[test]
+fn agg_spec_length_carries_alias_only() {
+    let spec = AggSpec::Length { output_alias: "n".into() };
+    match &spec {
+        AggSpec::Length { output_alias } => assert_eq!(output_alias, "n"),
+        _ => panic!("expected Length variant"),
+    }
+}
+
+#[test]
+fn agg_spec_simple_carries_input_col() {
+    let spec = AggSpec::Simple {
+        input_col: "v".into(),
+        op: AggOp::Sum,
+        output_alias: "v_sum".into(),
+    };
+    match &spec {
+        AggSpec::Simple { input_col, op, output_alias } => {
+            assert_eq!(input_col, "v");
+            assert_eq!(*op, AggOp::Sum);
+            assert_eq!(output_alias, "v_sum");
+        }
+        _ => panic!("expected Simple variant"),
     }
 }
 
@@ -768,12 +808,32 @@ fn agg_expr_depth_check_rejects_overdeep_nesting() {
     assert!(e.depth() > 4);
     assert!(matches!(e.validate(), Err(_)));
 }
+
+#[test]
+fn agg_expr_depth_4_passes_validation() {
+    // depth-4 expression: ((a + b) * (c - d)) — the kind of shape Q1 needs.
+    let e = AggExpr::Binary {
+        op: BinaryOp::Mul,
+        lhs: Box::new(AggExpr::Binary {
+            op: BinaryOp::Add,
+            lhs: Box::new(AggExpr::Column("a".into())),
+            rhs: Box::new(AggExpr::Column("b".into())),
+        }),
+        rhs: Box::new(AggExpr::Binary {
+            op: BinaryOp::Sub,
+            lhs: Box::new(AggExpr::Column("c".into())),
+            rhs: Box::new(AggExpr::Column("d".into())),
+        }),
+    };
+    assert_eq!(e.depth(), 2);
+    assert!(e.validate().is_ok());
+}
 ```
 
-- [ ] **Step 2: Add the IR types**
+- [ ] **Step 2: Convert `AggSpec` to enum + add `BinaryOp`/`AggExpr`**
 
 ```rust
-// crates/polars-metal-core/src/plan/mod.rs (additions)
+// crates/polars-metal-core/src/plan/mod.rs (replaces the existing struct AggSpec)
 
 /// Binary operations supported in inline aggregation expressions.
 /// Capability G's scope: arithmetic only; no comparison / boolean / function calls.
@@ -782,7 +842,7 @@ pub enum BinaryOp { Add, Sub, Mul, Div }
 
 /// Expression tree consumed by the fused aggregation kernel.
 /// Operands are columns or literals; operations are binary arithmetic.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AggExpr {
     Column(String),
     LiteralF64(f64),
@@ -795,10 +855,10 @@ impl AggExpr {
     /// deduplicated. Used by the kernel template engine to know which
     /// buffers to bind.
     pub fn referenced_columns(&self) -> Vec<String> {
-        let mut out = Vec::new();
+        let mut out: Vec<String> = Vec::new();
         self.walk(&mut |e| {
             if let AggExpr::Column(name) = e {
-                if !out.contains(name) { out.push(name.clone()); }
+                if !out.iter().any(|n| n == name) { out.push(name.clone()); }
             }
         });
         out
@@ -827,119 +887,443 @@ impl AggExpr {
     }
 }
 
-/// Aggregation specification. M2's `AggSpec::Simple` variant is unchanged;
-/// M3 adds `Expression` for inline binary-arithmetic shapes.
-#[derive(Debug, Clone)]
+/// Aggregation specification. Three variants:
+/// - `Simple` — aggregate one input column (M2 shape).
+/// - `Expression` — aggregate the value of an inline binary-arithmetic expression (M3, capability G).
+/// - `Length` — `pl.len()`, counts rows per group; no input column read.
+///
+/// Output dtype is **not** carried here. The kernel layer derives it from
+/// the input column dtype(s) + op semantics at dispatch / signature time.
+#[derive(Debug, Clone, PartialEq)]
 pub enum AggSpec {
-    /// M2 shape: aggregate a single column directly.
     Simple {
-        input_column: String,
+        input_col: String,
         op: AggOp,
         output_alias: String,
-        output_dtype: MetalDtype,
     },
-    /// M3 shape: aggregate an inline binary-arithmetic expression.
     Expression {
         expr: AggExpr,
         op: AggOp,
         output_alias: String,
-        output_dtype: MetalDtype,
     },
-    /// pl.len() — no input column, counts rows.
-    Length { output_alias: String },
+    Length {
+        output_alias: String,
+    },
 }
 ```
 
-- [ ] **Step 3: Run test**
+**Migration:** delete the existing `pub struct AggSpec { ... }` and its doc comment. The `pub enum MetalPlanNode::GroupBy { aggs: Vec<AggSpec>, ... }` field type is unchanged (still `Vec<AggSpec>`). Replace the implementation note above the old struct with the new doc comment.
+
+- [ ] **Step 3: Convert `ParsedAgg` to enum (mirror of AggSpec) in `udf.rs`**
+
+`crates/polars-metal-core/src/udf.rs` ~lines 918–924 currently has:
+
+```rust
+pub struct ParsedAgg {
+    pub input_col: String,
+    pub op: AggOp,
+    pub output_alias: String,
+}
+```
+
+Replace with an enum that mirrors `AggSpec`:
+
+```rust
+#[derive(Debug, Clone)]
+pub enum ParsedAgg {
+    Simple { input_col: String, op: AggOp, output_alias: String },
+    Expression { expr: AggExpr, op: AggOp, output_alias: String },
+    Length { output_alias: String },
+}
+
+impl ParsedAgg {
+    /// Convenience: the output alias regardless of variant (every variant
+    /// has one; dispatch reads this for result-column naming).
+    pub fn output_alias(&self) -> &str {
+        match self {
+            ParsedAgg::Simple { output_alias, .. }
+            | ParsedAgg::Expression { output_alias, .. }
+            | ParsedAgg::Length { output_alias } => output_alias,
+        }
+    }
+}
+```
+
+Add `AggExpr` to the `use crate::plan::{...}` import at the top of `udf.rs` (it already imports `AggOp`, `MetalDtype`, `AggSpec`).
+
+- [ ] **Step 4: Update `parse_groupby_plan` to dispatch on `"kind"`**
+
+In `udf.rs` ~lines 992–1022, the loop that reads each agg dict currently extracts `input_col`/`op`/`output_alias` directly. Rewrite it to read an optional `"kind"` discriminator and dispatch:
+
+```rust
+// Inside the `for item in aggs_list.iter()` loop (replaces the body):
+let entry: Bound<PyDict> = item
+    .downcast_into()
+    .map_err(|_| GroupByParseError::WrongType("agg entry"))?;
+
+// Backwards-compatible read: missing "kind" means M2-shape Simple/Length
+// (the existing wire format). Explicit "kind" means M3-shape; "Expression"
+// requires an "expr" field whose parser lands in Task 9.
+let kind: String = entry
+    .get_item("kind")
+    .ok()
+    .flatten()
+    .and_then(|v| v.extract().ok())
+    .unwrap_or_else(|| {
+        // Legacy shape: infer from op=="Len".
+        let op_str: String = entry
+            .get_item("op").ok().flatten()
+            .and_then(|v| v.extract().ok())
+            .unwrap_or_default();
+        if op_str == "Len" { "Length".into() } else { "Simple".into() }
+    });
+
+let output_alias: String = entry
+    .get_item("output_alias").ok().flatten()
+    .and_then(|v| v.extract().ok())
+    .ok_or(GroupByParseError::WrongType("output_alias"))?;
+
+let parsed = match kind.as_str() {
+    "Length" => ParsedAgg::Length { output_alias },
+    "Simple" => {
+        let input_col: String = entry
+            .get_item("input_col").ok().flatten()
+            .and_then(|v| v.extract().ok())
+            .unwrap_or_default();
+        let op_str: String = entry
+            .get_item("op").ok().flatten()
+            .and_then(|v| v.extract().ok())
+            .ok_or(GroupByParseError::WrongType("op"))?;
+        let op = AggOp::from_wire(&op_str).ok_or(GroupByParseError::UnknownOp(op_str))?;
+        ParsedAgg::Simple { input_col, op, output_alias }
+    }
+    "Expression" => {
+        // Expression-shape parser lands in Task 9; Phase 2 Task 8 leaves a stub
+        // that returns an error so callers can detect it without a panic.
+        return Err(GroupByParseError::WrongType(
+            "AggSpec::Expression parsing not implemented until Task 9",
+        ));
+    }
+    other => return Err(GroupByParseError::UnknownOp(format!("kind={other}"))),
+};
+aggs.push(parsed);
+```
+
+Task 9 fills in the `"Expression"` arm (parses the `expr` sub-tree from the dict).
+
+- [ ] **Step 5: Update `dispatch_groupby` field accesses in `udf.rs`**
+
+Around lines 1572–1659, the dispatch loop reads `agg.op`, `agg.input_col`, `agg.output_alias` directly on the old `ParsedAgg` struct. Convert to a `match` per agg. The current logic — early-exit for `Len`, otherwise look up `by_name.get(&agg.input_col)`, build a kind+vcol, push the operation — becomes:
+
+```rust
+// Inside the for-loop over `aggs`:
+let (op, output_alias, input_col_opt) = match agg {
+    ParsedAgg::Length { output_alias } => {
+        // Len path: no value column read.
+        ops.push(AggregateOp {
+            kind: AggregateKind::Len,
+            input_col_idx: i,
+            output_alias: output_alias.clone(),
+        });
+        continue;
+    }
+    ParsedAgg::Simple { input_col, op, output_alias } => {
+        (*op, output_alias.clone(), Some(input_col.as_str()))
+    }
+    ParsedAgg::Expression { .. } => {
+        // Phase 3 wires this branch; Phase 2's router gate (Task 10) ensures
+        // we never reach here at runtime — but defensively reject if we do.
+        return Err(/* polars-error; mirror the surrounding error style */
+            polars_error::polars_err!(
+                ComputeError: "AggSpec::Expression dispatch awaits Phase 3 fused-kernel consumer"
+            ));
+    }
+};
+let input_col = input_col_opt.expect("Simple variant always has input_col");
+// ... rest of M2's existing logic (look up dtype/data/valid, build kind+vcol,
+// push the op into `ops`) goes here unchanged ...
+```
+
+The exact error-construction pattern (`polars_err!` vs. the local error type) — match what the rest of `dispatch_groupby` returns. If unsure, grep nearby for `return Err(` to see the established style.
+
+- [ ] **Step 6: Update existing tests in `test_plan_groupby.rs`**
+
+`crates/polars-metal-core/tests/test_plan_groupby.rs` currently has ~7 `AggSpec { input_col: ..., op: ..., output_alias: ... }` struct literals. Convert each:
+
+- `AggSpec { input_col: "v".into(), op: AggOp::Sum, output_alias: "v_sum".into() }`
+  → `AggSpec::Simple { input_col: "v".into(), op: AggOp::Sum, output_alias: "v_sum".into() }`
+- Literals where `op == AggOp::Len` and `input_col == ""`:
+  → `AggSpec::Length { output_alias: "n".into() }`
+
+No semantic change; pure mechanical rewrite. Run `cargo test -p polars-metal-core --test test_plan_groupby -- --test-threads=1` and confirm all pre-existing tests still pass.
+
+- [ ] **Step 7: Update walker emit to include `"kind"` discriminator**
+
+In `python/polars_metal/_walker.py` `_walk_agg_expression` (~line 447), the function currently returns dicts like `{"input_col": "...", "op": "...", "output_alias": "..."}`. Add a `"kind"` key on both successful return paths:
+
+```python
+# Len branch (~line 482-487):
+return {
+    "kind": "Length",
+    "output_alias": output_alias or "len",
+}
+
+# Simple branch (~line 525-529):
+return {
+    "kind": "Simple",
+    "input_col": str(col_name),
+    "op": op,
+    "output_alias": output_alias or f"{col_name}_{op.lower()}",
+}
+```
+
+The `"input_col"` and `"op"` fields are dropped from the Length branch (the parser no longer reads them for Length). Task 9 adds the `"Expression"` branch.
+
+- [ ] **Step 8: Run the suite**
 
 ```bash
 cargo test -p polars-metal-core --test test_agg_expr -- --test-threads=1
+cargo test -p polars-metal-core --test test_plan_groupby -- --test-threads=1
+cargo test -p polars-metal-core --test test_router_cost -- --test-threads=1
+make wheel
+pytest tests/python_integration/ -k "groupby" -v
 ```
 
-Expected: 3 passes.
+Expected:
+- `test_agg_expr` — 6 passes (new file).
+- `test_plan_groupby` — same pre-existing tests pass (struct literals migrated).
+- `test_router_cost` — unchanged; `Vec<AggSpec>::new()` is variant-agnostic.
+- Existing Python groupby integration tests — unchanged behavior (walker emits `kind` discriminator; parser handles both old and new shapes; dispatch unaffected for Simple/Length).
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add crates/polars-metal-core/src/plan/mod.rs crates/polars-metal-core/tests/test_agg_expr.rs
-git commit -m "Plan: AggExpr IR + AggSpec::Expression variant
+git add crates/polars-metal-core/src/plan/mod.rs \
+        crates/polars-metal-core/src/udf.rs \
+        crates/polars-metal-core/tests/test_agg_expr.rs \
+        crates/polars-metal-core/tests/test_plan_groupby.rs \
+        python/polars_metal/_walker.py
+git commit -m "Plan: AggSpec → enum + AggExpr IR (no output_dtype)
 
-Capability G. Binary arithmetic expressions (Add/Sub/Mul/Div) over
-column/literal operands. Depth capped at 4 to bound MSL emission.
+Capability G — IR layer. Three variants: Simple (M2 shape), Expression
+(M3, populated in Task 9), Length (was AggOp::Len with empty input_col).
+ParsedAgg mirrors the enum. Wire format gains a 'kind' discriminator;
+parser is backwards-compatible (missing kind → infer Simple/Length).
+output_dtype omitted by design — kernel layer derives it.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ```
 
-### Task 9: Walker — pattern-match `Agg(BinaryExpr(...))` and emit `AggSpec::Expression`
+### Task 9: Walker — pattern-match `Agg(BinaryExpr(...))` and emit `kind: "Expression"`
 
 **Files:**
 - Modify: `python/polars_metal/_walker.py`
+- Modify: `crates/polars-metal-core/src/udf.rs` (fill in the `"Expression"` arm of `parse_groupby_plan` left as a stub in Task 8)
 - Create: `tests/python_integration/test_walker_expression_unfolding.py`
 
-- [ ] **Step 1: Find the existing agg-extraction code**
+- [ ] **Step 1: Find M2's verified attribute names**
 
 ```bash
-grep -n "extract_agg\|Agg(" python/polars_metal/_walker.py
+grep -n "view_expression\|BinaryExpr\|node_id\|getattr(.*,\s*['\"](op|left|right|value)" python/polars_metal/_walker.py
 ```
 
-M2 parses `Agg` nodes assuming the input is a column reference. M3 extends this to recognize binary-expression inputs.
+M2 already pattern-matches `BinaryExpr` for filter predicates (`_walk_predicate` and friends). Reuse the same attribute access pattern there (likely `inner.left`, `inner.right`, and either `inner.op` or an `Operator` lookup table) — do **not** invent new names.
 
-- [ ] **Step 2: Implement the rewriter**
+- [ ] **Step 2: Implement the agg-expression extractor**
+
+In `python/polars_metal/_walker.py`, alongside `_walk_agg_expression` (the function that currently returns Simple/Length dicts), add:
 
 ```python
-# python/polars_metal/_walker.py (excerpt)
-_SUPPORTED_BINARY_OPS = {
-    "multiply": "Mul",
-    "plus":     "Add",
-    "minus":    "Sub",
-    "divide":   "Div",
+# Polars' BinaryExpr op names. Mirrors the table M2 uses for predicate
+# binary ops; agg unfolding only supports the four arithmetic ops.
+# Use the same op-name discovery that the predicate path uses (M2 keys
+# off str(op) yielding "Operator.Multiply" / "Operator.Plus" etc., or
+# a function-name attribute — match the existing pattern).
+_AGG_BINARY_OP_NAMES: dict[str, str] = {
+    "Operator.Multiply": "Mul",
+    "Operator.Plus":     "Add",
+    "Operator.Minus":    "Sub",
+    "Operator.Divide":   "Div",
+    "Operator.TrueDivide": "Div",  # py-1.40.1 emits this for `/` on floats
 }
 
-def _extract_agg_expr(node, arena, max_depth=4):
-    """Recursively convert a Polars expression node to AggExpr-shape dict.
+_AGG_EXPR_MAX_DEPTH = 4
 
-    Returns the dict on success; raises ValueError if the shape is outside
-    capability G's scope (function calls, comparisons, deeper than 4, etc.).
+
+def _walk_agg_expr_node(nt, node_id, in_schema, depth):
+    """Recursively lower one Polars expression sub-node to an AggExpr dict.
+
+    Returns the dict on success; returns None if the shape is outside
+    capability G (function calls, comparisons, deeper than _AGG_EXPR_MAX_DEPTH,
+    unsupported binary ops, unknown literal types). Returning None causes
+    the caller to fall back the whole agg.
     """
-    if max_depth < 0:
-        raise ValueError("expression too deep for AggSpec::Expression")
-    cls = type(node).__name__
-    if cls in ("Column", "ColumnIR"):  # plain column ref
-        return {"kind": "Column", "name": node.name}
-    if cls in ("Literal", "LiteralIR"):
-        val = node.value
-        if isinstance(val, float):
-            return {"kind": "LiteralF64", "value": val}
-        if isinstance(val, int):
-            return {"kind": "LiteralI64", "value": val}
-        raise ValueError(f"unsupported literal type {type(val).__name__}")
-    if cls in ("BinaryExpr", "BinaryExprIR"):
-        op_name = getattr(node, "op", None) or getattr(node, "function_name", None)
-        if op_name not in _SUPPORTED_BINARY_OPS:
-            raise ValueError(f"unsupported binary op {op_name!r}")
-        lhs = _extract_agg_expr(_resolve(node.left, arena), arena, max_depth - 1)
-        rhs = _extract_agg_expr(_resolve(node.right, arena), arena, max_depth - 1)
-        return {"kind": "Binary", "op": _SUPPORTED_BINARY_OPS[op_name], "lhs": lhs, "rhs": rhs}
-    raise ValueError(f"unsupported expression node {cls}")
-
-
-def _extract_agg_spec(agg_node, arena):
-    """Try simple-column first; fall back to expression-shape."""
-    expr_node = _resolve(agg_node.arguments[0], arena)
-    expr_cls = type(expr_node).__name__
-    if expr_cls in ("Column", "ColumnIR"):
-        return {"kind": "Simple", "input": expr_node.name, ...}
-    try:
-        expr_dict = _extract_agg_expr(expr_node, arena)
-    except ValueError as e:
-        # Falls back: walker returns None → Fallback at router
+    if depth < 0:
         return None
-    return {"kind": "Expression", "expr": expr_dict, ...}
+    try:
+        node = nt.view_expression(node_id)
+    except Exception:
+        return None
+    cls = type(node).__name__
+
+    if cls == "Column":
+        col_name = getattr(node, "name", None)
+        if col_name is None:
+            return None
+        # Validate the column exists in input schema (same check as Simple path).
+        if in_schema.get(str(col_name)) is None:
+            return None
+        return {"kind": "Column", "name": str(col_name)}
+
+    if cls == "Literal":
+        val = getattr(node, "value", None)
+        if isinstance(val, bool):  # bool is a subclass of int; reject explicitly
+            return None
+        if isinstance(val, float):
+            return {"kind": "LiteralF64", "value": float(val)}
+        if isinstance(val, int):
+            return {"kind": "LiteralI64", "value": int(val)}
+        return None
+
+    if cls == "BinaryExpr":
+        op = getattr(node, "op", None)
+        op_key = str(op) if op is not None else ""
+        op_tag = _AGG_BINARY_OP_NAMES.get(op_key)
+        if op_tag is None:
+            return None
+        left_id = getattr(node, "left", None)
+        right_id = getattr(node, "right", None)
+        if left_id is None or right_id is None:
+            return None
+        lhs = _walk_agg_expr_node(nt, left_id, in_schema, depth - 1)
+        if lhs is None:
+            return None
+        rhs = _walk_agg_expr_node(nt, right_id, in_schema, depth - 1)
+        if rhs is None:
+            return None
+        return {"kind": "Binary", "op": op_tag, "lhs": lhs, "rhs": rhs}
+
+    return None
 ```
 
-The exact attribute names (`op`, `left`, `right`, `value`, `arguments`) need to be verified against py-1.40.1 — M2's walker has the verified pattern; reuse it.
+**Implementation note:** M2's predicate walker uses `str(op)` to key into a name table (see `_CMP_OP_NAMES` and `_LOGICAL_OP_NAMES`). The exact strings (`"Operator.Multiply"` etc.) need to be verified against the running py-1.40.1 — if py-1.40.1 emits something different (e.g. `"Operator.Mul"`), update `_AGG_BINARY_OP_NAMES` to match. Run `python -c "import polars as pl; e = pl.col('a') * pl.col('b'); print(...)" ` style probes if uncertain.
 
-- [ ] **Step 3: Add the integration test**
+- [ ] **Step 3: Wire the Expression branch into `_walk_agg_expression`**
+
+The existing `_walk_agg_expression` function (the one that returns Simple/Length dicts) currently bails out (`return None`) for any non-`Column` inner expression. Extend it: when the inner expression is `BinaryExpr` (and the outer `Agg` `name` is one of the supported ops Sum/Mean/Count/Min/Max — `Len` doesn't take expressions), try the expression extractor:
+
+```python
+# In _walk_agg_expression, after the existing Column branch (~line 511-513) fails,
+# before the final `return None`:
+if inner_cls in ("BinaryExpr",):
+    expr_dict = _walk_agg_expr_node(nt, arg_id, in_schema, _AGG_EXPR_MAX_DEPTH)
+    if expr_dict is None:
+        return None
+    # Synthesize a default alias if the user didn't provide one. Polars'
+    # default for `(a * b).sum()` is something like "a", but we can't
+    # rely on that — fall back to a stable synthesised name.
+    return {
+        "kind": "Expression",
+        "expr": expr_dict,
+        "op": op,
+        "output_alias": output_alias or f"expr_{op.lower()}",
+    }
+```
+
+The Simple branch's existing `return {...}` dict gains `"kind": "Simple"` (added in Task 8 Step 7). The Length branch already has `"kind": "Length"` (Task 8 Step 7). The new branch above adds `"kind": "Expression"`.
+
+- [ ] **Step 4: Fill in the `"Expression"` arm of `parse_groupby_plan` in `udf.rs`**
+
+Task 8 left this arm returning `WrongType`. Replace with a recursive parser that consumes the `"expr"` sub-dict the walker emits:
+
+```rust
+// crates/polars-metal-core/src/udf.rs — extend the imports at top:
+use crate::plan::{AggExpr, AggOp, AggSpec, BinaryOp, MetalDtype};
+
+// Helper: recursively parse an AggExpr dict.
+fn parse_agg_expr_dict(d: &Bound<PyDict>) -> Result<AggExpr, GroupByParseError> {
+    let kind: String = d
+        .get_item("kind").ok().flatten()
+        .and_then(|v| v.extract().ok())
+        .ok_or(GroupByParseError::WrongType("expr.kind"))?;
+    match kind.as_str() {
+        "Column" => {
+            let name: String = d
+                .get_item("name").ok().flatten()
+                .and_then(|v| v.extract().ok())
+                .ok_or(GroupByParseError::WrongType("expr.name"))?;
+            Ok(AggExpr::Column(name))
+        }
+        "LiteralF64" => {
+            let v: f64 = d
+                .get_item("value").ok().flatten()
+                .and_then(|v| v.extract().ok())
+                .ok_or(GroupByParseError::WrongType("expr.value(f64)"))?;
+            Ok(AggExpr::LiteralF64(v))
+        }
+        "LiteralI64" => {
+            let v: i64 = d
+                .get_item("value").ok().flatten()
+                .and_then(|v| v.extract().ok())
+                .ok_or(GroupByParseError::WrongType("expr.value(i64)"))?;
+            Ok(AggExpr::LiteralI64(v))
+        }
+        "Binary" => {
+            let op_str: String = d
+                .get_item("op").ok().flatten()
+                .and_then(|v| v.extract().ok())
+                .ok_or(GroupByParseError::WrongType("expr.op"))?;
+            let op = match op_str.as_str() {
+                "Add" => BinaryOp::Add,
+                "Sub" => BinaryOp::Sub,
+                "Mul" => BinaryOp::Mul,
+                "Div" => BinaryOp::Div,
+                _ => return Err(GroupByParseError::UnknownOp(format!("binary op {op_str}"))),
+            };
+            let lhs_dict: Bound<PyDict> = d
+                .get_item("lhs").ok().flatten()
+                .ok_or(GroupByParseError::WrongType("expr.lhs"))?
+                .downcast_into()
+                .map_err(|_| GroupByParseError::WrongType("expr.lhs(dict)"))?;
+            let rhs_dict: Bound<PyDict> = d
+                .get_item("rhs").ok().flatten()
+                .ok_or(GroupByParseError::WrongType("expr.rhs"))?
+                .downcast_into()
+                .map_err(|_| GroupByParseError::WrongType("expr.rhs(dict)"))?;
+            Ok(AggExpr::Binary {
+                op,
+                lhs: Box::new(parse_agg_expr_dict(&lhs_dict)?),
+                rhs: Box::new(parse_agg_expr_dict(&rhs_dict)?),
+            })
+        }
+        other => Err(GroupByParseError::UnknownOp(format!("expr kind={other}"))),
+    }
+}
+```
+
+Then in `parse_groupby_plan`'s `"Expression"` arm (the stub from Task 8 Step 4), replace the error return with:
+
+```rust
+"Expression" => {
+    let op_str: String = entry
+        .get_item("op").ok().flatten()
+        .and_then(|v| v.extract().ok())
+        .ok_or(GroupByParseError::WrongType("op"))?;
+    let op = AggOp::from_wire(&op_str).ok_or(GroupByParseError::UnknownOp(op_str))?;
+    let expr_dict: Bound<PyDict> = entry
+        .get_item("expr").ok().flatten()
+        .ok_or(GroupByParseError::WrongType("expr"))?
+        .downcast_into()
+        .map_err(|_| GroupByParseError::WrongType("expr(dict)"))?;
+    let expr = parse_agg_expr_dict(&expr_dict)?;
+    // Apply the same depth cap as the IR; defence-in-depth in case the
+    // walker emits something deeper than _AGG_EXPR_MAX_DEPTH.
+    expr.validate().map_err(|_| GroupByParseError::WrongType("expr(too deep)"))?;
+    ParsedAgg::Expression { expr, op, output_alias }
+}
+```
+
+- [ ] **Step 5: Add the integration test**
 
 ```python
 # tests/python_integration/test_walker_expression_unfolding.py
@@ -1002,24 +1386,28 @@ def test_depth_5_falls_back():
     assert_frame_equal(cpu, metal)
 ```
 
-- [ ] **Step 4: Build + run**
+- [ ] **Step 6: Build + run**
 
 ```bash
 make wheel
 pytest tests/python_integration/test_walker_expression_unfolding.py -v
 ```
 
-Expected: 4 passes. (The kernel-side consumption is Phase 3; at this point, Expression specs may still route as Fallback. Tests must still pass via CPU fallback.)
+Expected: 4 passes. (The kernel-side consumption is Phase 3; at this point, `AggSpec::Expression` may still route as Fallback per Task 10's gate. Tests must still pass via CPU fallback.)
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add python/polars_metal/_walker.py tests/python_integration/test_walker_expression_unfolding.py
-git commit -m "Walker: extract binary expressions inside .agg() as AggSpec::Expression
+git add python/polars_metal/_walker.py \
+        crates/polars-metal-core/src/udf.rs \
+        tests/python_integration/test_walker_expression_unfolding.py
+git commit -m "Walker + udf: extract binary expressions inside .agg() as Expression specs
 
-Capability G — Python side. Pattern-matches BinaryExpr(Add/Sub/Mul/Div)
-recursively up to depth 4. Unsupported shapes return None → router
-falls back. Kernel-side consumption lands in Phase 3.
+Capability G — Python + wire-format side. Walker pattern-matches
+BinaryExpr(Mul/Add/Sub/Div) recursively up to depth 4; emits
+{kind: 'Expression', expr: {...}, op, output_alias}. udf.rs parses
+the expr sub-tree into AggExpr. Unsupported shapes return None →
+router falls back. Kernel-side consumption lands in Phase 3.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ```
@@ -1028,40 +1416,106 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `crates/polars-metal-core/src/router/cost.rs`
+- Modify: `crates/polars-metal-core/tests/test_router_cost.rs` (add a test that proves the gate fires)
 
-- [ ] **Step 1: Add a temporary gate**
+- [ ] **Step 1: Add a temporary gate in `decide_groupby_with_keys`**
 
-Until Phase 3's fused-kernel template can consume `AggSpec::Expression`, the router falls back when any agg in a GroupBy spec is `Expression`. This is the safe path: walker emits Expression specs, router rejects them, query goes CPU.
+`decide_groupby_with_keys(n_rows, keys, _aggs)` already accepts an `_aggs: &[AggSpec]` parameter (currently unused — leading underscore). Rename to `aggs` and add a pre-check that fails any GroupBy whose agg list contains an Expression variant:
 
 ```rust
-// In the function that decides GroupBy routing (M2 named it decide_groupby):
-for agg in &spec.aggs {
-    if matches!(agg, AggSpec::Expression { .. }) {
-        return Decision::Fallback(
-            "AggSpec::Expression awaiting Phase 3 fused-kernel consumer".into()
+// crates/polars-metal-core/src/router/cost.rs
+
+pub fn decide_groupby_with_keys(
+    n_rows: usize,
+    keys: &[(String, MetalDtype)],
+    aggs: &[AggSpec],
+) -> NodeDecision {
+    // Phase 2 gate: Expression specs require the Phase 3 fused-kernel
+    // consumer. Until that lands, fall back at plan time so callers
+    // see a deterministic CPU path rather than a runtime panic.
+    if aggs.iter().any(|a| matches!(a, AggSpec::Expression { .. })) {
+        return NodeDecision::Fallback(
+            "AggSpec::Expression awaiting Phase 3 fused-kernel consumer".into(),
         );
     }
+
+    let total_bits: usize = keys.iter().map(|(_, d)| key_width_bits(*d)).sum();
+    if total_bits > 128 {
+        return NodeDecision::Fallback(format!(
+            "composite key total {total_bits} bits; M2 supports ≤ 128"
+        ));
+    }
+    decide_groupby(n_rows)
 }
 ```
 
-- [ ] **Step 2: Run unit + integration tests**
+- [ ] **Step 2: Add a router test that proves the gate fires**
+
+In `crates/polars-metal-core/tests/test_router_cost.rs`, add (alongside the existing tests):
+
+```rust
+use polars_metal_native::plan::{AggExpr, AggOp, AggSpec, BinaryOp, MetalDtype};
+use polars_metal_native::router::cost::decide_groupby_with_keys;
+use polars_metal_native::router::NodeDecision;
+
+#[test]
+fn router_falls_back_when_any_agg_is_expression() {
+    let keys = vec![("k".to_string(), MetalDtype::I64)];
+    let aggs = vec![
+        AggSpec::Simple { input_col: "v".into(), op: AggOp::Sum, output_alias: "v_sum".into() },
+        AggSpec::Expression {
+            expr: AggExpr::Binary {
+                op: BinaryOp::Mul,
+                lhs: Box::new(AggExpr::Column("a".into())),
+                rhs: Box::new(AggExpr::Column("b".into())),
+            },
+            op: AggOp::Sum,
+            output_alias: "sum_ab".into(),
+        },
+    ];
+    let decision = decide_groupby_with_keys(1_000_000, &keys, &aggs);
+    match decision {
+        NodeDecision::Fallback(reason) => {
+            assert!(reason.contains("Expression"), "expected Expression reason, got: {reason}");
+        }
+        other => panic!("expected Fallback, got: {other:?}"),
+    }
+}
+
+#[test]
+fn router_passes_when_only_simple_and_length_aggs() {
+    let keys = vec![("k".to_string(), MetalDtype::I64)];
+    let aggs = vec![
+        AggSpec::Simple { input_col: "v".into(), op: AggOp::Sum, output_alias: "v_sum".into() },
+        AggSpec::Length { output_alias: "n".into() },
+    ];
+    let decision = decide_groupby_with_keys(1_000_000, &keys, &aggs);
+    assert!(matches!(decision, NodeDecision::GpuLift));
+}
+```
+
+Match the existing path-to-`NodeDecision` import style in the file. The exact path to `decide_groupby_with_keys` (`router::cost::...` vs. re-exported) follows whatever the existing tests in that file do.
+
+- [ ] **Step 3: Run unit + integration tests**
 
 ```bash
-cargo test -p polars-metal-core --test test_router -- --test-threads=1
+cargo test -p polars-metal-core --test test_router_cost -- --test-threads=1
+make wheel
 pytest tests/python_integration/test_walker_expression_unfolding.py -v
 ```
 
-Expected: routing tests pass (fallback decision recorded); integration tests pass via CPU fallback.
+Expected: router tests pass (new gate-firing test asserts the Fallback reason); integration tests pass — `sum(a*b)` shapes still produce correct results via CPU fallback (`assert_frame_equal` matches CPU).
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add crates/polars-metal-core/src/router/cost.rs
+git add crates/polars-metal-core/src/router/cost.rs crates/polars-metal-core/tests/test_router_cost.rs
 git commit -m "Router: Expression aggs fall back until fused-kernel consumer lands
 
-Capability G — temporary gate. Walker emits Expression specs in Phase 2;
-the router rejects them with a clear reason. Phase 3 removes this gate
-when the fused kernel can emit the inline arithmetic.
+Capability G — temporary gate. Walker emits Expression specs in Tasks 8-9;
+the router's decide_groupby_with_keys rejects them with a clear reason.
+Phase 3 removes this gate when the fused kernel can emit the inline
+arithmetic. Test asserts the Fallback fires.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ```
