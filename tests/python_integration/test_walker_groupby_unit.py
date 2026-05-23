@@ -105,8 +105,33 @@ def test_groupby_string_key_falls_back() -> None:
 
 def test_groupby_unsupported_agg_expression_falls_back() -> None:
     df = pl.DataFrame({"k": [1, 1, 2], "v": [1.0, 2.0, 3.0]})
-    # ``(pl.col("v") * 2).sum()`` has a BinaryExpr as the agg argument, not a
-    # bare Column — outside the M2 closed set.
-    plan, fallback = _capture_plan(df.lazy().group_by("k").agg((pl.col("v") * 2).sum().alias("s")))
+    # ``abs()`` is a function call (not a BinaryExpr over Add/Sub/Mul/Div),
+    # so even with M3 Phase 2's capability-G extractor it falls outside the
+    # supported closed set.
+    plan, fallback = _capture_plan(df.lazy().group_by("k").agg(pl.col("v").abs().sum().alias("s")))
     assert plan is None
     assert fallback is not None
+
+
+def test_groupby_binary_expression_agg_emits_expression_kind() -> None:
+    """``(pl.col("v") * 2).sum()`` lifts via capability G (M3 Phase 2).
+
+    The walker emits an ``Expression``-kind AggSpec containing the recursive
+    ``expr`` sub-tree, the outer ``op``, and the alias.
+    """
+    df = pl.DataFrame({"k": [1, 1, 2], "v": [1.0, 2.0, 3.0]})
+    plan, fallback = _capture_plan(df.lazy().group_by("k").agg((pl.col("v") * 2).sum().alias("s")))
+    assert fallback is None
+    assert plan is not None
+    aggs = plan["aggs"]
+    assert len(aggs) == 1
+    spec = aggs[0]
+    assert spec["kind"] == "Expression"
+    assert spec["op"] == "Sum"
+    assert spec["output_alias"] == "s"
+    expr = spec["expr"]
+    assert expr["kind"] == "Binary"
+    assert expr["op"] == "Mul"
+    assert expr["lhs"] == {"kind": "Column", "name": "v"}
+    # ``pl.col("v") * 2`` on an F64 column has its literal cast to F64.
+    assert expr["rhs"]["kind"] in ("LiteralF64", "LiteralI64")

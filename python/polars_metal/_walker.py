@@ -361,6 +361,80 @@ _AGG_NAME_TO_OP: dict[str, str] = {
 }
 
 
+# Polars' BinaryExpr op names — verified against py-1.40.1 (probed
+# 2026-05-23 from a real BinaryExpr inside an Agg). M2's predicate path
+# uses the same `str(op)` discovery against the `Operator` enum.
+_AGG_BINARY_OP_NAMES: dict[str, str] = {
+    "Operator.Multiply": "Mul",
+    "Operator.Plus": "Add",
+    "Operator.Minus": "Sub",
+    "Operator.TrueDivide": "Div",  # `/` on float columns
+}
+
+_AGG_EXPR_MAX_DEPTH = 4
+
+
+def _walk_agg_expr_node(
+    nt: Any, node_id: Any, in_schema: dict[str, Any], depth: int
+) -> dict | None:
+    """Recursively lower one Polars expression sub-node to an AggExpr dict.
+
+    Returns the dict on success; returns None if the shape is outside
+    capability G (function calls, comparisons, deeper than
+    ``_AGG_EXPR_MAX_DEPTH``, unsupported binary ops, unknown literal types,
+    columns not in the input schema). Returning None causes the caller to
+    fall back the whole agg.
+    """
+    if depth < 0:
+        return None
+    try:
+        node = nt.view_expression(node_id)
+    except Exception:
+        return None
+    cls = type(node).__name__
+
+    if cls == "Column":
+        col_name = getattr(node, "name", None)
+        if col_name is None:
+            return None
+        # Validate the column exists in input schema (same check as Simple path).
+        if in_schema.get(str(col_name)) is None:
+            return None
+        return {"kind": "Column", "name": str(col_name)}
+
+    if cls == "Literal":
+        val = getattr(node, "value", None)
+        # `bool` is a subclass of `int`; reject bool explicitly before the
+        # int branch. (Matches the predicate walker's literal handling.)
+        if isinstance(val, bool):
+            return None
+        if isinstance(val, float):
+            return {"kind": "LiteralF64", "value": float(val)}
+        if isinstance(val, int):
+            return {"kind": "LiteralI64", "value": int(val)}
+        return None
+
+    if cls == "BinaryExpr":
+        op = getattr(node, "op", None)
+        op_key = str(op) if op is not None else ""
+        op_tag = _AGG_BINARY_OP_NAMES.get(op_key)
+        if op_tag is None:
+            return None
+        left_id = getattr(node, "left", None)
+        right_id = getattr(node, "right", None)
+        if left_id is None or right_id is None:
+            return None
+        lhs = _walk_agg_expr_node(nt, left_id, in_schema, depth - 1)
+        if lhs is None:
+            return None
+        rhs = _walk_agg_expr_node(nt, right_id, in_schema, depth - 1)
+        if rhs is None:
+            return None
+        return {"kind": "Binary", "op": op_tag, "lhs": lhs, "rhs": rhs}
+
+    return None
+
+
 def _walk_group_by(nt: Any, node: Any) -> WalkResult:
     """Lower a Polars GroupBy IR node iff every key is a bare Column of an
     accepted dtype and every aggregation is in the M2 closed set.
@@ -461,11 +535,17 @@ def _walk_agg_expression(
     Accepted shapes:
     - ``Agg(name=<op>, arguments=[col_arena_id])`` where the argument resolves
       to a bare ``Column`` of a supported dtype, and ``name`` is one of the
-      entries in ``_AGG_NAME_TO_OP``.
-    - ``Len`` (no arguments) — maps to op ``"Len"`` with ``input_col=""``.
+      entries in ``_AGG_NAME_TO_OP`` — emits ``"kind": "Simple"``.
+    - ``Agg(name=<op>, arguments=[binary_expr_arena_id])`` where the argument
+      resolves to a ``BinaryExpr`` over Add/Sub/Mul/Div whose operand tree
+      bottoms out at supported ``Column``/``Literal`` leaves within the
+      depth cap — emits ``"kind": "Expression"`` with a recursive ``expr``
+      sub-dict (capability G, M3 Phase 2).
+    - ``Len`` (no arguments) — emits ``"kind": "Length"``.
 
-    Everything else (e.g. ``Agg`` with a ``BinaryExpr`` argument, unknown agg
-    names, multi-arg aggs) returns ``None`` and causes the GroupBy to fall back.
+    Everything else (unknown agg names, multi-arg aggs, function calls or
+    comparisons inside the argument, columns absent from the input schema)
+    returns ``None`` and causes the GroupBy to fall back.
     """
     node_id = getattr(agg_expr, "node", None)
     if node_id is None:
@@ -507,7 +587,26 @@ def _walk_agg_expression(
         col_expr = nt.view_expression(arg_id)
     except Exception:
         return None
-    if type(col_expr).__name__ != "Column":
+    inner_arg_cls = type(col_expr).__name__
+
+    if inner_arg_cls == "BinaryExpr":
+        # Capability G (M3 Phase 2): aggregate over an inline binary
+        # expression like ``(pl.col("a") * pl.col("b")).sum()``. Lower the
+        # sub-tree recursively; if any part of it is outside the supported
+        # closed set (function calls, comparisons, depth > cap, unknown
+        # literals, missing columns) the extractor returns None and we fall
+        # back the whole agg.
+        expr_dict = _walk_agg_expr_node(nt, arg_id, in_schema, _AGG_EXPR_MAX_DEPTH)
+        if expr_dict is None:
+            return None
+        return {
+            "kind": "Expression",
+            "expr": expr_dict,
+            "op": op,
+            "output_alias": output_alias or f"expr_{op.lower()}",
+        }
+
+    if inner_arg_cls != "Column":
         return None
     col_name = getattr(col_expr, "name", None)
     if col_name is None:

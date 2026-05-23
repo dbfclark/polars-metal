@@ -959,6 +959,92 @@ pub enum GroupByParseError {
     UnknownOp(String),
 }
 
+/// Recursively parse one `{"kind": ..., ...}` dict emitted by the Python
+/// walker's expression extractor into an [`AggExpr`].
+///
+/// The accepted shapes mirror `_walk_agg_expr_node` in `_walker.py`:
+/// - `{"kind": "Column", "name": str}` → [`AggExpr::Column`]
+/// - `{"kind": "LiteralF64", "value": float}` → [`AggExpr::LiteralF64`]
+/// - `{"kind": "LiteralI64", "value": int}` → [`AggExpr::LiteralI64`]
+/// - `{"kind": "Binary", "op": "Add"|"Sub"|"Mul"|"Div",
+///       "lhs": <expr dict>, "rhs": <expr dict>}` → [`AggExpr::Binary`]
+///
+/// Unknown kinds or unknown binary ops produce
+/// [`GroupByParseError::UnknownOp`]; missing or wrongly-typed fields
+/// produce [`GroupByParseError::WrongType`].
+fn parse_agg_expr_dict(d: &Bound<PyDict>) -> Result<AggExpr, GroupByParseError> {
+    let kind: String = d
+        .get_item("kind")
+        .ok()
+        .flatten()
+        .and_then(|v| v.extract().ok())
+        .ok_or(GroupByParseError::WrongType("expr.kind"))?;
+    match kind.as_str() {
+        "Column" => {
+            let name: String = d
+                .get_item("name")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract().ok())
+                .ok_or(GroupByParseError::WrongType("expr.name"))?;
+            Ok(AggExpr::Column(name))
+        }
+        "LiteralF64" => {
+            let v: f64 = d
+                .get_item("value")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract().ok())
+                .ok_or(GroupByParseError::WrongType("expr.value(f64)"))?;
+            Ok(AggExpr::LiteralF64(v))
+        }
+        "LiteralI64" => {
+            let v: i64 = d
+                .get_item("value")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract().ok())
+                .ok_or(GroupByParseError::WrongType("expr.value(i64)"))?;
+            Ok(AggExpr::LiteralI64(v))
+        }
+        "Binary" => {
+            let op_str: String = d
+                .get_item("op")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract().ok())
+                .ok_or(GroupByParseError::WrongType("expr.op"))?;
+            let op = match op_str.as_str() {
+                "Add" => BinaryOp::Add,
+                "Sub" => BinaryOp::Sub,
+                "Mul" => BinaryOp::Mul,
+                "Div" => BinaryOp::Div,
+                _ => return Err(GroupByParseError::UnknownOp(format!("binary op {op_str}"))),
+            };
+            let lhs_dict: Bound<PyDict> = d
+                .get_item("lhs")
+                .ok()
+                .flatten()
+                .ok_or(GroupByParseError::WrongType("expr.lhs"))?
+                .downcast_into()
+                .map_err(|_| GroupByParseError::WrongType("expr.lhs(dict)"))?;
+            let rhs_dict: Bound<PyDict> = d
+                .get_item("rhs")
+                .ok()
+                .flatten()
+                .ok_or(GroupByParseError::WrongType("expr.rhs"))?
+                .downcast_into()
+                .map_err(|_| GroupByParseError::WrongType("expr.rhs(dict)"))?;
+            Ok(AggExpr::Binary {
+                op,
+                lhs: Box::new(parse_agg_expr_dict(&lhs_dict)?),
+                rhs: Box::new(parse_agg_expr_dict(&rhs_dict)?),
+            })
+        }
+        other => Err(GroupByParseError::UnknownOp(format!("expr kind={other}"))),
+    }
+}
+
 /// Parse the `plan_dict` PyDict emitted by the Python walker into a
 /// [`ParsedGroupByPlan`]. No new Python dep required — we read the dict
 /// directly via PyO3.
@@ -1073,16 +1159,33 @@ pub fn parse_groupby_plan(plan: &Bound<PyDict>) -> Result<ParsedGroupByPlan, Gro
                 }
             }
             "Expression" => {
-                // Expression-shape parser lands in Task 9 (recursive AggExpr
-                // dict reader). Task 8 leaves a stub that returns an error
-                // so callers can detect it without a panic. The router's
-                // Task 10 gate prevents this branch from ever firing at
-                // runtime once the walker emits Expression specs.
-                let _ = BinaryOp::Add; // keep BinaryOp import live for T9
-                let _ = AggExpr::Column(String::new()); // ditto AggExpr
-                return Err(GroupByParseError::WrongType(
-                    "AggSpec::Expression parsing not implemented until Task 9",
-                ));
+                // Capability G (M3 Phase 2): the walker emits a recursive
+                // AggExpr sub-tree under `expr` plus the outer reducer (`op`)
+                // and alias. Parse the sub-tree, then re-validate the depth
+                // cap on the Rust side as defence-in-depth (the walker's
+                // `_AGG_EXPR_MAX_DEPTH` is the primary gate).
+                let op_str: String = entry
+                    .get_item("op")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.extract().ok())
+                    .ok_or(GroupByParseError::WrongType("op"))?;
+                let op = AggOp::from_wire(&op_str).ok_or(GroupByParseError::UnknownOp(op_str))?;
+                let expr_dict: Bound<PyDict> = entry
+                    .get_item("expr")
+                    .ok()
+                    .flatten()
+                    .ok_or(GroupByParseError::WrongType("expr"))?
+                    .downcast_into()
+                    .map_err(|_| GroupByParseError::WrongType("expr(dict)"))?;
+                let expr = parse_agg_expr_dict(&expr_dict)?;
+                expr.validate()
+                    .map_err(|_| GroupByParseError::WrongType("expr(too deep)"))?;
+                ParsedAgg::Expression {
+                    expr,
+                    op,
+                    output_alias,
+                }
             }
             other => {
                 return Err(GroupByParseError::UnknownOp(format!("kind={other}")));
