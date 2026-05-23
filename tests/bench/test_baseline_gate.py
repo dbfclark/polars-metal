@@ -3,6 +3,7 @@
 Runs after pytest-benchmark fixtures have updated baseline.json.
 Fails the session if any _gate-ed entry violates its threshold.
 """
+
 import json
 from pathlib import Path
 
