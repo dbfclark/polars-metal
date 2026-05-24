@@ -39,6 +39,7 @@ use thiserror::Error;
 // ---------- kernel-layer mirrors of the core IR ----------------------------
 
 /// Mirror of `polars_metal_core::plan::MetalDtype`.
+// MIRROR of polars_metal_core::plan::MetalDtype — keep in sync
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MetalDtype {
     I64,
@@ -54,6 +55,7 @@ pub enum MetalDtype {
 }
 
 /// Mirror of `polars_metal_core::plan::AggOp`.
+// MIRROR of polars_metal_core::plan::AggOp — keep in sync
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AggOp {
     Sum,
@@ -65,6 +67,7 @@ pub enum AggOp {
 }
 
 /// Mirror of `polars_metal_core::plan::BinaryOp`.
+// MIRROR of polars_metal_core::plan::BinaryOp — keep in sync
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinaryOp {
     Add,
@@ -74,6 +77,7 @@ pub enum BinaryOp {
 }
 
 /// Mirror of `polars_metal_core::plan::AggExpr`.
+// MIRROR of polars_metal_core::plan::AggExpr — keep in sync
 #[derive(Debug, Clone, PartialEq)]
 pub enum AggExpr {
     Column(String),
@@ -112,6 +116,7 @@ impl AggExpr {
 
 /// Mirror of `polars_metal_core::plan::AggSpec`. Identical variant and
 /// field names — IR callers convert by walking and rebuilding.
+// MIRROR of polars_metal_core::plan::AggSpec — keep in sync
 #[derive(Debug, Clone, PartialEq)]
 pub enum AggSpec {
     Simple {
@@ -180,16 +185,42 @@ enum CanonicalExpr {
 /// (via `AggExpr::referenced_columns()`).
 ///
 /// Aliases (`output_alias`) are dropped entirely.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// `PartialEq` / `Eq` / `Hash` deliberately exclude `column_order` — the
+/// canonical identity is `(column_dtypes, aggs)`. Two signatures whose
+/// columns differ only in name (same shape, same per-slot dtypes, same
+/// agg structure) must compare equal and hash equal; otherwise the cache
+/// key fragments per query and the whole point of slot canonicalization
+/// is lost.
+#[derive(Debug, Clone)]
 pub struct AggSignature {
     /// Original column names in first-seen order. Slot `i` ↔
     /// `column_order[i]`. The emitter (Task 12) needs the names to keep
     /// alias info available when generating MSL parameter symbols.
+    /// NOT included in `PartialEq` / `Hash` — see struct doc comment.
     column_order: Vec<String>,
     /// Per-column-slot dtype, in first-seen order.
     column_dtypes: Vec<MetalDtype>,
     /// Per-agg shape, with column references rewritten as slot indices.
     aggs: Vec<CanonicalAgg>,
+}
+
+impl PartialEq for AggSignature {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare canonical fields only; column_order is metadata for the
+        // emitter and must not affect identity.
+        self.column_dtypes == other.column_dtypes && self.aggs == other.aggs
+    }
+}
+
+impl Eq for AggSignature {}
+
+impl Hash for AggSignature {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Mirror `PartialEq`: exclude `column_order`.
+        self.column_dtypes.hash(state);
+        self.aggs.hash(state);
+    }
 }
 
 impl AggSignature {
@@ -226,17 +257,19 @@ impl AggSignature {
                     }
                 }
                 AggSpec::Expression { expr, op, .. } => {
+                    // Walk once; reuse the result for slot interning and
+                    // for output-dtype derivation below.
+                    let referenced = expr.referenced_columns();
                     // First-seen order over the expression tree.
-                    for col in expr.referenced_columns() {
-                        let dt = lookup_dtype(&col, col_dtypes)?;
-                        intern(&col, dt, &mut slots, &mut order, &mut dtypes);
+                    for col in &referenced {
+                        let dt = lookup_dtype(col, col_dtypes)?;
+                        intern(col, dt, &mut slots, &mut order, &mut dtypes);
                     }
                     // Output dtype: from the first column referenced in
                     // the expression (see module-level doc comment for
                     // the simplifying assumption).
-                    let first_col = expr.referenced_columns().into_iter().next();
-                    let output_dtype = match first_col {
-                        Some(c) => lookup_dtype(&c, col_dtypes)?,
+                    let output_dtype = match referenced.first() {
+                        Some(c) => lookup_dtype(c, col_dtypes)?,
                         // Literal-only expressions: fall back to F64. M3
                         // walker never emits this shape, but the kernel
                         // layer should still produce a deterministic key.
@@ -285,6 +318,13 @@ impl AggSignature {
     pub fn column_order(&self) -> &[String] {
         &self.column_order
     }
+
+    /// Per-slot value-column dtype, indexed by the slot indices produced by
+    /// canonicalization. Task 12's MSL emitter consumes this to emit
+    /// `device const <ty>* value_<i>` parameter types.
+    pub fn column_dtypes(&self) -> &[MetalDtype] {
+        &self.column_dtypes
+    }
 }
 
 // ---------- internal helpers ----------------------------------------------
@@ -322,11 +362,16 @@ fn intern(
 fn canon_expr(e: &AggExpr, slots: &BTreeMap<String, u16>) -> CanonicalExpr {
     match e {
         AggExpr::Column(name) => {
-            // `slots.get` is safe here — the caller populated every
-            // referenced column. If a column is somehow missing, fall
-            // back to slot `u16::MAX` (a deterministic sentinel) rather
-            // than panicking; this preserves the signature contract.
-            let slot = slots.get(name).copied().unwrap_or(u16::MAX);
+            // Callers pre-populate `slots` with every column returned by
+            // `referenced_columns()`, so this lookup is unreachable
+            // unless the contract is violated. A `debug_assert!` documents
+            // that intent; release builds fall back to slot 0, which is
+            // still deterministic for the signature contract.
+            debug_assert!(
+                slots.contains_key(name),
+                "canon_expr: slots missing column `{name}`; caller must pre-intern via referenced_columns()"
+            );
+            let slot = slots.get(name).copied().unwrap_or(0);
             CanonicalExpr::Column(slot)
         }
         AggExpr::LiteralF64(v) => CanonicalExpr::LiteralF64Bits(v.to_bits()),

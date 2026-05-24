@@ -235,6 +235,24 @@ fn signature_for_expression_includes_expr_shape() {
     assert_ne!(s_inline, s_simple);
 }
 
+#[test]
+fn signature_collapses_different_column_names_same_shape() {
+    // Headline canonicalization property: two specs with different
+    // column names but identical shape and dtype must hash to the same
+    // signature. This is the entire reason slot indices replace column
+    // names in the canonical form.
+    let a = build(
+        &[simple("price", IrAggOp::Sum, "sum_price")],
+        &[("price", IrMetalDtype::F64)],
+    );
+    let b = build(
+        &[simple("revenue", IrAggOp::Sum, "sum_revenue")],
+        &[("revenue", IrMetalDtype::F64)],
+    );
+    assert_eq!(a, b);
+    assert_eq!(a.hash64(), b.hash64());
+}
+
 // ---------- accessor sanity ------------------------------------------------
 
 #[test]
