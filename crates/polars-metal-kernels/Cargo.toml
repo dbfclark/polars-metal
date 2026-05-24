@@ -68,5 +68,9 @@ harness = false
 name = "groupby_aggregate"
 harness = false
 
+[[bench]]
+name = "aggregate_fused"
+harness = false
+
 [lints]
 workspace = true
