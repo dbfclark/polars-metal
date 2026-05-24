@@ -1525,6 +1525,43 @@ The most novel piece of M3. M2 dispatches N kernels for N aggregations. M3 emits
 
 This phase also unblocks capability G (expression unfolding), since the fused kernel is what consumes `AggSpec::Expression` inline.
 
+### Plan-vs-code reconciliation (Phase 3 starting state)
+
+Reading Phase 3 against the actual M2 + Phase 1/2 code revealed several drifts. Subagents implementing Phase 3 tasks should follow this section over any earlier-draft snippet in Tasks 11–18 where they conflict.
+
+1. **`AggSpec` field names.** Phase 2 landed `AggSpec` as an enum with these *exact* fields (see `crates/polars-metal-core/src/plan/mod.rs` lines 173–197):
+   - `AggSpec::Simple { input_col: String, op: AggOp, output_alias: String }`
+   - `AggSpec::Expression { expr: AggExpr, op: AggOp, output_alias: String }`
+   - `AggSpec::Length { output_alias: String }`
+
+   Plan snippets that say `input_column` / `output_dtype` are wrong; use `input_col` and **do not add `output_dtype`** to the IR (intentionally omitted in Phase 2 — kernel layer derives it).
+
+2. **Dtype threading.** Because `AggSpec` carries no dtype, the kernel layer must receive it externally. `AggSignature::from_specs(specs: &[AggSpec], col_dtypes: &BTreeMap<String, MetalDtype>) -> Self`. The signature builder canonicalizes column names to slot indices using `col_dtypes` for the per-slot dtype list. Callers build `col_dtypes` from the kernel-layer `ValueColumn` (which is already typed) at dispatch time. For `AggSpec::Length`, no column lookup is needed.
+
+3. **Runtime MSL compilation.** The current `crates/polars-metal-kernels/src/shader_lib.rs` only loads a *pre-compiled* metallib embedded via `build.rs`. Phase 3 requires **runtime MSL source compilation** (one library per signature). Add a single helper to `MetalDevice` (or `ShaderLibrary`) that wraps `MTLDevice::newLibraryWithSource:options:error:`:
+
+   ```rust
+   // crates/polars-metal-buffer/src/device.rs (add to impl MetalDevice)
+   pub fn new_library_from_source(&self, source: &str) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, BufferError> { … }
+   pub fn pipeline_for_entry_point(&self, library: &ProtocolObject<dyn MTLLibrary>, entry_point: &str)
+       -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BufferError> { … }
+   ```
+   These are the only new public APIs needed on `MetalDevice` for Phase 3. They use `objc2-metal`'s `newLibraryWithSource_options_error` (already in the workspace via `objc2-metal = "0.2"`).
+
+4. **`FusedLibraryCache` value type.** Plan snippet says `Arc<ComputePipeline>` where `ComputePipeline` is exported from `polars-metal-buffer`. That type does not exist. Use the actual `Retained<ProtocolObject<dyn MTLComputePipelineState>>` (the same type `ShaderLibrary::pipeline` returns). Wrap with `Arc<…>` if multi-clone sharing is needed, or just `Retained` since it's reference-counted internally.
+
+5. **`dispatch_groupby` is the wiring point.** M2's actual entry is `dispatch_groupby(device, queue, key_cols, agg_specs: &[(AggRequest, ValueColumn<'_>)], n_rows)` in `crates/polars-metal-kernels/src/groupby.rs` ~line 1790. The per-agg loop is at lines 1827–1837 (`for (req, vcol) in agg_specs { run_one_agg(...) }`). Task 15 replaces *this* loop with a single fused call. The kernel layer receives kernel-layer types (`AggRequest`, `ValueColumn`), not IR `AggSpec` — so the fused entry must take a slice of kernel-layer descriptors. Define a small `FusedAggDescriptor` enum at the kernel layer that mirrors `AggSpec` but with dtypes baked in (from `ValueColumn`); convert at the dispatch boundary inside `dispatch_groupby`.
+
+6. **Expression aggs at kernel layer.** `AggSpec::Expression` has no `AggRequest` twin in M2 (M2 didn't support expressions). For Phase 3, route Expression aggs through the kernel layer via a separate path that converts IR `AggExpr` → kernel-layer `FusedAggDescriptor::Expression { expr, col_dtypes, op, output_dtype }`. The IR-to-kernel conversion happens at the `dispatch_groupby` caller (in `udf.rs`) before dispatch.
+
+7. **`AggOp` `Mean` variant in M2.** M2's `AggOp` is `{ Sum, Mean, Count, Min, Max, Len }`. Phase 3 keeps the same set. The kernel-side `AggKind` enum is *separate* (e.g. `SumF32`, `MeanI64` — encodes both op *and* dtype). Don't conflate the two.
+
+8. **Bench placement.** Phase 3 Task 17 says `benches/aggregate_fused.rs`. The actual workspace benches live under `crates/polars-metal-kernels/benches/` (see `Cargo.toml` `[[bench]]` entries). Add Task 17's bench at `crates/polars-metal-kernels/benches/aggregate_fused.rs` and the `[[bench]] name = "aggregate_fused" harness = false` entry to `crates/polars-metal-kernels/Cargo.toml`.
+
+9. **Mean & 32-bit atomics on Apple Silicon.** Per memory `m2-metal-atomics-constraint`: toolchain 32023.883 lacks 64-bit atomics and `double`. The emitter must accumulate into 32-bit atomic types only (`atomic_uint`, `atomic_int`, `atomic_float` if supported; otherwise via uint-bit-pattern CAS for floats). The fused kernel's f64-input case loads as `float` for accumulation, with CPU-side finalize widening back to `f64` for Polars schema compatibility — same pattern M2 uses (see `run_one_agg` and `aggregate_sum_f64_cpu`).
+
+With those reconciled, Tasks 11–18 below remain structurally correct; subagents should adapt the per-task snippets to use the right field names, helpers, and module paths as listed above.
+
 ### Task 11: `AggSignature` — hashable cache key for compiled fused kernels
 
 **Files:**
