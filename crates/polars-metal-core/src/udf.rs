@@ -23,12 +23,17 @@
 
 use crate::plan::{AggExpr, AggOp, BinaryOp, MetalDtype, MetalPlanNode, PredicateAst};
 use polars_metal_buffer::MetalDevice;
+use polars_metal_kernels::aggregate_fused::cache::FusedLibraryCache;
+use polars_metal_kernels::aggregate_fused::signature::{
+    AggExpr as KAggExpr, AggOp as KAggOp, AggSpec as KAggSpec, BinaryOp as KBinaryOp,
+    MetalDtype as KMetalDtype,
+};
 use polars_metal_kernels::cmp::{
     dispatch_cmp_f64, dispatch_cmp_f64_scalar, dispatch_cmp_i64, dispatch_cmp_i64_scalar, CompareOp,
 };
 use polars_metal_kernels::command::CommandQueue;
 use polars_metal_kernels::groupby::{
-    AggKind, AggRequest, GroupByError, KeyColumn, KeyDtype, ValueColumn,
+    dispatch_groupby_fused, AggKind, AggRequest, GroupByError, KeyColumn, KeyDtype, ValueColumn,
 };
 use polars_metal_kernels::logical::{dispatch_bool_and, dispatch_bool_or};
 use polars_metal_kernels::pipeline::{
@@ -37,7 +42,150 @@ use polars_metal_kernels::pipeline::{
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::OnceLock;
+
+// ----------------------------------------------------------------------------
+// IR → kernel-layer mirrors (Phase 3 / Task 15)
+// ----------------------------------------------------------------------------
+
+/// Convert IR `AggOp` → kernel-layer `AggOp` mirror.
+fn convert_agg_op(op: AggOp) -> KAggOp {
+    match op {
+        AggOp::Sum => KAggOp::Sum,
+        AggOp::Mean => KAggOp::Mean,
+        AggOp::Count => KAggOp::Count,
+        AggOp::Min => KAggOp::Min,
+        AggOp::Max => KAggOp::Max,
+        AggOp::Len => KAggOp::Len,
+    }
+}
+
+/// Convert IR `BinaryOp` → kernel-layer mirror.
+fn convert_binary_op(op: BinaryOp) -> KBinaryOp {
+    match op {
+        BinaryOp::Add => KBinaryOp::Add,
+        BinaryOp::Sub => KBinaryOp::Sub,
+        BinaryOp::Mul => KBinaryOp::Mul,
+        BinaryOp::Div => KBinaryOp::Div,
+    }
+}
+
+/// Convert IR `AggExpr` → kernel-layer mirror (mechanical tree walk).
+fn convert_agg_expr(expr: &AggExpr) -> KAggExpr {
+    match expr {
+        AggExpr::Column(name) => KAggExpr::Column(name.clone()),
+        AggExpr::LiteralF64(v) => KAggExpr::LiteralF64(*v),
+        AggExpr::LiteralI64(v) => KAggExpr::LiteralI64(*v),
+        AggExpr::Binary { op, lhs, rhs } => KAggExpr::Binary {
+            op: convert_binary_op(*op),
+            lhs: Box::new(convert_agg_expr(lhs)),
+            rhs: Box::new(convert_agg_expr(rhs)),
+        },
+    }
+}
+
+/// Wire dtype tag (`"I32"` / `"F32"` / ...) → kernel-layer `MetalDtype`.
+fn wire_dtype_tag_to_kernel(tag: &str) -> Option<KMetalDtype> {
+    match tag {
+        "I64" => Some(KMetalDtype::I64),
+        "F64" => Some(KMetalDtype::F64),
+        "Bool" => Some(KMetalDtype::Bool),
+        "I32" => Some(KMetalDtype::I32),
+        "F32" => Some(KMetalDtype::F32),
+        "I8" => Some(KMetalDtype::I8),
+        "I16" => Some(KMetalDtype::I16),
+        "U8" => Some(KMetalDtype::U8),
+        "U16" => Some(KMetalDtype::U16),
+        "U32" => Some(KMetalDtype::U32),
+        _ => None,
+    }
+}
+
+/// Routing decision for one groupby query: fused single-kernel dispatch
+/// vs M2's per-agg loop. See `decide_groupby_dispatch` for the rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupByDispatchChoice {
+    Fused,
+    PerAgg,
+}
+
+/// Decide between the fused kernel and M2's per-agg path.
+///
+/// Rules (Task 15):
+///   1. If any agg is Expression → Fused (Expression has no per-agg fallback).
+///   2. Otherwise, if every agg is Simple/Length AND there are ≥ 2 aggs
+///      AND the signature is fused-supported (all 32-bit-or-narrower inputs)
+///      → Fused.
+///   3. Otherwise → PerAgg (single-agg queries, F64/I64 inputs, etc.).
+///
+/// Caller must have already verified the value columns referenced by the
+/// aggs are present in the HashMap. The signature is built once here and
+/// inspected for support; the same signature is reused at dispatch time.
+fn decide_groupby_dispatch(
+    parsed: &[ParsedAgg],
+    by_name: &HashMap<String, (String, &[u8], &[u8])>,
+) -> GroupByDispatchChoice {
+    let has_expression = parsed
+        .iter()
+        .any(|a| matches!(a, ParsedAgg::Expression { .. }));
+    let n_simple_or_len = parsed
+        .iter()
+        .filter(|a| !matches!(a, ParsedAgg::Expression { .. }))
+        .count();
+
+    // Check that every referenced column is 32-bit-or-narrower (fused-only
+    // supports that). Build a tentative signature inline.
+    let mut col_dtypes: BTreeMap<String, KMetalDtype> = BTreeMap::new();
+    let mut all_fused_supported = true;
+    for a in parsed {
+        match a {
+            ParsedAgg::Simple { input_col, .. } => {
+                let Some((dt_tag, _, _)) = by_name.get(input_col) else {
+                    return GroupByDispatchChoice::PerAgg;
+                };
+                let Some(kdt) = wire_dtype_tag_to_kernel(dt_tag) else {
+                    return GroupByDispatchChoice::PerAgg;
+                };
+                if matches!(kdt, KMetalDtype::F64 | KMetalDtype::I64) {
+                    all_fused_supported = false;
+                }
+                col_dtypes.entry(input_col.clone()).or_insert(kdt);
+            }
+            ParsedAgg::Expression { expr, .. } => {
+                for c in expr.referenced_columns() {
+                    let Some((dt_tag, _, _)) = by_name.get(&c) else {
+                        return GroupByDispatchChoice::PerAgg;
+                    };
+                    let Some(kdt) = wire_dtype_tag_to_kernel(dt_tag) else {
+                        return GroupByDispatchChoice::PerAgg;
+                    };
+                    if matches!(kdt, KMetalDtype::F64 | KMetalDtype::I64) {
+                        all_fused_supported = false;
+                    }
+                    col_dtypes.entry(c).or_insert(kdt);
+                }
+            }
+            ParsedAgg::Length { .. } => {}
+        }
+    }
+
+    if has_expression && all_fused_supported {
+        return GroupByDispatchChoice::Fused;
+    }
+    if !has_expression && n_simple_or_len >= 2 && all_fused_supported {
+        return GroupByDispatchChoice::Fused;
+    }
+    GroupByDispatchChoice::PerAgg
+}
+
+/// Process-wide fused-library cache. Constructed lazily on first dispatch
+/// when the system default Metal device is acquirable.
+static FUSED_CACHE: OnceLock<FusedLibraryCache> = OnceLock::new();
+
+fn get_or_init_fused_cache(device: &MetalDevice) -> &'static FusedLibraryCache {
+    FUSED_CACHE.get_or_init(|| FusedLibraryCache::new(device.clone()))
+}
 
 /// PyO3 entry point exposed as `polars_metal._native.execute_plan`.
 ///
@@ -1220,6 +1368,53 @@ fn metal_dtype_to_key_dtype(d: MetalDtype) -> KeyDtype {
 /// wrapped in `ValueColumn`. We use `unsafe slice::from_raw_parts` here
 /// for the same reason as the filter path: no `bytemuck` dep, and Arrow
 /// buffers are guaranteed to be at least 8-byte aligned.
+/// Construct a typed `ValueColumn` view over raw bytes for the fused
+/// groupby dispatcher.
+///
+/// Unlike [`build_agg_kind_and_vcol`] this does not derive a kernel-side
+/// `AggKind` — the fused dispatcher derives output shape from the
+/// `AggSignature`. Only the 32-bit-or-narrower dtypes the fused emitter
+/// supports are accepted; F64/I64 callers must route through the M2 path.
+fn build_value_column<'a>(
+    dtype_tag: &str,
+    data: &'a [u8],
+    valid: &'a [u8],
+    n_rows: usize,
+) -> Result<ValueColumn<'a>, String> {
+    match dtype_tag {
+        "I32" => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(format!(
+                    "I32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                ));
+            }
+            // SAFETY: i32 has no invalid bit patterns; Arrow buffers are
+            // 64-byte aligned so the reinterpret meets the 4-byte alignment.
+            let typed: &[i32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, n_rows) };
+            Ok(ValueColumn::I32 { data: typed, valid })
+        }
+        "F32" => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(format!(
+                    "F32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                ));
+            }
+            // SAFETY: f32 has no invalid bit patterns; same alignment as I32.
+            let typed: &[f32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_rows) };
+            Ok(ValueColumn::F32 { data: typed, valid })
+        }
+        other => Err(format!(
+            "dtype {other} not supported by fused groupby (only I32/F32 currently)"
+        )),
+    }
+}
+
 fn build_agg_kind_and_vcol<'a>(
     op: AggOp,
     dtype_tag: &str,
@@ -1725,90 +1920,37 @@ pub fn execute_groupby<'py>(
         })
         .collect();
 
-    // 4. Build (AggRequest, ValueColumn) pairs.
-    //    Len needs no value column; we use a zero-length I64 placeholder
-    //    because `run_one_agg` for Len ignores the ValueColumn entirely.
-    let empty_data: &[u8] = &[];
-    let empty_valid: &[u8] = &[];
-    // SAFETY: &[] cast to &[i64] is a zero-length slice — no pointer
-    // arithmetic occurs. The slice is valid and the pointer is non-null
-    // (a valid empty slice). This is the established pattern for
-    // zero-length typed slices in this codebase.
-    let empty_i64: &[i64] =
-        unsafe { std::slice::from_raw_parts(empty_data.as_ptr() as *const i64, 0) };
-
-    // Tuple type alias to keep the Vec type readable for clippy.
-    type AggByteRef<'a> = (&'a [u8], &'a [u8], String);
-
-    let mut agg_byte_refs: Vec<Option<AggByteRef<'_>>> = Vec::with_capacity(parsed.aggs.len());
+    // 4. Build the routing-input view: each agg's value-column byte/dtype
+    //    triple, keyed by column name. The fused path consumes a HashMap of
+    //    ValueColumns; the M2 per-agg path consumes (AggRequest, ValueColumn)
+    //    pairs. We build the byte-references first; typed slices materialize
+    //    after the routing decision so we can specialize both paths
+    //    correctly.
+    //
+    // `name_byte_refs` covers EVERY column referenced by any Simple's
+    // `input_col` OR by any Expression's `referenced_columns()`. This is a
+    // superset of the M2 byte_refs because Expression-shape aggs can name
+    // columns no Simple agg touches.
+    let mut name_byte_refs: HashMap<String, (String, &[u8], &[u8])> = HashMap::new();
     for agg in &parsed.aggs {
-        match agg {
-            ParsedAgg::Length { .. } => {
-                agg_byte_refs.push(None);
+        let referenced: Vec<String> = match agg {
+            ParsedAgg::Length { .. } => Vec::new(),
+            ParsedAgg::Simple { input_col, .. } => vec![input_col.clone()],
+            ParsedAgg::Expression { expr, .. } => expr.referenced_columns(),
+        };
+        for col_name in referenced {
+            if name_byte_refs.contains_key(&col_name) {
+                continue;
             }
-            ParsedAgg::Simple { input_col, .. } => {
-                let (dtype_tag, data_py, valid_py) = by_name.get(input_col).ok_or_else(|| {
-                    PyKeyError::new_err(format!(
-                        "polars_metal: agg input column {input_col:?} not found in upstream columns"
-                    ))
-                })?;
-                agg_byte_refs.push(Some((
-                    data_py.as_bytes(),
-                    valid_py.as_bytes(),
-                    dtype_tag.clone(),
-                )));
-            }
-            ParsedAgg::Expression { .. } => {
-                // Phase 3 wires the fused-kernel consumer; the Task 10
-                // router gate ensures we never reach here at runtime.
-                // Defensively reject if we do.
-                return Err(PyValueError::new_err(
-                    "polars_metal: AggSpec::Expression dispatch awaits Phase 3 fused-kernel consumer",
-                ));
-            }
-        }
-    }
-
-    let mut agg_specs: Vec<(AggRequest, ValueColumn<'_>)> = Vec::with_capacity(parsed.aggs.len());
-    for (i, agg) in parsed.aggs.iter().enumerate() {
-        match agg {
-            ParsedAgg::Length { .. } => {
-                agg_specs.push((
-                    AggRequest {
-                        kind: AggKind::Len,
-                        input_col_idx: i,
-                    },
-                    ValueColumn::I64 {
-                        data: empty_i64,
-                        valid: empty_valid,
-                    },
-                ));
-            }
-            ParsedAgg::Simple { op, .. } => {
-                // This entry was populated in the previous loop (Length was already
-                // handled via the matching arm), so `None` here is a logic bug
-                // rather than a runtime condition — surface it as an internal error.
-                let (data, valid, dtype_tag) = agg_byte_refs[i].as_ref().ok_or_else(|| {
-                    PyValueError::new_err(
-                        "polars_metal: internal error: missing agg byte ref for Simple agg",
-                    )
-                })?;
-                let (kind, vcol) = build_agg_kind_and_vcol(*op, dtype_tag, data, valid, n_rows)?;
-                agg_specs.push((
-                    AggRequest {
-                        kind,
-                        input_col_idx: i,
-                    },
-                    vcol,
-                ));
-            }
-            ParsedAgg::Expression { .. } => {
-                // Same defence-in-depth as the byte-ref pass; router gate
-                // (Task 10) prevents reaching here at runtime.
-                return Err(PyValueError::new_err(
-                    "polars_metal: AggSpec::Expression dispatch awaits Phase 3 fused-kernel consumer",
-                ));
-            }
+            let (dtype_tag, data_py, valid_py) = by_name.get(&col_name).ok_or_else(|| {
+                PyKeyError::new_err(format!(
+                    "polars_metal: agg input column {col_name:?} not found in upstream columns"
+                ))
+            })?;
+            name_byte_refs.insert(
+                col_name,
+                (dtype_tag.clone(), data_py.as_bytes(), valid_py.as_bytes()),
+            );
         }
     }
 
@@ -1818,11 +1960,126 @@ pub fn execute_groupby<'py>(
     let mut queue = CommandQueue::new(&device)
         .map_err(|e| crate::engine_err(crate::EngineError::Other(format!("command queue: {e}"))))?;
 
-    // 6. Dispatch.
-    let result = polars_metal_kernels::groupby::dispatch_groupby(
-        &device, &mut queue, &key_cols, &agg_specs, n_rows,
-    )
-    .map_err(groupby_err)?;
+    // 6. Routing: fused single-kernel vs M2 per-agg.
+    let choice = decide_groupby_dispatch(&parsed.aggs, &name_byte_refs);
+
+    let result = match choice {
+        GroupByDispatchChoice::Fused => {
+            // Build kernel-layer specs.
+            let kernel_specs: Vec<KAggSpec> = parsed
+                .aggs
+                .iter()
+                .map(|pa| match pa {
+                    ParsedAgg::Simple {
+                        input_col,
+                        op,
+                        output_alias,
+                    } => KAggSpec::Simple {
+                        input_col: input_col.clone(),
+                        op: convert_agg_op(*op),
+                        output_alias: output_alias.clone(),
+                    },
+                    ParsedAgg::Expression {
+                        expr,
+                        op,
+                        output_alias,
+                    } => KAggSpec::Expression {
+                        expr: convert_agg_expr(expr),
+                        op: convert_agg_op(*op),
+                        output_alias: output_alias.clone(),
+                    },
+                    ParsedAgg::Length { output_alias } => KAggSpec::Length {
+                        output_alias: output_alias.clone(),
+                    },
+                })
+                .collect();
+
+            // Materialize each referenced column as a typed ValueColumn.
+            let mut value_columns: HashMap<String, ValueColumn<'_>> = HashMap::new();
+            for (name, (dt_tag, data, valid)) in name_byte_refs.iter() {
+                let vcol = build_value_column(dt_tag, data, valid, n_rows).map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "polars_metal: fused groupby — value column {name:?}: {e}"
+                    ))
+                })?;
+                value_columns.insert(name.clone(), vcol);
+            }
+
+            let cache = get_or_init_fused_cache(&device);
+            dispatch_groupby_fused(
+                &device,
+                &mut queue,
+                cache,
+                &key_cols,
+                &kernel_specs,
+                &value_columns,
+                n_rows,
+            )
+            .map_err(|e| {
+                PyValueError::new_err(format!("polars_metal: fused groupby dispatch: {e}"))
+            })?
+        }
+        GroupByDispatchChoice::PerAgg => {
+            // M2's per-agg path. Len uses a zero-length I64 placeholder; Simple
+            // looks up its single input column from `name_byte_refs`.
+            let empty_data: &[u8] = &[];
+            let empty_valid: &[u8] = &[];
+            // SAFETY: &[] cast to &[i64] is a zero-length slice — no pointer
+            // arithmetic occurs. The slice is valid and the pointer is
+            // non-null (a valid empty slice). This is the established
+            // pattern for zero-length typed slices in this codebase.
+            let empty_i64: &[i64] =
+                unsafe { std::slice::from_raw_parts(empty_data.as_ptr() as *const i64, 0) };
+
+            let mut agg_specs: Vec<(AggRequest, ValueColumn<'_>)> =
+                Vec::with_capacity(parsed.aggs.len());
+            for (i, agg) in parsed.aggs.iter().enumerate() {
+                match agg {
+                    ParsedAgg::Length { .. } => {
+                        agg_specs.push((
+                            AggRequest {
+                                kind: AggKind::Len,
+                                input_col_idx: i,
+                            },
+                            ValueColumn::I64 {
+                                data: empty_i64,
+                                valid: empty_valid,
+                            },
+                        ));
+                    }
+                    ParsedAgg::Simple { input_col, op, .. } => {
+                        let (dtype_tag, data, valid) =
+                            name_byte_refs.get(input_col).ok_or_else(|| {
+                                PyValueError::new_err(
+                                    "polars_metal: internal error: missing byte ref for Simple agg",
+                                )
+                            })?;
+                        let (kind, vcol) =
+                            build_agg_kind_and_vcol(*op, dtype_tag, data, valid, n_rows)?;
+                        agg_specs.push((
+                            AggRequest {
+                                kind,
+                                input_col_idx: i,
+                            },
+                            vcol,
+                        ));
+                    }
+                    ParsedAgg::Expression { .. } => {
+                        // Expression specs should never route here (the
+                        // router decides Fused above). Defensive guard.
+                        return Err(PyValueError::new_err(
+                            "polars_metal: AggSpec::Expression routed to per-agg path; this is a routing bug",
+                        ));
+                    }
+                }
+            }
+
+            polars_metal_kernels::groupby::dispatch_groupby(
+                &device, &mut queue, &key_cols, &agg_specs, n_rows,
+            )
+            .map_err(groupby_err)?
+        }
+    };
 
     // 7. Encode result as a list of (name, dtype_tag, data, valid) tuples.
     //    Key columns first, then agg outputs.

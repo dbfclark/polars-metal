@@ -89,17 +89,14 @@ pub fn decide_groupby_with_keys(
     keys: &[(String, MetalDtype)],
     aggs: &[AggSpec],
 ) -> NodeDecision {
-    // Phase 2 gate: Expression specs require the Phase 3 fused-kernel
-    // consumer. Until that lands, fall back at plan time so callers
-    // see a deterministic CPU path rather than a runtime panic. This
-    // check fires BEFORE the key-width check so an Expression query
-    // with an oversize composite key still surfaces the Expression-
-    // specific diagnostic.
-    if aggs.iter().any(|a| matches!(a, AggSpec::Expression { .. })) {
-        return NodeDecision::Fallback(
-            "AggSpec::Expression awaiting Phase 3 fused-kernel consumer".into(),
-        );
-    }
+    // Phase 3 (Task 15) wires Expression aggs to the fused-kernel consumer
+    // via `udf::dispatch_groupby_fused`. The Phase 2 plan-time gate that
+    // forced Fallback on any Expression spec is removed; routing of
+    // fused-vs-per-agg now happens at dispatch time and is invisible to
+    // the cost model. `aggs` is retained in the signature so future
+    // dtype-aware checks (e.g. F64 aggregation falls back at plan time)
+    // can land here without an API churn.
+    let _ = aggs;
 
     let total_bits: usize = keys.iter().map(|(_, d)| key_width_bits(*d)).sum();
     if total_bits > 128 {

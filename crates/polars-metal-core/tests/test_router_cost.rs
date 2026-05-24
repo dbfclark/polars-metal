@@ -99,11 +99,11 @@ fn groupby_with_oversized_composite_key_falls_back_at_plan_time() {
 }
 
 #[test]
-fn router_falls_back_when_any_agg_is_expression() {
-    // Phase 2 gate (Task 10): any AggSpec::Expression in the agg list
-    // must route to CPU until the Phase 3 fused-kernel consumer lands.
-    // Row count is well above GROUPBY_GPU_MIN_ROWS, key width is
-    // trivially in budget — only the Expression spec triggers fallback.
+fn router_lifts_expression_aggs_to_gpu_after_task15() {
+    // Phase 3 / Task 15 wired the fused-kernel consumer. Expression aggs
+    // now route to GPU at the dispatch boundary (selection between fused
+    // and per-agg paths is invisible to the cost model). The Phase 2
+    // plan-time fallback for Expression specs is removed.
     let keys = vec![("k".to_string(), MetalDtype::I64)];
     let aggs = vec![
         AggSpec::Simple {
@@ -122,15 +122,10 @@ fn router_falls_back_when_any_agg_is_expression() {
         },
     ];
     let decision = cost::decide_groupby_with_keys(1_000_000, &keys, &aggs);
-    match decision {
-        NodeDecision::Fallback(reason) => {
-            assert!(
-                reason.contains("Expression"),
-                "expected Expression reason, got: {reason}"
-            );
-        }
-        other => panic!("expected Fallback, got: {other:?}"),
-    }
+    assert!(
+        matches!(decision, NodeDecision::GpuLift),
+        "expected GpuLift for Expression aggs after Task 15, got: {decision:?}"
+    );
 }
 
 #[test]

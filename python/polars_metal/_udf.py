@@ -240,14 +240,40 @@ def _dispatch_groupby(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
     n_rows = upstream.height
 
     # Collect the column names we'll send to Rust (keys + agg inputs).
+    # Simple aggs reference one column via `input_col`; Expression aggs
+    # reference one or more via the recursive `expr` dict (M3 capability G).
     needed: list[str] = []
     seen: set[str] = set()
+
+    def _collect_expr_cols(expr_dict: dict, out: list[str], seen_set: set[str]) -> None:
+        """Walk an Expression-kind agg's `expr` sub-dict, collecting column refs."""
+        kind = expr_dict.get("kind")
+        if kind == "Column":
+            name = expr_dict.get("name", "")
+            if name and name not in seen_set:
+                out.append(name)
+                seen_set.add(name)
+        elif kind == "Binary":
+            lhs = expr_dict.get("lhs")
+            rhs = expr_dict.get("rhs")
+            if isinstance(lhs, dict):
+                _collect_expr_cols(lhs, out, seen_set)
+            if isinstance(rhs, dict):
+                _collect_expr_cols(rhs, out, seen_set)
+        # Literals (LiteralF64, LiteralI64) reference no columns.
+
     for key_entry in wire_plan["keys"]:
         key_name = key_entry[0]
         if key_name not in seen:
             needed.append(key_name)
             seen.add(key_name)
     for agg in wire_plan["aggs"]:
+        kind = agg.get("kind", "Simple")
+        if kind == "Expression":
+            expr_dict = agg.get("expr")
+            if isinstance(expr_dict, dict):
+                _collect_expr_cols(expr_dict, needed, seen)
+            continue
         ic = agg.get("input_col", "")
         if ic and ic not in seen:
             needed.append(ic)
