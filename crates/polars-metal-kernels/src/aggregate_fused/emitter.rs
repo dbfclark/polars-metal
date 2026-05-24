@@ -23,14 +23,19 @@
 //!
 //! ## Apple Silicon atomic constraints
 //!
-//! Toolchain 32023.883 lacks 64-bit atomics. For float Sum/Mean the
-//! emitter uses `atomic_fetch_add_explicit` on `atomic_float`; for
-//! float Min/Max it uses a CAS-loop over `atomic_uint` reinterpreted
-//! via `as_type<float>` because Metal lacks `atomic_fetch_min/max` on
-//! floats. Integer Sum/Min/Max use native
+//! Toolchain 32023.883 lacks 64-bit atomics. It *also* rejects
+//! `atomic_fetch_add_explicit` on `atomic_float` at
+//! `MTLComputePipelineState` creation, even though the source compiles
+//! via `newLibraryWithSource`. For float Sum/Mean the emitter therefore
+//! uses a CAS-loop over `atomic_uint` (the bit-pattern container) —
+//! matching the M2 `agg_sum_f32` shader in `shaders/aggregate.metal`.
+//! Float Min/Max uses the same CAS-loop pattern because Metal lacks
+//! `atomic_fetch_min/max` on floats. Integer Sum/Min/Max use native
 //! `atomic_fetch_{add,min,max}_explicit` on `atomic_int` / `atomic_uint`.
 //! Count is `atomic_fetch_add_explicit` on `atomic_uint`. Mean is
-//! `(sum, count)` — CPU finalizes the division.
+//! `(sum, count)` — CPU finalizes the division. The Mean *count*
+//! companion is `atomic_uint` with `atomic_fetch_add_explicit` (the
+//! count of valid rows).
 //!
 //! ## Slot layout
 //!
@@ -206,14 +211,17 @@ fn msl_output_atomic_type(
             (AggOp::Len, _) => "atomic_uint",
             (AggOp::Mean, 1) => "atomic_uint",
             // Sum / Mean (sum slot) / Min / Max: type depends on input
-            // dtype + op. Float Sum/Mean uses `atomic_float` (native
-            // fetch-add); float Min/Max uses `atomic_uint` bit-pattern
-            // CAS because Metal lacks `atomic_fetch_min/max` on floats.
+            // dtype + op. Float Sum/Mean *and* Min/Max use `atomic_uint`
+            // as a bit-pattern container — Apple Silicon Metal toolchain
+            // 32023.883 rejects atomic_fetch_add/min/max on `atomic_float`
+            // at MTLComputePipelineState creation. See
+            // `shaders/aggregate.metal:64-91` and
+            // `docs/kernel-authoring.md` § "Apple Silicon Metal atomic
+            // ops constraint".
             _ => {
                 let dt = column_dtype_for(sig, column_dtypes, input_col)
                     .unwrap_or(MetalDtype::F32);
                 match (dt, op) {
-                    (MetalDtype::F32 | MetalDtype::F64, AggOp::Sum | AggOp::Mean) => "atomic_float",
                     (MetalDtype::F32 | MetalDtype::F64, _) => "atomic_uint",
                     (
                         MetalDtype::I32
@@ -300,10 +308,26 @@ fn emit_simple_agg_update(
 fn emit_sum(out: &mut String, agg_idx: usize, col_idx: usize, is_float: bool, is_signed: bool) {
     let _ = writeln!(out, "  if (val_{col_idx}_valid) {{");
     if is_float {
+        // Float Sum via CAS-loop on `atomic_uint` (bit-pattern container).
+        // `atomic_fetch_add_explicit` on `atomic_float` fails at
+        // MTLComputePipelineState creation on Apple Silicon Metal
+        // toolchain 32023.883 even though source compiles. Mirrors
+        // `agg_sum_f32` in `shaders/aggregate.metal`.
         let _ = writeln!(
             out,
-            "    atomic_fetch_add_explicit((device atomic_float*)&out_{agg_idx}_0[g], (float)val_{col_idx}, memory_order_relaxed);"
+            "    uint old_bits_a = atomic_load_explicit((device atomic_uint*)&out_{agg_idx}_0[g], memory_order_relaxed);"
         );
+        out.push_str("    while (true) {\n");
+        out.push_str("      float cur = as_type<float>(old_bits_a);\n");
+        let _ = writeln!(
+            out,
+            "      uint next_bits = as_type<uint>(cur + (float)val_{col_idx});"
+        );
+        let _ = writeln!(
+            out,
+            "      if (atomic_compare_exchange_weak_explicit((device atomic_uint*)&out_{agg_idx}_0[g], &old_bits_a, next_bits, memory_order_relaxed, memory_order_relaxed)) {{ break; }}"
+        );
+        out.push_str("    }\n");
     } else if is_signed {
         let _ = writeln!(
             out,
