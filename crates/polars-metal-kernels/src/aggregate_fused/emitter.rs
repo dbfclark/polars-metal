@@ -19,7 +19,12 @@
 //! equivalent and finalizes the widened sum on CPU (`aggregate_sum_f64_cpu`
 //! pattern).
 //!
-//! Expression aggs are Task 13; they are silently skipped here.
+//! Expression aggs (Task 13) are emitted **after** the per-column-load
+//! loop in their own stanza: each Expression evaluates inline as a
+//! `float`, guarded by the AND of its referenced columns' validity bits,
+//! and feeds the same per-op accumulator template as Simple. Shared
+//! value-column loads (Task 12 invariant) are preserved — Expression aggs
+//! re-use the `val_<i>` / `val_<i>_valid` locals already in scope.
 //!
 //! ## Apple Silicon atomic constraints
 //!
@@ -51,7 +56,7 @@
 
 use std::fmt::Write as _;
 
-use super::signature::{AggOp, AggSignature, AggSpec, MetalDtype};
+use super::signature::{AggExpr, AggOp, AggSignature, AggSpec, BinaryOp, MetalDtype};
 
 /// Public entry point: emit MSL source for the given signature + specs.
 ///
@@ -79,12 +84,22 @@ pub fn emit_msl(sig: &AggSignature, specs: &[AggSpec]) -> String {
         slot += 1;
     }
 
-    // Outputs: one slot per agg, two for Mean.
+    // Outputs: one slot per agg, two for Mean (sum + count).
     let mut output_slots: Vec<Vec<usize>> = Vec::with_capacity(specs.len());
     for spec in specs {
         let mut outs = vec![slot];
         slot += 1;
-        if let AggSpec::Simple { op: AggOp::Mean, .. } = spec {
+        let is_mean = matches!(
+            spec,
+            AggSpec::Simple {
+                op: AggOp::Mean,
+                ..
+            } | AggSpec::Expression {
+                op: AggOp::Mean,
+                ..
+            }
+        );
+        if is_mean {
             outs.push(slot);
             slot += 1;
         }
@@ -108,24 +123,15 @@ pub fn emit_msl(sig: &AggSignature, specs: &[AggSpec]) -> String {
     );
     for (i, sl) in value_slots.iter().enumerate() {
         let ty = msl_value_load_type(column_dtypes[i]);
-        let _ = writeln!(
-            s,
-            "  device const {ty}*  value_{i}    [[buffer({sl})]],"
-        );
+        let _ = writeln!(s, "  device const {ty}*  value_{i}    [[buffer({sl})]],");
     }
     for (i, sl) in validity_slots.iter().enumerate() {
-        let _ = writeln!(
-            s,
-            "  device const uchar* validity_{i} [[buffer({sl})]],"
-        );
+        let _ = writeln!(s, "  device const uchar* validity_{i} [[buffer({sl})]],");
     }
     for (a, outs) in output_slots.iter().enumerate() {
         for (j, sl) in outs.iter().enumerate() {
             let ty = msl_output_atomic_type(&specs[a], j, column_dtypes, sig);
-            let _ = writeln!(
-                s,
-                "  device {ty}*  out_{a}_{j}     [[buffer({sl})]],"
-            );
+            let _ = writeln!(s, "  device {ty}*  out_{a}_{j}     [[buffer({sl})]],");
         }
     }
     s.push_str("  uint gid [[thread_position_in_grid]])\n{\n");
@@ -148,6 +154,16 @@ pub fn emit_msl(sig: &AggSignature, specs: &[AggSpec]) -> String {
             }
         }
         s.push('\n');
+    }
+
+    // ---- expression aggs (Task 13) ----
+    // Emitted after the per-column-load loop because an Expression may
+    // reference multiple column slots. The `val_<i>` / `val_<i>_valid`
+    // locals are already in scope.
+    for (a, spec) in specs.iter().enumerate() {
+        if let AggSpec::Expression { expr, op, .. } = spec {
+            emit_expression_agg_update(&mut s, expr, *op, a, column_order);
+        }
     }
 
     // ---- length aggs (no value column) ----
@@ -219,22 +235,27 @@ fn msl_output_atomic_type(
             // `docs/kernel-authoring.md` § "Apple Silicon Metal atomic
             // ops constraint".
             _ => {
-                let dt = column_dtype_for(sig, column_dtypes, input_col)
-                    .unwrap_or(MetalDtype::F32);
+                let dt = column_dtype_for(sig, column_dtypes, input_col).unwrap_or(MetalDtype::F32);
                 match (dt, op) {
                     (MetalDtype::F32 | MetalDtype::F64, _) => "atomic_uint",
-                    (
-                        MetalDtype::I32
-                        | MetalDtype::I16
-                        | MetalDtype::I8
-                        | MetalDtype::I64,
-                        _,
-                    ) => "atomic_int",
+                    (MetalDtype::I32 | MetalDtype::I16 | MetalDtype::I8 | MetalDtype::I64, _) => {
+                        "atomic_int"
+                    }
                     _ => "atomic_uint",
                 }
             }
         },
-        AggSpec::Expression { .. } => "atomic_uint", // Task 13
+        AggSpec::Expression { op, .. } => match (op, j) {
+            // Count and Mean's count companion → uint atomic.
+            (AggOp::Count, _) | (AggOp::Mean, 1) | (AggOp::Len, _) => "atomic_uint",
+            // Sum / Mean (sum slot) / Min / Max: expression evaluates to
+            // float (per `emit_expr_msl`), so the accumulator is always
+            // `atomic_uint` used as a float bit-pattern container (same
+            // CAS-loop pattern as Simple-float Sum/Min/Max — Apple Silicon
+            // Metal 32023.883 rejects `atomic_fetch_add` on `atomic_float`
+            // at MTLComputePipelineState creation).
+            _ => "atomic_uint",
+        },
         AggSpec::Length { .. } => "atomic_uint",
     }
 }
@@ -351,7 +372,11 @@ fn emit_min_max(
     is_signed: bool,
 ) {
     if is_float {
-        let break_cond = if is_min { "curf <= valf" } else { "curf >= valf" };
+        let break_cond = if is_min {
+            "curf <= valf"
+        } else {
+            "curf >= valf"
+        };
         let _ = writeln!(out, "  if (val_{col_idx}_valid) {{");
         let _ = writeln!(out, "    float valf = (float)val_{col_idx};");
         let _ = writeln!(
@@ -369,7 +394,11 @@ fn emit_min_max(
         out.push_str("    }\n");
         out.push_str("  }\n");
     } else {
-        let fn_name = if is_min { "atomic_fetch_min_explicit" } else { "atomic_fetch_max_explicit" };
+        let fn_name = if is_min {
+            "atomic_fetch_min_explicit"
+        } else {
+            "atomic_fetch_max_explicit"
+        };
         let _ = writeln!(out, "  if (val_{col_idx}_valid) {{");
         if is_signed {
             let _ = writeln!(
@@ -384,4 +413,197 @@ fn emit_min_max(
         }
         out.push_str("  }\n");
     }
+}
+
+// ---------- Expression-agg emission (Task 13) ------------------------------
+
+/// Convert a kernel-layer `AggExpr` to an MSL `float`-typed expression.
+///
+/// `col_order` is the first-seen column order from `AggSignature` — the
+/// position of a column name in this slice IS its `val_<i>` slot index.
+/// Callers must have pre-interned every column referenced by `expr`
+/// (`AggSignature::from_specs` does this).
+///
+/// Literals are emitted with explicit `(float)` casts (and the `f`
+/// suffix for finite floats) to keep the result type `float` throughout
+/// the tree — Apple Silicon Metal can't run `double` arithmetic in
+/// compute kernels under toolchain 32023.883.
+fn emit_expr_msl(expr: &AggExpr, col_order: &[String]) -> String {
+    match expr {
+        AggExpr::Column(name) => {
+            // `from_specs` interns every referenced column, so position()
+            // is always Some in a valid signature. Fall back to slot 0
+            // in release builds to keep behavior deterministic if the
+            // contract is violated; debug_assert documents the invariant.
+            debug_assert!(
+                col_order.iter().any(|c| c == name),
+                "emit_expr_msl: column `{name}` missing from col_order; \
+                 caller must build the signature with from_specs() first"
+            );
+            let idx = col_order.iter().position(|c| c == name).unwrap_or(0);
+            format!("(float)val_{idx}")
+        }
+        AggExpr::LiteralF64(v) => {
+            if v.is_nan() {
+                "(float)NAN".into()
+            } else if v.is_infinite() {
+                if *v > 0.0 {
+                    "(float)INFINITY".into()
+                } else {
+                    "-(float)INFINITY".into()
+                }
+            } else {
+                // Stringify with enough precision to round-trip an f32
+                // and append the Metal `f` suffix so the literal binds
+                // as `float`, not `double`.
+                format!("{v:?}f")
+            }
+        }
+        AggExpr::LiteralI64(v) => format!("(float){v}"),
+        AggExpr::Binary { op, lhs, rhs } => {
+            let l = emit_expr_msl(lhs, col_order);
+            let r = emit_expr_msl(rhs, col_order);
+            let s = match op {
+                BinaryOp::Add => "+",
+                BinaryOp::Sub => "-",
+                BinaryOp::Mul => "*",
+                BinaryOp::Div => "/",
+            };
+            format!("({l} {s} {r})")
+        }
+    }
+}
+
+/// AND of all referenced columns' validity bits. Empty (literal-only)
+/// expression returns the constant `1u` — the M3 walker doesn't emit
+/// literal-only Expression aggs, but the helper stays deterministic.
+fn emit_expr_validity_check(expr: &AggExpr, col_order: &[String]) -> String {
+    let cols = expr.referenced_columns();
+    if cols.is_empty() {
+        return "1u".into();
+    }
+    cols.iter()
+        .map(|c| {
+            debug_assert!(
+                col_order.iter().any(|x| x == c),
+                "emit_expr_validity_check: column `{c}` missing from col_order"
+            );
+            let idx = col_order.iter().position(|x| x == c).unwrap_or(0);
+            format!("val_{idx}_valid")
+        })
+        .collect::<Vec<_>>()
+        .join(" & ")
+}
+
+/// Emit the per-row update for one `AggSpec::Expression` agg. The
+/// `val_<i>` / `val_<i>_valid` locals are already in scope (the
+/// per-column-load loop ran first). The expression evaluates to a
+/// `float`; the accumulator pattern matches Simple-float for Sum/Min/Max
+/// (CAS loop on `atomic_uint` as a bit-pattern container) and
+/// `atomic_fetch_add_explicit` on `atomic_uint` for Count and Mean's
+/// count companion.
+fn emit_expression_agg_update(
+    out: &mut String,
+    expr: &AggExpr,
+    op: AggOp,
+    agg_idx: usize,
+    col_order: &[String],
+) {
+    let _ = writeln!(out, "  // --- expression agg slot {agg_idx} ---");
+    let guard = emit_expr_validity_check(expr, col_order);
+    let value = emit_expr_msl(expr, col_order);
+
+    match op {
+        AggOp::Count => {
+            let _ = writeln!(out, "  if ({guard}) {{");
+            let _ = writeln!(
+                out,
+                "    atomic_fetch_add_explicit((device atomic_uint*)&out_{agg_idx}_0[g], 1u, memory_order_relaxed);"
+            );
+            out.push_str("  }\n");
+        }
+        AggOp::Len => {
+            // Len normally appears as AggSpec::Length; tolerate it here
+            // defensively — semantics match an unconditional row count.
+            let _ = writeln!(
+                out,
+                "  atomic_fetch_add_explicit((device atomic_uint*)&out_{agg_idx}_0[g], 1u, memory_order_relaxed);"
+            );
+        }
+        AggOp::Sum => emit_expression_sum(out, agg_idx, &guard, &value),
+        AggOp::Mean => {
+            emit_expression_sum(out, agg_idx, &guard, &value);
+            // Companion count update — increments per valid-row.
+            let _ = writeln!(out, "  if ({guard}) {{");
+            let _ = writeln!(
+                out,
+                "    atomic_fetch_add_explicit((device atomic_uint*)&out_{agg_idx}_1[g], 1u, memory_order_relaxed);"
+            );
+            out.push_str("  }\n");
+        }
+        AggOp::Min => emit_expression_min_max(out, agg_idx, &guard, &value, true),
+        AggOp::Max => emit_expression_min_max(out, agg_idx, &guard, &value, false),
+    }
+}
+
+fn emit_expression_sum(out: &mut String, agg_idx: usize, guard: &str, value: &str) {
+    // Float Sum via CAS loop on `atomic_uint` (bit-pattern container),
+    // matching the Simple-float Sum pattern.
+    let _ = writeln!(out, "  if ({guard}) {{");
+    let _ = writeln!(out, "    float ex_{agg_idx} = (float)({value});");
+    let _ = writeln!(
+        out,
+        "    uint old_bits_e{agg_idx} = atomic_load_explicit((device atomic_uint*)&out_{agg_idx}_0[g], memory_order_relaxed);"
+    );
+    out.push_str("    while (true) {\n");
+    let _ = writeln!(
+        out,
+        "      float cur_e{agg_idx} = as_type<float>(old_bits_e{agg_idx});"
+    );
+    let _ = writeln!(
+        out,
+        "      uint next_bits_e{agg_idx} = as_type<uint>(cur_e{agg_idx} + ex_{agg_idx});"
+    );
+    let _ = writeln!(
+        out,
+        "      if (atomic_compare_exchange_weak_explicit((device atomic_uint*)&out_{agg_idx}_0[g], &old_bits_e{agg_idx}, next_bits_e{agg_idx}, memory_order_relaxed, memory_order_relaxed)) {{ break; }}"
+    );
+    out.push_str("    }\n");
+    out.push_str("  }\n");
+}
+
+fn emit_expression_min_max(
+    out: &mut String,
+    agg_idx: usize,
+    guard: &str,
+    value: &str,
+    is_min: bool,
+) {
+    let break_cond = if is_min {
+        format!("curf_e{agg_idx} <= valf_e{agg_idx}")
+    } else {
+        format!("curf_e{agg_idx} >= valf_e{agg_idx}")
+    };
+    let _ = writeln!(out, "  if ({guard}) {{");
+    let _ = writeln!(out, "    float valf_e{agg_idx} = (float)({value});");
+    let _ = writeln!(
+        out,
+        "    uint old_bits_e{agg_idx} = atomic_load_explicit((device atomic_uint*)&out_{agg_idx}_0[g], memory_order_relaxed);"
+    );
+    out.push_str("    while (true) {\n");
+    let _ = writeln!(
+        out,
+        "      float curf_e{agg_idx} = as_type<float>(old_bits_e{agg_idx});"
+    );
+    let _ = writeln!(out, "      if ({break_cond}) {{ break; }}");
+    let _ = writeln!(
+        out,
+        "      uint next_bits_e{agg_idx} = as_type<uint>(valf_e{agg_idx});"
+    );
+    let _ = writeln!(
+        out,
+        "      if (atomic_compare_exchange_weak_explicit((device atomic_uint*)&out_{agg_idx}_0[g], &old_bits_e{agg_idx}, next_bits_e{agg_idx}, memory_order_relaxed, memory_order_relaxed)) {{ break; }}"
+    );
+    out.push_str("    }\n");
+    out.push_str("  }\n");
 }

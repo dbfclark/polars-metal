@@ -13,9 +13,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLLibrary;
 use polars_metal_kernels::aggregate_fused::emitter::emit_msl;
-use polars_metal_kernels::aggregate_fused::signature::{
-    AggOp, AggSignature, AggSpec, MetalDtype,
-};
+use polars_metal_kernels::aggregate_fused::signature::{AggOp, AggSignature, AggSpec, MetalDtype};
 
 // ---------- helpers --------------------------------------------------------
 
@@ -146,9 +144,7 @@ fn emitted_kernel_creates_pipeline_state() {
     device
         .raw()
         .newComputePipelineStateWithFunction_error(&func)
-        .expect(
-            "PSO creation must succeed — atomic ops in emitted MSL must be runtime-supported",
-        );
+        .expect("PSO creation must succeed — atomic ops in emitted MSL must be runtime-supported");
 }
 
 #[test]
