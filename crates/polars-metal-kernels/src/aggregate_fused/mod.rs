@@ -8,8 +8,10 @@
 //!   3. compile via `MTLDevice::newLibraryWithSource` → cached pipeline
 //!   4. dispatch with bound buffers per signature's column order
 //!
-//! Phase 3 lands these in tasks 11–18. Task 11 only ships the signature
-//! module; `emitter` and `cache` are stubs that subsequent tasks fill in.
+//! Phase 3 lands these in tasks 11–18. Tasks 11–14 ship the signature
+//! module, the MSL emitter (Simple + Expression aggs), and the lazy
+//! library cache; Tasks 15–18 wire those into `dispatch_groupby` and
+//! pre-compile common signatures at module import.
 
 pub mod cache;
 pub mod emitter;
