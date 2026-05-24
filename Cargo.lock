@@ -768,6 +768,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-metal",
  "polars-metal-buffer",
+ "polars-metal-core",
  "polars-metal-mlx-sys",
  "proptest",
  "rand 0.8.6",

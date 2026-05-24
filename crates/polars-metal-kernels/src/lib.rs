@@ -4,6 +4,7 @@
 //! compute-dispatch primitives (`command`); individual kernel modules
 //! (filter, comparison, logical) land in subsequent tasks.
 
+pub mod aggregate_fused;
 pub mod cmp;
 pub mod command;
 pub mod filter;
