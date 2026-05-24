@@ -2194,3 +2194,740 @@ fn run_one_agg(
         }
     }
 }
+
+// ============================================================================
+// Fused groupby dispatch (Task 15)
+// ============================================================================
+//
+// Parallel entry point to `dispatch_groupby` that uses a single MSL kernel
+// for ALL aggregations rather than launching one kernel per agg. The fused
+// kernel is emitted by `aggregate_fused::emitter::emit_msl` and cached by
+// signature hash in `FusedLibraryCache`.
+//
+// The caller (IR layer in `polars-metal-core::udf`) decides between this
+// path and the M2 per-agg path based on `signature_supported_by_fused` and
+// agg shape (see `udf::pick_groupby_dispatch`).
+//
+// ## Buffer slot layout (must match `emitter.rs`)
+//
+//   slot 0:                  row_to_group  (u32 per row)
+//   slot 1:                  n_rows scalar (1-element u32)
+//   slots 2 .. 2+C:          value_<i> column data, in `sig.column_order()`
+//   slots 2+C .. 2+2C:       validity_<i> bitmap, in `sig.column_order()`
+//   slots 2+2C ..:           outputs — one per agg, plus a second u32 count
+//                            companion for every Mean.
+
+use crate::aggregate_fused::cache::{FusedCacheError, FusedLibraryCache};
+use crate::aggregate_fused::emitter::signature_supported_by_fused;
+use crate::aggregate_fused::signature::{
+    AggOp as KAggOp, AggSignature, AggSignatureError, AggSpec as KAggSpec,
+    MetalDtype as KMetalDtype,
+};
+
+/// Errors specific to the fused dispatcher. Wraps `GroupByError` for the
+/// shared path and adds variants for fused-only signal failures.
+#[derive(Debug, thiserror::Error)]
+pub enum FusedDispatchError {
+    #[error("groupby: {0}")]
+    GroupBy(#[from] GroupByError),
+    #[error("signature: {0}")]
+    Signature(#[from] AggSignatureError),
+    #[error("fused cache: {0}")]
+    Cache(#[from] FusedCacheError),
+    #[error(
+        "fused dispatch rejected: signature contains 64-bit input dtypes; \
+         caller must route to the M2 per-agg path"
+    )]
+    SignatureNotFused,
+    #[error("missing value column for slot {slot} ({name})")]
+    MissingValueColumn { slot: usize, name: String },
+    #[error("value column {name}: dtype mismatch (signature has {sig_dt:?}, caller {got:?})")]
+    ValueDtypeMismatch {
+        name: String,
+        sig_dt: KMetalDtype,
+        got: &'static str,
+    },
+}
+
+/// Per-output buffer descriptor used while encoding the dispatch and
+/// reading results back. Kept private — callers only see `AggOutput`.
+struct OutputBuf {
+    primary: polars_metal_buffer::MetalBuffer,
+    /// Mean carries a companion `count` (u32). For non-Mean aggs this is `None`.
+    count: Option<polars_metal_buffer::MetalBuffer>,
+    /// What the primary buffer holds, used to widen back to AggOutput. The
+    /// fused emitter accumulates Sum/Min/Max into one of three 32-bit
+    /// containers: i32 (for signed-integer inputs), u32 (for unsigned),
+    /// or f32-bit-pattern stored in a u32 (for float inputs).
+    primary_kind: PrimaryKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PrimaryKind {
+    /// Output is u32 (Count, Length, unsigned-integer Sum/Min/Max).
+    U32,
+    /// Output is i32 (signed-integer Sum/Min/Max).
+    I32,
+    /// Output is f32, stored as u32 bit pattern (float Sum/Min/Max + Mean's sum slot).
+    F32Bits,
+}
+
+/// Fused-kernel groupby dispatch.
+///
+/// Single MSL kernel handles all aggs; one kernel launch per groupby
+/// regardless of agg count.
+///
+/// # Preconditions
+///
+/// - Every value column is 32-bit or narrower (caller verified via
+///   [`signature_supported_by_fused`]); F64 / I64 input columns must route
+///   to [`dispatch_groupby`] instead.
+/// - Every column referenced by a Simple or Expression agg appears in
+///   `value_columns_by_name`. `Length` aggs need no value columns.
+/// - `value_columns_by_name` typing matches `col_dtypes` exactly. The two
+///   must come from a single caller-side derivation step.
+///
+/// Returns the same shape of result as [`dispatch_groupby`].
+pub fn dispatch_groupby_fused(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    cache: &FusedLibraryCache,
+    key_cols: &[KeyColumn<'_>],
+    aggs: &[KAggSpec],
+    value_columns_by_name: &std::collections::HashMap<String, ValueColumn<'_>>,
+    n_rows: usize,
+) -> Result<GroupByResult, FusedDispatchError> {
+    // Defensive: every key column reports the same n_rows.
+    for kc in key_cols {
+        if kc.n_rows != n_rows {
+            return Err(FusedDispatchError::GroupBy(GroupByError::OutputTooShort {
+                got: kc.n_rows,
+                need: n_rows,
+            }));
+        }
+    }
+
+    let (encoded, schema) = encode_keys(key_cols).map_err(GroupByError::KeyEncode)?;
+
+    if n_rows == 0 {
+        let decoded_keys = decode_keys(&[], &schema);
+        let agg_outputs = aggs.iter().map(empty_output_for_kagg).collect();
+        return Ok(GroupByResult {
+            decoded_keys,
+            agg_outputs,
+            n_groups: 0,
+        });
+    }
+
+    // Build col_dtypes from value_columns_by_name. Walk every column that
+    // any agg references — Simple.input_col or Expression.referenced_columns.
+    let mut col_dtypes: std::collections::BTreeMap<String, KMetalDtype> =
+        std::collections::BTreeMap::new();
+    for agg in aggs {
+        match agg {
+            KAggSpec::Simple { input_col, .. } => {
+                insert_dtype(&mut col_dtypes, input_col, value_columns_by_name)?;
+            }
+            KAggSpec::Expression { expr, .. } => {
+                for col in expr.referenced_columns() {
+                    insert_dtype(&mut col_dtypes, &col, value_columns_by_name)?;
+                }
+            }
+            KAggSpec::Length { .. } => {}
+        }
+    }
+
+    let sig = AggSignature::from_specs(aggs, &col_dtypes)?;
+    if !signature_supported_by_fused(&sig) {
+        return Err(FusedDispatchError::SignatureNotFused);
+    }
+
+    // Compile / look up the PSO.
+    let pso = cache.get_or_compile(&sig, aggs)?;
+
+    // Build hashes / row_to_group via the existing CPU build phase.
+    let mut hashes = vec![0u32; n_rows];
+    dispatch_hash(device, queue, &encoded, n_rows, &mut hashes)?;
+    let build = dispatch_build(device, queue, &encoded, &hashes, n_rows)?;
+    let n_groups_u32 = build.group_count;
+    let n_groups = n_groups_u32 as usize;
+
+    // ---- allocate per-slot value/validity buffers in column_order -----------
+    let column_order = sig.column_order().to_vec();
+    let column_dtypes = sig.column_dtypes().to_vec();
+
+    let mut value_bufs: Vec<polars_metal_buffer::MetalBuffer> =
+        Vec::with_capacity(column_order.len());
+    let mut valid_bufs: Vec<polars_metal_buffer::MetalBuffer> =
+        Vec::with_capacity(column_order.len());
+    let valid_bytes_needed = (n_rows + 7) / 8;
+    for (slot, name) in column_order.iter().enumerate() {
+        let vcol = value_columns_by_name.get(name).ok_or_else(|| {
+            FusedDispatchError::MissingValueColumn {
+                slot,
+                name: name.clone(),
+            }
+        })?;
+        let sig_dt = column_dtypes[slot];
+        let (data_bytes, valid_bytes_src) = vcol_bytes_for_slot(vcol, sig_dt, name, n_rows)?;
+        let val_buf = device
+            .new_buffer_from_bytes(data_bytes)
+            .map_err(GroupByError::Buffer)?;
+        // Defensive: ensure the validity buffer has enough bytes.
+        if valid_bytes_src.len() < valid_bytes_needed {
+            return Err(FusedDispatchError::GroupBy(GroupByError::OutputTooShort {
+                got: valid_bytes_src.len(),
+                need: valid_bytes_needed,
+            }));
+        }
+        let valid_slice = &valid_bytes_src[..valid_bytes_needed];
+        // Metal rejects zero-byte allocations; new_buffer_from_bytes also
+        // rejects empty slices. Pad to at least 4 bytes for alignment.
+        let padded;
+        let valid_for_buf: &[u8] = if valid_slice.len() < 4 {
+            padded = {
+                let mut v = vec![0u8; 4];
+                v[..valid_slice.len()].copy_from_slice(valid_slice);
+                v
+            };
+            &padded
+        } else {
+            valid_slice
+        };
+        let valid_buf = device
+            .new_buffer_from_bytes(valid_for_buf)
+            .map_err(GroupByError::Buffer)?;
+        value_bufs.push(val_buf);
+        valid_bufs.push(valid_buf);
+    }
+
+    // ---- allocate output buffers per agg ------------------------------------
+    let mut output_bufs: Vec<OutputBuf> = Vec::with_capacity(aggs.len());
+    for agg in aggs {
+        output_bufs.push(allocate_agg_output(device, agg, &col_dtypes, n_groups)?);
+    }
+
+    // ---- row_to_group + n_rows scalar buffers --------------------------------
+    let r2g_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            build.row_to_group.as_ptr() as *const u8,
+            build.row_to_group.len() * 4,
+        )
+    };
+    let r2g_buf = device
+        .new_buffer_from_bytes(r2g_bytes)
+        .map_err(GroupByError::Buffer)?;
+    let n_rows_u32: u32 =
+        u32::try_from(n_rows).map_err(|_| GroupByError::RowCountOverflow { n_rows })?;
+    let n_rows_buf = device
+        .new_buffer_from_bytes(&n_rows_u32.to_le_bytes())
+        .map_err(GroupByError::Buffer)?;
+
+    // ---- assemble bindings in emitter slot order ----------------------------
+    let mut bindings: Vec<&polars_metal_buffer::MetalBuffer> = Vec::new();
+    bindings.push(&r2g_buf);
+    bindings.push(&n_rows_buf);
+    for vb in &value_bufs {
+        bindings.push(vb);
+    }
+    for vb in &valid_bufs {
+        bindings.push(vb);
+    }
+    for ob in &output_bufs {
+        bindings.push(&ob.primary);
+        if let Some(cnt) = &ob.count {
+            bindings.push(cnt);
+        }
+    }
+
+    // ---- dispatch and wait --------------------------------------------------
+    queue
+        .dispatch_1d(&pso, &bindings, n_rows)
+        .map_err(GroupByError::from)?;
+    queue.wait_until_complete().map_err(GroupByError::from)?;
+
+    // ---- read back and finalize ---------------------------------------------
+    let mut agg_outputs: Vec<AggOutput> = Vec::with_capacity(aggs.len());
+    for (i, agg) in aggs.iter().enumerate() {
+        agg_outputs.push(finalize_agg_output(
+            agg,
+            &output_bufs[i],
+            n_groups,
+            &col_dtypes,
+        )?);
+    }
+
+    let representative_keys: Vec<u128> = build
+        .first_row_per_group
+        .iter()
+        .map(|&row| encoded[row as usize])
+        .collect();
+    let decoded_keys = decode_keys(&representative_keys, &schema);
+
+    Ok(GroupByResult {
+        decoded_keys,
+        agg_outputs,
+        n_groups: n_groups_u32,
+    })
+}
+
+/// Empty-shape output for an `AggSpec` (kernel-layer variant).
+fn empty_output_for_kagg(agg: &KAggSpec) -> AggOutput {
+    match agg {
+        KAggSpec::Simple { op, .. } => empty_output_for_op_simple(*op),
+        KAggSpec::Expression { op, .. } => empty_output_for_op_expression(*op),
+        KAggSpec::Length { .. } => AggOutput::U64 { values: vec![] },
+    }
+}
+
+fn empty_output_for_op_simple(op: KAggOp) -> AggOutput {
+    // Match the M2 dtype shape for these ops. Sum keeps its input width;
+    // Mean is always F32 (in the fused path — we only handle 32-bit inputs).
+    match op {
+        KAggOp::Count | KAggOp::Len => AggOutput::U64 { values: vec![] },
+        KAggOp::Mean => AggOutput::F32 {
+            values: vec![],
+            valid: vec![],
+        },
+        // Fall back to F32 for the other empty cases — the actual width is
+        // dtype-dependent but on an empty input no values are produced
+        // anyway; the python encoder reads `values.len()` (== 0) regardless.
+        KAggOp::Sum | KAggOp::Min | KAggOp::Max => AggOutput::F32 {
+            values: vec![],
+            valid: vec![],
+        },
+    }
+}
+
+fn empty_output_for_op_expression(op: KAggOp) -> AggOutput {
+    // Expression aggs always evaluate to f32 in the fused emitter.
+    match op {
+        KAggOp::Count | KAggOp::Len => AggOutput::U64 { values: vec![] },
+        _ => AggOutput::F32 {
+            values: vec![],
+            valid: vec![],
+        },
+    }
+}
+
+fn insert_dtype(
+    out: &mut std::collections::BTreeMap<String, KMetalDtype>,
+    name: &str,
+    by_name: &std::collections::HashMap<String, ValueColumn<'_>>,
+) -> Result<(), FusedDispatchError> {
+    if out.contains_key(name) {
+        return Ok(());
+    }
+    let vcol = by_name
+        .get(name)
+        .ok_or_else(|| FusedDispatchError::MissingValueColumn {
+            slot: out.len(),
+            name: name.to_string(),
+        })?;
+    let dt = match vcol {
+        ValueColumn::I32 { .. } => KMetalDtype::I32,
+        ValueColumn::F32 { .. } => KMetalDtype::F32,
+        ValueColumn::I64 { .. } => KMetalDtype::I64,
+        ValueColumn::F64 { .. } => KMetalDtype::F64,
+    };
+    out.insert(name.to_string(), dt);
+    Ok(())
+}
+
+/// Borrow the data and validity byte slices for a value column. Verifies
+/// the runtime dtype matches the signature's per-slot dtype (callers are
+/// expected to derive both from the same source, so a mismatch is a bug).
+fn vcol_bytes_for_slot<'a>(
+    vcol: &'a ValueColumn<'a>,
+    sig_dt: KMetalDtype,
+    name: &str,
+    n_rows: usize,
+) -> Result<(&'a [u8], &'a [u8]), FusedDispatchError> {
+    match (sig_dt, vcol) {
+        (KMetalDtype::I32, ValueColumn::I32 { data, valid }) => {
+            // SAFETY: i32 is plain-old-data; we expose the n_rows*4 byte
+            // window onto the typed slice.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, n_rows * 4) };
+            Ok((bytes, valid))
+        }
+        (KMetalDtype::F32, ValueColumn::F32 { data, valid }) => {
+            // SAFETY: f32 is plain-old-data.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, n_rows * 4) };
+            Ok((bytes, valid))
+        }
+        (sig_dt, got) => {
+            let got_name = match got {
+                ValueColumn::I32 { .. } => "I32",
+                ValueColumn::F32 { .. } => "F32",
+                ValueColumn::I64 { .. } => "I64",
+                ValueColumn::F64 { .. } => "F64",
+            };
+            Err(FusedDispatchError::ValueDtypeMismatch {
+                name: name.to_string(),
+                sig_dt,
+                got: got_name,
+            })
+        }
+    }
+}
+
+/// Allocate the output buffer(s) for one agg, seeded per op semantics.
+/// Mean reserves a count companion (u32); other ops use only the primary.
+fn allocate_agg_output(
+    device: &MetalDevice,
+    agg: &KAggSpec,
+    col_dtypes: &std::collections::BTreeMap<String, KMetalDtype>,
+    n_groups: usize,
+) -> Result<OutputBuf, FusedDispatchError> {
+    let (op, primary_kind) = match agg {
+        KAggSpec::Simple { op, input_col, .. } => {
+            let dt = *col_dtypes.get(input_col).ok_or_else(|| {
+                FusedDispatchError::MissingValueColumn {
+                    slot: 0,
+                    name: input_col.clone(),
+                }
+            })?;
+            (*op, primary_kind_for(*op, dt))
+        }
+        KAggSpec::Expression { expr, op, .. } => {
+            // Expression aggs always evaluate to f32 in the emitter (see
+            // `emit_expr_msl`).
+            let _ = expr; // unused except for documentation
+            (*op, primary_kind_for(*op, KMetalDtype::F32))
+        }
+        KAggSpec::Length { .. } => (KAggOp::Len, PrimaryKind::U32),
+    };
+
+    let primary = match (op, primary_kind) {
+        // Sum / Mean's sum slot / Count / Len → zero-init.
+        (KAggOp::Sum, _) | (KAggOp::Count, _) | (KAggOp::Len, _) | (KAggOp::Mean, _) => device
+            .new_buffer_zeroed(n_groups * 4)
+            .map_err(GroupByError::Buffer)?,
+        // Min over signed int: seed with i32::MAX.
+        (KAggOp::Min, PrimaryKind::I32) => seed_buffer_i32(device, i32::MAX, n_groups)?,
+        // Min over unsigned int: seed with u32::MAX.
+        (KAggOp::Min, PrimaryKind::U32) => seed_buffer_u32(device, u32::MAX, n_groups)?,
+        // Min over float: seed with +INFINITY's bit pattern.
+        (KAggOp::Min, PrimaryKind::F32Bits) => {
+            seed_buffer_u32(device, f32::INFINITY.to_bits(), n_groups)?
+        }
+        // Max over signed int: seed with i32::MIN.
+        (KAggOp::Max, PrimaryKind::I32) => seed_buffer_i32(device, i32::MIN, n_groups)?,
+        // Max over unsigned int: seed with u32::MIN (0). Same as zero-init.
+        (KAggOp::Max, PrimaryKind::U32) => device
+            .new_buffer_zeroed(n_groups * 4)
+            .map_err(GroupByError::Buffer)?,
+        // Max over float: seed with -INFINITY's bit pattern.
+        (KAggOp::Max, PrimaryKind::F32Bits) => {
+            seed_buffer_u32(device, f32::NEG_INFINITY.to_bits(), n_groups)?
+        }
+    };
+
+    let count = if matches!(op, KAggOp::Mean) {
+        Some(
+            device
+                .new_buffer_zeroed(n_groups * 4)
+                .map_err(GroupByError::Buffer)?,
+        )
+    } else {
+        None
+    };
+
+    Ok(OutputBuf {
+        primary,
+        count,
+        primary_kind,
+    })
+}
+
+fn primary_kind_for(op: KAggOp, input_dt: KMetalDtype) -> PrimaryKind {
+    match op {
+        KAggOp::Count | KAggOp::Len => PrimaryKind::U32,
+        // Mean's sum slot follows the same shape as a float Sum (CAS on
+        // atomic_uint as a bit-pattern container) when the input is float,
+        // or i32/u32 otherwise. The CPU finalize divides by count.
+        _ => match input_dt {
+            KMetalDtype::F32 | KMetalDtype::F64 => PrimaryKind::F32Bits,
+            KMetalDtype::I32 | KMetalDtype::I16 | KMetalDtype::I8 | KMetalDtype::I64 => {
+                PrimaryKind::I32
+            }
+            KMetalDtype::U32 | KMetalDtype::U16 | KMetalDtype::U8 | KMetalDtype::Bool => {
+                PrimaryKind::U32
+            }
+        },
+    }
+}
+
+fn seed_buffer_i32(
+    device: &MetalDevice,
+    seed: i32,
+    n_groups: usize,
+) -> Result<polars_metal_buffer::MetalBuffer, FusedDispatchError> {
+    let v: Vec<i32> = vec![seed; n_groups];
+    // SAFETY: i32 is plain-old-data.
+    let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, n_groups * 4) };
+    device
+        .new_buffer_from_bytes(bytes)
+        .map_err(|e| FusedDispatchError::GroupBy(GroupByError::Buffer(e)))
+}
+
+fn seed_buffer_u32(
+    device: &MetalDevice,
+    seed: u32,
+    n_groups: usize,
+) -> Result<polars_metal_buffer::MetalBuffer, FusedDispatchError> {
+    let v: Vec<u32> = vec![seed; n_groups];
+    // SAFETY: u32 is plain-old-data.
+    let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, n_groups * 4) };
+    device
+        .new_buffer_from_bytes(bytes)
+        .map_err(|e| FusedDispatchError::GroupBy(GroupByError::Buffer(e)))
+}
+
+/// Read back one agg's output buffer(s) and widen into `AggOutput`.
+fn finalize_agg_output(
+    agg: &KAggSpec,
+    obuf: &OutputBuf,
+    n_groups: usize,
+    col_dtypes: &std::collections::BTreeMap<String, KMetalDtype>,
+) -> Result<AggOutput, FusedDispatchError> {
+    let primary_bytes = obuf.primary.as_slice();
+    let need = n_groups * 4;
+    if primary_bytes.len() < need {
+        return Err(FusedDispatchError::GroupBy(GroupByError::OutputTooShort {
+            got: primary_bytes.len(),
+            need,
+        }));
+    }
+
+    // For Mean, read the count companion now.
+    let count_vec: Option<Vec<u32>> = obuf.count.as_ref().map(|c| {
+        let b = c.as_slice();
+        (0..n_groups)
+            .map(|g| u32::from_le_bytes(b[g * 4..g * 4 + 4].try_into().unwrap_or([0; 4])))
+            .collect::<Vec<u32>>()
+    });
+
+    match agg {
+        KAggSpec::Length { .. } => {
+            let vals = read_u32_to_u64(primary_bytes, n_groups);
+            Ok(AggOutput::U64 { values: vals })
+        }
+        KAggSpec::Simple { op, input_col, .. } => {
+            let dt = *col_dtypes.get(input_col).ok_or_else(|| {
+                FusedDispatchError::MissingValueColumn {
+                    slot: 0,
+                    name: input_col.clone(),
+                }
+            })?;
+            finalize_simple_like(*op, dt, obuf, primary_bytes, n_groups, count_vec)
+        }
+        KAggSpec::Expression { op, .. } => {
+            // Expression evaluates to f32 always; treat as F32 input dtype.
+            finalize_simple_like(
+                *op,
+                KMetalDtype::F32,
+                obuf,
+                primary_bytes,
+                n_groups,
+                count_vec,
+            )
+        }
+    }
+}
+
+/// Shared finalize: handles Sum / Mean / Min / Max / Count given the
+/// (op, input dtype) pair. The fused emitter's primary kind disambiguates
+/// the 32-bit container type.
+fn finalize_simple_like(
+    op: KAggOp,
+    input_dt: KMetalDtype,
+    obuf: &OutputBuf,
+    primary_bytes: &[u8],
+    n_groups: usize,
+    count_vec: Option<Vec<u32>>,
+) -> Result<AggOutput, FusedDispatchError> {
+    match op {
+        KAggOp::Count => Ok(AggOutput::U64 {
+            values: read_u32_to_u64(primary_bytes, n_groups),
+        }),
+        KAggOp::Len => Ok(AggOutput::U64 {
+            values: read_u32_to_u64(primary_bytes, n_groups),
+        }),
+        KAggOp::Sum => match obuf.primary_kind {
+            PrimaryKind::I32 => {
+                let values: Vec<i32> = read_i32(primary_bytes, n_groups);
+                // Polars sum of an all-null group returns 0 (not null) —
+                // matches the M2 i32 sum path.
+                Ok(AggOutput::I32 {
+                    values,
+                    valid: vec![true; n_groups],
+                })
+            }
+            PrimaryKind::U32 => {
+                let values: Vec<i32> = read_u32(primary_bytes, n_groups)
+                    .into_iter()
+                    .map(|v| v as i32)
+                    .collect();
+                Ok(AggOutput::I32 {
+                    values,
+                    valid: vec![true; n_groups],
+                })
+            }
+            PrimaryKind::F32Bits => {
+                let values: Vec<f32> = read_f32_bits(primary_bytes, n_groups);
+                Ok(AggOutput::F32 {
+                    values,
+                    valid: vec![true; n_groups],
+                })
+            }
+        },
+        KAggOp::Mean => {
+            let counts = count_vec.unwrap_or_else(|| vec![0u32; n_groups]);
+            match obuf.primary_kind {
+                PrimaryKind::I32 => {
+                    let sums: Vec<i32> = read_i32(primary_bytes, n_groups);
+                    let (values, valid) = mean_from_sum_count_i32(&sums, &counts);
+                    Ok(AggOutput::F32 { values, valid })
+                }
+                PrimaryKind::U32 => {
+                    let sums: Vec<u32> = read_u32(primary_bytes, n_groups);
+                    let (values, valid) = mean_from_sum_count_u32(&sums, &counts);
+                    Ok(AggOutput::F32 { values, valid })
+                }
+                PrimaryKind::F32Bits => {
+                    let sums: Vec<f32> = read_f32_bits(primary_bytes, n_groups);
+                    let (values, valid) = mean_from_sum_count_f32(&sums, &counts);
+                    Ok(AggOutput::F32 { values, valid })
+                }
+            }
+        }
+        KAggOp::Min | KAggOp::Max => {
+            // Per-group validity: a group is null only when no input row
+            // contributed. The fused emitter doesn't currently materialize
+            // a per-agg count companion for Min/Max (Task 16 will explore
+            // adding one). Q1-shape workloads have no all-null groups, so
+            // we treat all groups as valid for now. See the commit message
+            // for Task 15 for the limitation note.
+            match obuf.primary_kind {
+                PrimaryKind::I32 => {
+                    let values: Vec<i32> = read_i32(primary_bytes, n_groups);
+                    Ok(AggOutput::I32 {
+                        values,
+                        valid: vec![true; n_groups],
+                    })
+                }
+                PrimaryKind::U32 => {
+                    // unsigned-input Min/Max isn't exercised in Q1 today, but
+                    // the emitter still emits a u32 accumulator. We preserve
+                    // it by returning as I32 (Polars surfaces u32 separately;
+                    // M2's per-agg path doesn't yet route u32 either, so
+                    // this is unreachable on the canonical workloads). Mark
+                    // every group valid.
+                    let _ = input_dt; // silence
+                    let values: Vec<i32> = read_u32(primary_bytes, n_groups)
+                        .into_iter()
+                        .map(|v| v as i32)
+                        .collect();
+                    Ok(AggOutput::I32 {
+                        values,
+                        valid: vec![true; n_groups],
+                    })
+                }
+                PrimaryKind::F32Bits => {
+                    let values: Vec<f32> = read_f32_bits(primary_bytes, n_groups);
+                    Ok(AggOutput::F32 {
+                        values,
+                        valid: vec![true; n_groups],
+                    })
+                }
+            }
+        }
+    }
+}
+
+// ---- typed read helpers --------------------------------------------------
+
+fn read_u32(bytes: &[u8], n: usize) -> Vec<u32> {
+    let mut out = Vec::with_capacity(n);
+    for g in 0..n {
+        let b = &bytes[g * 4..g * 4 + 4];
+        out.push(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    }
+    out
+}
+
+fn read_u32_to_u64(bytes: &[u8], n: usize) -> Vec<u64> {
+    let mut out = Vec::with_capacity(n);
+    for g in 0..n {
+        let b = &bytes[g * 4..g * 4 + 4];
+        out.push(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64);
+    }
+    out
+}
+
+fn read_i32(bytes: &[u8], n: usize) -> Vec<i32> {
+    let mut out = Vec::with_capacity(n);
+    for g in 0..n {
+        let b = &bytes[g * 4..g * 4 + 4];
+        out.push(i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    }
+    out
+}
+
+fn read_f32_bits(bytes: &[u8], n: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(n);
+    for g in 0..n {
+        let b = &bytes[g * 4..g * 4 + 4];
+        let bits = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        out.push(f32::from_bits(bits));
+    }
+    out
+}
+
+fn mean_from_sum_count_f32(sums: &[f32], counts: &[u32]) -> (Vec<f32>, Vec<bool>) {
+    let mut values = Vec::with_capacity(sums.len());
+    let mut valid = Vec::with_capacity(sums.len());
+    for (s, &c) in sums.iter().zip(counts.iter()) {
+        if c == 0 {
+            values.push(0.0f32);
+            valid.push(false);
+        } else {
+            values.push(*s / c as f32);
+            valid.push(true);
+        }
+    }
+    (values, valid)
+}
+
+fn mean_from_sum_count_i32(sums: &[i32], counts: &[u32]) -> (Vec<f32>, Vec<bool>) {
+    let mut values = Vec::with_capacity(sums.len());
+    let mut valid = Vec::with_capacity(sums.len());
+    for (s, &c) in sums.iter().zip(counts.iter()) {
+        if c == 0 {
+            values.push(0.0f32);
+            valid.push(false);
+        } else {
+            values.push(*s as f32 / c as f32);
+            valid.push(true);
+        }
+    }
+    (values, valid)
+}
+
+fn mean_from_sum_count_u32(sums: &[u32], counts: &[u32]) -> (Vec<f32>, Vec<bool>) {
+    let mut values = Vec::with_capacity(sums.len());
+    let mut valid = Vec::with_capacity(sums.len());
+    for (s, &c) in sums.iter().zip(counts.iter()) {
+        if c == 0 {
+            values.push(0.0f32);
+            valid.push(false);
+        } else {
+            values.push(*s as f32 / c as f32);
+            valid.push(true);
+        }
+    }
+    (values, valid)
+}

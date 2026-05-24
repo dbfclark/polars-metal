@@ -36,8 +36,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLCompileOptions, MTLComputePipelineState, MTLDevice as _, MTLFunction as _,
-    MTLLibrary as _,
+    MTLCompileOptions, MTLComputePipelineState, MTLDevice as _, MTLFunction as _, MTLLibrary as _,
 };
 use polars_metal_buffer::MetalDevice;
 use thiserror::Error;
@@ -185,7 +184,9 @@ impl FusedLibraryCache {
         let device = function.device();
         device
             .newComputePipelineStateWithFunction_error(&function)
-            .map_err(|err| FusedCacheError::PipelineStateFailed(err.localizedDescription().to_string()))
+            .map_err(|err| {
+                FusedCacheError::PipelineStateFailed(err.localizedDescription().to_string())
+            })
     }
 }
 

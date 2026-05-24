@@ -111,4 +111,3 @@ fn warmup_pre_compiles_then_get_or_compile_is_a_hit() {
         "warmup-compiled PSO must be the same instance returned by get_or_compile"
     );
 }
-
