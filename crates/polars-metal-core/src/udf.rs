@@ -187,6 +187,36 @@ fn get_or_init_fused_cache(device: &MetalDevice) -> &'static FusedLibraryCache {
     FUSED_CACHE.get_or_init(|| FusedLibraryCache::new(device.clone()))
 }
 
+/// Pre-compile common fused-agg signatures into the process-wide
+/// `FUSED_CACHE` (Task 18). Called from `python/polars_metal/__init__.py`
+/// at import time so the first user query of a common shape
+/// (single-column F32 Sum, Q1-shape 10-agg, etc.) does not pay the MSL
+/// compile cost.
+///
+/// Best-effort: if the Metal device cannot be acquired (no Metal-capable
+/// hardware), or any individual signature fails to compile, the warmup
+/// returns the number of signatures actually queued (0 on device failure).
+/// The Python wrapper swallows exceptions too — warmup is advisory and
+/// must not break engine startup.
+///
+/// Returns the count of signatures the cache was asked to warm; the
+/// Python side uses this for logging and the integration test.
+#[pyfunction]
+pub fn warmup_common_fused_signatures() -> i32 {
+    use polars_metal_kernels::aggregate_fused::cache::common_signatures;
+
+    let Ok(device) = MetalDevice::system_default() else {
+        // No Metal device available — running under a non-Metal harness
+        // (e.g. CI without a GPU). Warmup is a no-op; skip without error.
+        return 0;
+    };
+    let cache = get_or_init_fused_cache(&device);
+    let sigs = common_signatures();
+    let count = sigs.len() as i32;
+    cache.warmup(&sigs);
+    count
+}
+
 /// PyO3 entry point exposed as `polars_metal._native.execute_plan`.
 ///
 /// # Arguments

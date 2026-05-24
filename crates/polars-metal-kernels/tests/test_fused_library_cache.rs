@@ -85,6 +85,26 @@ fn cache_compiles_distinct_for_different_signatures() {
 }
 
 #[test]
+fn common_signatures_returns_nonempty_and_buildable() {
+    use polars_metal_kernels::aggregate_fused::cache::{common_signatures, FusedLibraryCache};
+    let device = MetalDevice::system_default().expect("Metal-capable hardware required");
+    let cache = FusedLibraryCache::new(device);
+    let sigs = common_signatures();
+    assert!(
+        sigs.len() >= 3,
+        "expected at least 3 common signatures, got {}",
+        sigs.len()
+    );
+    cache.warmup(&sigs);
+    // Touch the first signature again — should be a hit (same PSO returned).
+    let (sig, specs) = &sigs[0];
+    let pso = cache
+        .get_or_compile(sig, specs)
+        .expect("warmed sig must hit");
+    drop(pso);
+}
+
+#[test]
 fn warmup_pre_compiles_then_get_or_compile_is_a_hit() {
     let device = MetalDevice::system_default().expect("Metal-capable hardware required");
     let cache = FusedLibraryCache::new(device);

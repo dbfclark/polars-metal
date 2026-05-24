@@ -142,4 +142,24 @@ def _patch_gpu_engine_callback() -> None:
 _patch_gpu_engine_callback()
 
 
+def _warmup_kernels() -> None:
+    """Pre-compile common fused-agg signatures at import time (Task 18).
+
+    Cost: ~100-500ms one-time per process. Benefit: first user query of
+    common shapes (single F32 Sum, F32 Mean, Q1-shape 10-agg, Q1 disc_price
+    expression) doesn't pay MSL compile (~100-300ms each).
+
+    Best-effort: any error (missing Metal device, compile failure) is
+    swallowed so module import never breaks. Real failures resurface when
+    a query of that shape actually runs.
+    """
+    try:
+        _native.warmup_common_fused_signatures()
+    except Exception:  # noqa: BLE001 — best-effort, never fail import
+        pass
+
+
+_warmup_kernels()
+
+
 __all__ = ["MetalEngine", "__version__"]
