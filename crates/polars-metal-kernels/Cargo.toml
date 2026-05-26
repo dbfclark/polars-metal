@@ -76,5 +76,9 @@ harness = false
 name = "groupby_build_partitioned"
 harness = false
 
+[[bench]]
+name = "groupby_build_sort"
+harness = false
+
 [lints]
 workspace = true
