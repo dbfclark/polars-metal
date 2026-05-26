@@ -54,3 +54,16 @@ proptest! {
         prop_assert_eq!(gpu_out.n_groups, cpu_out.n_groups);
     }
 }
+
+#[test]
+fn build_signals_overflow_at_extreme_cardinality() {
+    let device = polars_metal_buffer::MetalDevice::system_default().expect("metal device");
+    use polars_metal_kernels::groupby_build_partitioned::{
+        gpu::partition_and_build, PartitionedBuildError,
+    };
+    // 10K unique keys into 4 partitions → ~2.5K unique per partition,
+    // which exceeds the 1024-slot TGSM table cap; overflow expected.
+    let keys: Vec<u128> = (0u128..10_000).collect();
+    let result = partition_and_build(&device, &keys, 4);
+    assert!(matches!(result, Err(PartitionedBuildError::Overflow)));
+}

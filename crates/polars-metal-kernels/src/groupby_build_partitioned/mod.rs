@@ -36,6 +36,14 @@ pub enum PartitionedBuildError {
     Dispatch(#[from] crate::command::DispatchError),
     #[error("input row count overflows u32")]
     RowOverflow,
+    /// A1's per-threadgroup TGSM hash table couldn't fit one partition's
+    /// unique keys (either the partition exceeded the 1024-slot capacity
+    /// or the linear-probe chain exceeded the 64-step limit). The
+    /// orchestrator (Phase 6 router) handles this by re-dispatching the
+    /// query via capability A2 (sort + segment-reduce build), which has
+    /// no upper bound on group cardinality. Per-row sentinel
+    /// `UINT_MAX` in the GPU output marks rows that failed to land in a
+    /// slot — those rows are discarded once we fall back.
     #[error("A1 TGSM overflow; fallback to A2")]
     Overflow,
 }
