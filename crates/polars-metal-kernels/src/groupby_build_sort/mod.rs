@@ -13,5 +13,17 @@
 //! implementation. We share the `BuildOutput` struct with A1 so the
 //! router (Phase 6) can dispatch either build interchangeably.
 
+pub mod gpu;
 pub mod reference;
-// `pub mod gpu;` lands in Task 25 alongside the first lane kernel.
+
+#[derive(Debug, thiserror::Error)]
+pub enum SortError {
+    #[error(transparent)]
+    Buffer(#[from] polars_metal_buffer::BufferError),
+    #[error(transparent)]
+    Shader(#[from] crate::shader_lib::ShaderError),
+    #[error(transparent)]
+    Dispatch(#[from] crate::command::DispatchError),
+    #[error("input row count overflows u32")]
+    RowOverflow,
+}
