@@ -4352,6 +4352,279 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 
 ---
 
+## Phase 5 retrospective — measured perf and revised strategy (2026-05-26)
+
+**Bench data after Phases 4 + 5 shipped** (commits `b7b9afd`–`45f04b2`; M2 Pro, --release, median of 5 iters, 16 partitions for A1):
+
+```
+   n_rows   n_groups     A1 (GPU)     A2 (GPU)  CPU HashMap   A1/CPU
+   100000          4         5.79        59.34         1.13     5.14×
+   100000       1024         5.29        60.58         1.28     4.13×
+   100000      16384       overflow      59.27         1.54        —
+  1000000          4        16.33       223.15        10.66     1.53×
+  1000000       1024        13.44       223.61        13.16     1.02×
+  1000000      16384       overflow     225.87        20.76        —
+  1000000      65536       overflow     225.86        20.76        —
+ 10000000          4       109.11      2050.19       113.29     0.96×
+ 10000000       1024        83.63      2079.45       126.97     0.66×
+ 10000000      65536       overflow    2092.03       211.44        —
+```
+
+**Per-phase A1 breakdown at 10M × 1024 (50ms total):**
+| Phase | Time | % |
+|---|---|---|
+| key_split (u128 → u64 lo/hi) | 5.85ms | 12% |
+| alloc_scatter (9 buffers) | 11.70ms | 23% |
+| dispatch_count | 8.63ms | 17% |
+| cpu_scan_1 | 0.27ms | 1% |
+| dispatch_scatter | 3.18ms | 6% |
+| dispatch_build | 7.64ms | 15% |
+| readback | 1.31ms | 3% |
+| final_derive (CPU re-hashes each row) | 9.26ms | 19% |
+
+**Per-lane A2 breakdown at 10M (~126ms/lane × 16 lanes = 2050ms):**
+- 2 GPU dispatches × ~2ms = 4ms
+- ~640MB memory traffic ping-ponging keys/idx buffers
+- 40MB tile_hist readback + 40MB CPU prefix-scan (cache-miss territory)
+- Buffer (re-)allocation per lane
+
+**Conclusions driving the strategy revision:**
+
+1. **A1 is competitive but not dominant in current form.** Wins at high row × low cardinality (10M × 1024 = 0.66× CPU) and loses elsewhere (100K × 4 = 5× *slower* than CPU). Three measurable optimizations (Phase 4.5 below) target a 6× CPU win.
+
+2. **A2 in current form is strictly worse than CPU at every tested cardinality.** Even where A1 overflows (16K+ groups), CPU at 211ms beats A2's 2092ms at 10M × 65K. The architectural issue is **GPU dispatch+wait latency on Apple Silicon is ~1-3ms** versus NVIDIA's microsecond-scale dispatch; 16-pass radix sort × 2 kernels/pass = 32 dispatches floor on Apple. Not fixable without algorithmic change.
+
+3. **Phase 5 (A2) is shelf-ware.** Keep the kernels and infrastructure in the repo as a future reference / M4 starting point, but do NOT wire A2 into the Phase 6 router. The fallback path for A1-overflow stays CPU.
+
+4. **High-cardinality (>16K groups) needs a different GPU algorithm.** A single-pass global-atomic GPU hash table (Phase 5b spike) might work where A2 doesn't: Apple Silicon unified memory + single-die avoids the cross-die contention that motivated cuDF's partitioned design.
+
+## Phase 4.5 — A1 optimization (perf wins to make it dominant)
+
+Goal: take A1 at 10M × 1024 groups from 50ms → ~20ms (matches CPU's 99ms ÷ ~5×). Three independent wins from the breakdown above.
+
+### Task 28a: MSL `ulong2` keys — eliminate the lo/hi split
+
+**Files:**
+- Modify: `shaders/groupby_build_partitioned_scatter.metal`
+- Modify: `shaders/groupby_build_partitioned_build.metal`
+- Modify: `crates/polars-metal-kernels/src/groupby_build_partitioned/gpu.rs`
+
+**Win**: 5.85ms saved at 10M (CPU pre-processing eliminated), plus halves the input-buffer allocation overhead (one 160MB buffer instead of two 80MB buffers).
+
+- [ ] **Step 1**: Replace `device const uint64_t* keys_lo` + `device const uint64_t* keys_hi` with `device const ulong2* keys` in both MSL kernels. Update `hash_u128`, `partition_id` helpers to take `ulong2` (or `uint64_t lo, uint64_t hi` split inline from `key.x`, `key.y`). MSL 3.0 supports `ulong2`.
+
+- [ ] **Step 2**: Replace the Rust `keys_lo: Vec<u64>` + `keys_hi: Vec<u64>` allocations with a direct reinterpret of the input `&[u128]` as `&[u8]` (the layout matches `ulong2` on Apple Silicon: 16-byte aligned, little-endian). No copy needed:
+
+```rust
+// SAFETY: u128 is layout-compatible with ulong2 (16 bytes, 16-byte aligned, LE).
+let keys_bytes: &[u8] = unsafe {
+    std::slice::from_raw_parts(keys.as_ptr() as *const u8, std::mem::size_of_val(keys))
+};
+let buf_keys = device.new_buffer_from_bytes(keys_bytes)?;
+```
+
+- [ ] **Step 3**: Update both kernels' `[[buffer(N)]]` binding indices (now one less). Cascades through `partition_count`, `partition_scatter`, `partition_build`. Be careful with the constant-buffer indices — they shift.
+
+- [ ] **Step 4**: Run all existing A1 proptests (`test_groupby_build_partitioned_scatter`, `test_groupby_build_partitioned_build`). Expect them to pass unchanged — the algorithm is the same.
+
+- [ ] **Step 5**: Re-run `bench_cpu_build_compare` to confirm the saving. Target: 10M × 1024 A1 drops from 84ms → ~75ms (saved key_split + halved input alloc).
+
+- [ ] **Step 6**: Commit.
+
+```bash
+git commit -m "Kernel: A1 uses MSL ulong2 keys, removing CPU u128→u64 lo/hi split
+
+Phase 4.5 / Task 28a. Halves the input-buffer footprint and eliminates
+two CPU iter-allocate loops totalling ~6ms at 10M rows.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+```
+
+### Task 28b: Per-call scratch arena — eliminate buffer-allocation overhead
+
+**Files:**
+- Modify: `crates/polars-metal-kernels/src/groupby_build_partitioned/gpu.rs`
+
+**Win**: 11.7ms saved at 10M (the alloc_scatter phase). MTLBuffer creation has fixed per-allocation cost; combining all scratch buffers into one or pooling them across calls eliminates most of it.
+
+- [ ] **Step 1**: Introduce a `BuildScratch` struct that owns all the scratch buffers a single `partition_and_build` call needs:
+  - `counts: MetalBuffer` (n_partitions × 4 bytes)
+  - `cursors: MetalBuffer` (n_partitions × 4 bytes)
+  - `partition_offsets: MetalBuffer` (n_partitions + 1 × 4 bytes)
+  - `row_idx: MetalBuffer` (n_rows × 4 bytes)
+  - `row_to_local_group: MetalBuffer` (n_rows × 4 bytes)
+  - `n_groups_per_part: MetalBuffer` (n_partitions × 4 bytes)
+  - `overflow_flag: MetalBuffer` (4 bytes)
+  - Plus the three small constant buffers (`n_rows`, `n_partitions`, `log2_tgsm`)
+
+```rust
+pub struct BuildScratch {
+    counts: MetalBuffer,
+    cursors: MetalBuffer,
+    partition_offsets: MetalBuffer,
+    row_idx: MetalBuffer,
+    r2lg: MetalBuffer,
+    n_groups_per_part: MetalBuffer,
+    overflow: MetalBuffer,
+    capacity_rows: usize,
+    capacity_parts: u32,
+}
+
+impl BuildScratch {
+    pub fn new(device: &MetalDevice, capacity_rows: usize, capacity_parts: u32)
+        -> Result<Self, PartitionedBuildError> { ... }
+
+    /// Reuse if capacity is sufficient; otherwise reallocate to fit.
+    pub fn ensure(&mut self, device: &MetalDevice, n_rows: usize, n_parts: u32)
+        -> Result<(), PartitionedBuildError> { ... }
+
+    pub fn zero(&self) -> Result<(), PartitionedBuildError> { ... }
+}
+```
+
+- [ ] **Step 2**: Add a new entry point `partition_and_build_with_scratch(&device, &mut scratch, keys, n_partitions) -> Result<BuildOutput, _>`. The existing `partition_and_build` becomes a convenience wrapper that constructs scratch each call.
+
+- [ ] **Step 3**: Re-zero the scratch buffers between calls via a TGSM zero-fill helper (vs alloc+zeroed). Metal's `blitCommandEncoder fillBuffer:range:value:` is the fastest; if `polars-metal-kernels::command` doesn't expose it, add a `CommandQueue::zero_buffer(&buf)` method.
+
+- [ ] **Step 4**: Run proptests + bench. Target: 10M × 1024 A1 drops 75ms → ~63ms.
+
+- [ ] **Step 5**: Commit.
+
+### Task 28c: Pass partition_id from scatter to build — skip CPU re-hash
+
+**Files:**
+- Modify: `shaders/groupby_build_partitioned_scatter.metal`
+- Modify: `crates/polars-metal-kernels/src/groupby_build_partitioned/gpu.rs`
+
+**Win**: 9.26ms saved at 10M (the final_derive phase). Currently `partition_and_build` re-hashes every row on the CPU to recover its partition_id; the scatter kernel already computed this, we just need to persist it.
+
+- [ ] **Step 1**: Add an output buffer to `partition_scatter`:
+
+```metal
+// Add a third output to partition_scatter:
+device uint*           partition_id_per_row [[buffer(N)]],   // [n_rows]
+```
+
+Each thread writes `partition_id_per_row[gid] = p` (where `p` is already computed for the scatter write).
+
+- [ ] **Step 2**: In the Rust orchestrator, read this buffer back into `Vec<u32>` and use it directly in the final loop instead of calling `partition_id(keys[r], np)`.
+
+- [ ] **Step 3**: Run proptests + bench. Target: 10M × 1024 A1 drops 63ms → ~54ms.
+
+- [ ] **Step 4**: Commit.
+
+### Task 28d: Re-run benches + update perf gate
+
+**Files:**
+- Modify: `benches/baseline.json` (or wherever the perf-gate thresholds live)
+- Re-run: `cargo bench --bench groupby_build_partitioned` and `bench_cpu_build_compare`
+
+- [ ] Capture new A1 numbers across the full grid. Phase 4.5 hits its win target if the 10M × 1024 case lands at ≤30ms (≈3× CPU's 127ms). Document delta from the Phase 4 baseline.
+
+- [ ] If targets miss, profile again and identify the next bottleneck (likely: `dispatch_build`'s TGSM-table build, or the final scan).
+
+- [ ] Commit perf-gate update.
+
+## Phase 5b — Single-pass global-atomic GPU hash spike (capability A3)
+
+Goal: prove or disprove that Apple Silicon's unified-memory + single-die architecture makes a global-atomic hash table viable for high-cardinality groupby (the regime where A1 overflows and CPU starts to slow down).
+
+**This is a spike, not a productionization.** Outcome: either a working high-cardinality GPU path that beats CPU at 10M × 65K (CPU = 211ms; target = 100ms), or a documented "doesn't work" with the failure mode captured.
+
+### Task A3.1: Design + smoke
+
+**Files:**
+- Create: `shaders/groupby_global_hash.metal`
+- Create: `crates/polars-metal-kernels/src/groupby_global_hash/mod.rs`
+- Create: `crates/polars-metal-kernels/src/groupby_global_hash/gpu.rs`
+- Create: `crates/polars-metal-kernels/tests/test_groupby_global_hash_smoke.rs`
+
+The design (inspired by cuDF's `cuco::static_map` but adapted):
+
+```metal
+// Single kernel, one thread per input row.
+// Global table: 2 × estimated_unique_keys slots, open addressing, linear probe.
+// Slot state: (key: ulong2, group_id: uint, occupied: atomic_uint).
+// occupied = 0 → empty. occupied != 0 → group_id is valid.
+
+kernel void global_hash_build(
+    device const ulong2*  keys             [[buffer(0)]],
+    device atomic_ulong2* slot_key         [[buffer(1)]],   // [table_size]
+    device atomic_uint*   slot_state       [[buffer(2)]],   // [table_size]
+    device atomic_uint*   next_group_id    [[buffer(3)]],   // [1]
+    device uint*          row_to_group     [[buffer(4)]],   // [n_rows]
+    constant uint&        n_rows           [[buffer(5)]],
+    constant uint&        table_size       [[buffer(6)]],   // power-of-2
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n_rows) return;
+    ulong2 key = keys[gid];
+    uint slot = (uint)(hash_u128(key.x, key.y) & (table_size - 1));
+    // Open-addressing linear probe.
+    for (uint probe = 0; probe < table_size; probe++) {
+        uint state = atomic_load_explicit(&slot_state[slot], memory_order_relaxed);
+        if (state == 0) {
+            // Try to claim.
+            uint expected = 0;
+            if (atomic_compare_exchange_weak_explicit(
+                    &slot_state[slot], &expected, UINT_MAX,
+                    memory_order_acquire, memory_order_relaxed)) {
+                // We won the CAS. Write the key, get a group_id, publish.
+                // ⚠ Metal lacks atomic_ulong2 — we may need atomic_ulong on
+                //   key.x and a separate slot for key.y, with a 2-step claim
+                //   protocol. Alternative: keep keys in non-atomic global
+                //   storage and rely on slot_state CAS as the synchronization
+                //   point (sequenced_acquire/release between key write and
+                //   state publish).
+                slot_key[slot] = key;
+                uint gid_local = atomic_fetch_add_explicit(&next_group_id, 1, memory_order_relaxed);
+                atomic_store_explicit(&slot_state[slot], gid_local + 1, memory_order_release);
+                row_to_group[gid] = gid_local;
+                return;
+            }
+            // Lost race; fallthrough.
+        }
+        // Wait for claim to complete or check for match.
+        while (state == UINT_MAX) {
+            state = atomic_load_explicit(&slot_state[slot], memory_order_acquire);
+        }
+        if (slot_key[slot].x == key.x && slot_key[slot].y == key.y) {
+            row_to_group[gid] = state - 1;
+            return;
+        }
+        slot = (slot + 1) & (table_size - 1);
+    }
+    // Table full; should not happen if table_size ≥ 2 × cardinality.
+    row_to_group[gid] = UINT_MAX;
+}
+```
+
+**Open design questions** (resolve in Step 1):
+- **Does Metal support `atomic_ulong2`?** If no, the slot_key write must be sequenced via the state CAS (writer publishes state AFTER key write; reader spins until state is non-claiming, then reads key with `acquire` ordering).
+- **Spin-wait safety?** Per [[m2-metal-atomics-constraint]] and the Phase 4 retrospective, same-warp spin-wait can deadlock. Mitigation for A3: at high cardinality (>16K groups), same-key collisions in a warp are rare. If proptest at adversarial inputs (all-same-key, etc.) deadlocks, fall back to skip-and-retry-elsewhere (which livelocks at low cardinality but should converge at high).
+- **Table sizing?** Need `est_cardinality × 2` (50% load factor). The cardinality estimator (Phase 6 Task 29 — pull forward and run first).
+
+- [ ] **Step 1**: Probe Metal SDK for `atomic_ulong2` (likely doesn't exist; design around state-based publish/acquire).
+
+- [ ] **Step 2**: Implement minimum-viable kernel + Rust dispatch. Single test: 10K unique random keys, 100K total rows. Verify `n_groups == 10K` and `row_to_group` is consistent.
+
+- [ ] **Step 3**: Adversarial proptest: 1024 cases of `{1..16K unique keys, 1K..100K total rows}`. If deadlocks observed, document the failure pattern and STOP — don't attempt to fix the SIMD-lockstep problem without a design conversation.
+
+- [ ] **Step 4**: If working, bench at 10M × 65K (the target case). Target: ≤100ms (CPU = 211ms; A2 in current form = 2092ms).
+
+- [ ] **Step 5**: Commit OR document the failure mode in `docs/open-questions.md` for M4 follow-up.
+
+### Task A3.2 (conditional on A3.1 success): Wire into router
+
+Only execute if A3.1 ships. The decision logic becomes:
+- est_card ≤ ~4K → A1 (low contention path)
+- est_card 4K–~1M → A3 (global hash; if A3.1 confirmed working at this range)
+- est_card > ~1M → CPU (A3 likely tip into contention; reassess if A3.1 numbers warrant)
+
+(Threshold numbers come from A3.1's measured perf — placeholders here.)
+
+---
+
 ## Phase 6 — A1/A2 routing + cardinality estimation
 
 ### Task 29: HyperLogLog++ cardinality estimator
