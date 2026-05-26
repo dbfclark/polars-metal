@@ -72,5 +72,9 @@ harness = false
 name = "aggregate_fused"
 harness = false
 
+[[bench]]
+name = "groupby_build_partitioned"
+harness = false
+
 [lints]
 workspace = true
