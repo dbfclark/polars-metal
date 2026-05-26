@@ -3776,8 +3776,13 @@ pub fn cpu_sort_segment(keys: &[u128]) -> BuildOutput {
 ```rust
 // crates/polars-metal-kernels/src/groupby_build_sort/mod.rs
 pub mod reference;
-pub mod gpu;
+// `pub mod gpu;` lands in Task 25 alongside the first lane kernel.
+
+// Re-use `BuildOutput` from the partitioned module so A1/A2 are
+// interchangeable at the router layer.
 ```
+
+The subagent should also add `pub mod groupby_build_sort;` to `crates/polars-metal-kernels/src/lib.rs` (alphabetical order — right after `pub mod groupby_build_partitioned;`).
 
 - [ ] **Step 3: Run + commit**
 
@@ -3889,58 +3894,121 @@ fn lane_0_sorts_by_low_byte() {
 
 - [ ] **Step 3: Implement `run_radix_lane`**
 
+API note: same conventions as Phase 4 — `shader_lib::shared_library` + `CommandQueue::new` + `new_buffer_from_bytes` + `as_slice` readback. Define a `SortError` enum mirroring `PartitionedBuildError`. The scatter kernel mutates `keys_*_out` / `row_idx_out` and increments `cursors[d]`; the unused `buf_offsets` variable from the original sketch is dropped (the cursors buffer is seeded with the same offsets, so we never read offsets in the kernel).
+
+```rust
+// crates/polars-metal-kernels/src/groupby_build_sort/mod.rs
+pub mod gpu;
+
+#[derive(Debug, thiserror::Error)]
+pub enum SortError {
+    #[error(transparent)]
+    Buffer(#[from] polars_metal_buffer::BufferError),
+    #[error(transparent)]
+    Shader(#[from] crate::shader_lib::ShaderError),
+    #[error(transparent)]
+    Dispatch(#[from] crate::command::DispatchError),
+    #[error("input row count overflows u32")]
+    RowOverflow,
+}
+```
+
 ```rust
 // crates/polars-metal-kernels/src/groupby_build_sort/gpu.rs
+use crate::command::CommandQueue;
+use crate::shader_lib::shared_library;
+use polars_metal_buffer::MetalDevice;
+use std::mem::size_of_val;
+
+use super::SortError;
+
 pub fn run_radix_lane(
     device: &MetalDevice,
     keys: &[u128],
     row_idx_in: &[u32],
     lane: u32,
-) -> Result<(Vec<u128>, Vec<u32>), String> {
+) -> Result<(Vec<u128>, Vec<u32>), SortError> {
+    assert_eq!(keys.len(), row_idx_in.len(), "keys and idx must have same length");
+    if keys.is_empty() {
+        return Ok((vec![], vec![]));
+    }
     let keys_lo: Vec<u64> = keys.iter().map(|k| *k as u64).collect();
     let keys_hi: Vec<u64> = keys.iter().map(|k| (*k >> 64) as u64).collect();
-    let n_rows = keys.len() as u32;
+    let n_rows: u32 = keys.len().try_into().map_err(|_| SortError::RowOverflow)?;
 
-    let lib = device.load_shader_library("groupby_sort_u128_lane")?;
-    let pso_hist = device.pipeline_for_function(&lib, "lane_histogram")?;
-    let pso_scat = device.pipeline_for_function(&lib, "lane_scatter")?;
+    let lib = shared_library(device)?;
+    let pso_hist = lib.pipeline("lane_histogram")?;
+    let pso_scat = lib.pipeline("lane_scatter")?;
 
-    let buf_lo  = device.new_buffer_from_slice(&keys_lo);
-    let buf_hi  = device.new_buffer_from_slice(&keys_hi);
-    let buf_idx = device.new_buffer_from_slice(row_idx_in);
-    let buf_bins = device.new_buffer_zeroed::<u32>(256);
-    let buf_n = device.new_buffer_from_slice(&[n_rows]);
-    let buf_lane = device.new_buffer_from_slice(&[lane]);
-    let queue = device.new_command_queue();
+    // SAFETY: u64/u32 are POD; reinterpret as bytes for the synchronous copy
+    // inside `new_buffer_from_bytes`.
+    let u64_bytes = |s: &[u64]| unsafe {
+        std::slice::from_raw_parts(s.as_ptr() as *const u8, size_of_val(s))
+    };
+    let u32_bytes = |s: &[u32]| unsafe {
+        std::slice::from_raw_parts(s.as_ptr() as *const u8, size_of_val(s))
+    };
 
-    queue.dispatch_1d(&pso_hist, &[&buf_lo, &buf_hi, &buf_bins, &buf_n, &buf_lane], n_rows)?;
-    let bins: Vec<u32> = buf_bins.to_vec();
+    let buf_lo = device.new_buffer_from_bytes(u64_bytes(&keys_lo))?;
+    let buf_hi = device.new_buffer_from_bytes(u64_bytes(&keys_hi))?;
+    let buf_idx = device.new_buffer_from_bytes(u32_bytes(row_idx_in))?;
+    let buf_bins = device.new_buffer_zeroed(256 * std::mem::size_of::<u32>())?;
+    let buf_n = device.new_buffer_from_bytes(&n_rows.to_le_bytes())?;
+    let buf_lane = device.new_buffer_from_bytes(&lane.to_le_bytes())?;
 
-    // CPU exclusive scan.
-    let mut offsets = vec![0u32; 256];
-    for i in 1..256 { offsets[i] = offsets[i-1] + bins[i-1]; }
-    let buf_offsets = device.new_buffer_from_slice(&offsets);
-    let buf_cursors = device.new_buffer_from_slice(&offsets);  // seed cursors with offsets
+    let mut queue = CommandQueue::new(device)?;
+    queue.dispatch_1d(
+        &pso_hist,
+        &[&buf_lo, &buf_hi, &buf_bins, &buf_n, &buf_lane],
+        n_rows as usize,
+    )?;
+    queue.wait_until_complete()?;
 
-    let buf_lo_out  = device.new_buffer_zeroed::<u64>(keys.len());
-    let buf_hi_out  = device.new_buffer_zeroed::<u64>(keys.len());
-    let buf_idx_out = device.new_buffer_zeroed::<u32>(keys.len());
+    // Read bins; CPU exclusive scan.
+    let bins_bytes = buf_bins.as_slice();
+    let mut bins = [0u32; 256];
+    for i in 0..256 {
+        let b = &bins_bytes[i * 4..(i + 1) * 4];
+        bins[i] = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    }
+    let mut offsets = [0u32; 256];
+    for i in 1..256 {
+        offsets[i] = offsets[i - 1] + bins[i - 1];
+    }
+
+    let buf_cursors = device.new_buffer_from_bytes(u32_bytes(&offsets))?;
+    let buf_lo_out = device.new_buffer_zeroed(keys.len() * std::mem::size_of::<u64>())?;
+    let buf_hi_out = device.new_buffer_zeroed(keys.len() * std::mem::size_of::<u64>())?;
+    let buf_idx_out = device.new_buffer_zeroed(keys.len() * std::mem::size_of::<u32>())?;
 
     queue.dispatch_1d(
         &pso_scat,
-        &[&buf_lo, &buf_hi, &buf_idx, &buf_lo_out, &buf_hi_out, &buf_idx_out, &buf_cursors, &buf_n, &buf_lane],
-        n_rows,
+        &[
+            &buf_lo, &buf_hi, &buf_idx,
+            &buf_lo_out, &buf_hi_out, &buf_idx_out,
+            &buf_cursors, &buf_n, &buf_lane,
+        ],
+        n_rows as usize,
     )?;
+    queue.wait_until_complete()?;
 
-    let sorted_lo: Vec<u64> = buf_lo_out.to_vec();
-    let sorted_hi: Vec<u64> = buf_hi_out.to_vec();
-    let sorted_idx: Vec<u32> = buf_idx_out.to_vec();
-    let sorted_keys: Vec<u128> = sorted_lo.iter().zip(sorted_hi.iter())
-        .map(|(&lo, &hi)| (hi as u128) << 64 | lo as u128)
-        .collect();
+    let lo_b = buf_lo_out.as_slice();
+    let hi_b = buf_hi_out.as_slice();
+    let idx_b = buf_idx_out.as_slice();
+    let mut sorted_keys = Vec::with_capacity(keys.len());
+    let mut sorted_idx = Vec::with_capacity(keys.len());
+    for i in 0..keys.len() {
+        let lo = u64::from_le_bytes(lo_b[i * 8..(i + 1) * 8].try_into().unwrap());
+        let hi = u64::from_le_bytes(hi_b[i * 8..(i + 1) * 8].try_into().unwrap());
+        let id = u32::from_le_bytes(idx_b[i * 4..(i + 1) * 4].try_into().unwrap());
+        sorted_keys.push(((hi as u128) << 64) | (lo as u128));
+        sorted_idx.push(id);
+    }
     Ok((sorted_keys, sorted_idx))
 }
 ```
+
+(Note: the `try_into().unwrap()` on `&[u8] -> [u8; 4]/[u8; 8]` is infallible-by-slice-bound; clippy will accept it. The bound is statically enforced by the surrounding `i * stride..(i+1) * stride` slice.)
 
 - [ ] **Step 4: Run + commit**
 
@@ -4002,9 +4070,13 @@ proptest! {
 
 ```rust
 // In crates/polars-metal-kernels/src/groupby_build_sort/gpu.rs
-pub fn sort_u128(device: &MetalDevice, keys: &[u128]) -> Result<(Vec<u128>, Vec<u32>), String> {
+pub fn sort_u128(device: &MetalDevice, keys: &[u128]) -> Result<(Vec<u128>, Vec<u32>), SortError> {
+    if keys.is_empty() {
+        return Ok((vec![], vec![]));
+    }
+    let n: u32 = keys.len().try_into().map_err(|_| SortError::RowOverflow)?;
     let mut current_keys: Vec<u128> = keys.to_vec();
-    let mut current_idx:  Vec<u32>  = (0u32..keys.len() as u32).collect();
+    let mut current_idx: Vec<u32> = (0..n).collect();
     for lane in 0u32..16 {
         let (next_keys, next_idx) = run_radix_lane(device, &current_keys, &current_idx, lane)?;
         current_keys = next_keys;
@@ -4114,23 +4186,47 @@ proptest! {
 
 ```rust
 // In gpu.rs
-pub fn sort_and_segment(device: &MetalDevice, keys: &[u128]) -> Result<BuildOutput, String> {
-    let (sorted_keys, sorted_idx) = sort_u128(device, keys)?;
-    let n_rows = keys.len() as u32;
+use crate::groupby_build_partitioned::BuildOutput;
 
-    // Segment boundaries via GPU kernel.
-    let buf_lo: Vec<u64> = sorted_keys.iter().map(|k| *k as u64).collect();
-    let buf_hi: Vec<u64> = sorted_keys.iter().map(|k| (*k >> 64) as u64).collect();
-    let lib = device.load_shader_library("groupby_segments")?;
-    let pso = device.pipeline_for_function(&lib, "segment_starts")?;
-    let starts_size = ((keys.len() + 7) >> 3) + 4;  // pad for atomic OR
-    let buf_starts = device.new_buffer_zeroed::<u8>(starts_size);
-    let buf_lo_d = device.new_buffer_from_slice(&buf_lo);
-    let buf_hi_d = device.new_buffer_from_slice(&buf_hi);
-    let buf_n = device.new_buffer_from_slice(&[n_rows]);
-    let queue = device.new_command_queue();
-    queue.dispatch_1d(&pso, &[&buf_lo_d, &buf_hi_d, &buf_starts, &buf_n], n_rows)?;
-    let starts: Vec<u8> = buf_starts.to_vec();
+pub fn sort_and_segment(
+    device: &MetalDevice,
+    keys: &[u128],
+) -> Result<BuildOutput, SortError> {
+    if keys.is_empty() {
+        return Ok(BuildOutput { row_to_group: vec![], first_row_per_group: vec![], n_groups: 0 });
+    }
+    let n_rows: u32 = keys.len().try_into().map_err(|_| SortError::RowOverflow)?;
+
+    let (sorted_keys, sorted_idx) = sort_u128(device, keys)?;
+    let buf_lo_host: Vec<u64> = sorted_keys.iter().map(|k| *k as u64).collect();
+    let buf_hi_host: Vec<u64> = sorted_keys.iter().map(|k| (*k >> 64) as u64).collect();
+
+    // SAFETY: u64 is POD; reinterpret as bytes for the synchronous copy.
+    let u64_bytes = |s: &[u64]| unsafe {
+        std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s))
+    };
+
+    let lib = shared_library(device)?;
+    let pso = lib.pipeline("segment_starts")?;
+    // Pad starts buffer to a multiple of 4 bytes so atomic_fetch_or
+    // writes don't run off the end. The buffer carries `n_rows` bits
+    // packed little-endian byte-by-byte; rounding up to 4 bytes
+    // guarantees that the word read at `byte_idx & ~3u` is valid.
+    let starts_size = ((keys.len() + 7) >> 3).next_multiple_of(4).max(4);
+    let buf_starts = device.new_buffer_zeroed(starts_size)?;
+    let buf_lo_d = device.new_buffer_from_bytes(u64_bytes(&buf_lo_host))?;
+    let buf_hi_d = device.new_buffer_from_bytes(u64_bytes(&buf_hi_host))?;
+    let buf_n = device.new_buffer_from_bytes(&n_rows.to_le_bytes())?;
+
+    let mut queue = CommandQueue::new(device)?;
+    queue.dispatch_1d(
+        &pso,
+        &[&buf_lo_d, &buf_hi_d, &buf_starts, &buf_n],
+        n_rows as usize,
+    )?;
+    queue.wait_until_complete()?;
+
+    let starts = buf_starts.as_slice();
 
     // CPU: scan segment bits to derive group_ids in sorted order, then
     // permute back to original order via sorted_idx.
@@ -4147,7 +4243,11 @@ pub fn sort_and_segment(device: &MetalDevice, keys: &[u128]) -> Result<BuildOutp
         }
         row_to_group[sorted_idx[i] as usize] = cur_group;
     }
-    Ok(BuildOutput { row_to_group, first_row_per_group, n_groups: cur_group + 1 })
+    Ok(BuildOutput {
+        row_to_group,
+        first_row_per_group,
+        n_groups: cur_group + 1,
+    })
 }
 ```
 
@@ -4170,43 +4270,68 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ### Task 28: Criterion bench — A2 vs A1 across cardinality
 
 **Files:**
-- Create: `benches/groupby_build_sort.rs`
+- Create: `crates/polars-metal-kernels/benches/groupby_build_sort.rs`
+- Modify: `crates/polars-metal-kernels/Cargo.toml`
 
 - [ ] **Step 1: Write the bench**
 
 ```rust
-// benches/groupby_build_sort.rs
+// crates/polars-metal-kernels/benches/groupby_build_sort.rs
+#![allow(clippy::expect_used, clippy::panic)]
+
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use polars_metal_buffer::MetalDevice;
+use polars_metal_kernels::groupby_build_partitioned::PartitionedBuildError;
 use polars_metal_kernels::groupby_build_partitioned::gpu::partition_and_build;
 use polars_metal_kernels::groupby_build_sort::gpu::sort_and_segment;
 
 fn bench_build_modes(c: &mut Criterion) {
-    let device = MetalDevice::system_default().unwrap();
+    let device = MetalDevice::system_default().expect("metal device");
     let mut group = c.benchmark_group("groupby_build_a1_vs_a2");
     for &n_rows in &[1_000_000usize, 10_000_000] {
         for &n_groups in &[1024u32, 65_536, 1_048_576] {
-            let keys: Vec<u128> = (0..n_rows).map(|i| (i % n_groups as usize) as u128).collect();
-            group.bench_with_input(
-                BenchmarkId::new(format!("a1_rows{n_rows}_groups{n_groups}"), n_rows),
-                &keys,
-                |b, keys| b.iter(|| partition_and_build(&device, keys, 16)),
+            let keys: Vec<u128> =
+                (0..n_rows).map(|i| (i % n_groups as usize) as u128).collect();
+            // A1 only runs where TGSM fits.
+            let a1_ok = matches!(
+                partition_and_build(&device, &keys, 16),
+                Ok(_)
             );
+            if a1_ok {
+                group.bench_with_input(
+                    BenchmarkId::new(format!("a1_rows{n_rows}_groups{n_groups}"), n_rows),
+                    &keys,
+                    |b, keys| {
+                        b.iter(|| partition_and_build(&device, keys, 16).expect("dispatch"))
+                    },
+                );
+            } else {
+                eprintln!("skipping A1 rows={n_rows} groups={n_groups} (TGSM overflow expected)");
+            }
+            // A2 always runs.
             group.bench_with_input(
                 BenchmarkId::new(format!("a2_rows{n_rows}_groups{n_groups}"), n_rows),
                 &keys,
-                |b, keys| b.iter(|| sort_and_segment(&device, keys)),
+                |b, keys| b.iter(|| sort_and_segment(&device, keys).expect("dispatch")),
             );
         }
     }
     group.finish();
+    // Silence dead-import warning on PartitionedBuildError if the
+    // overflow path is never reached at this cardinality grid.
+    let _ = std::any::TypeId::of::<PartitionedBuildError>();
 }
 
 criterion_group!(benches, bench_build_modes);
 criterion_main!(benches);
 ```
 
-Add `[[bench]] name = "groupby_build_sort"` to `Cargo.toml`.
+Add to `crates/polars-metal-kernels/Cargo.toml`:
+```toml
+[[bench]]
+name = "groupby_build_sort"
+harness = false
+```
 
 - [ ] **Step 2: Run + record + commit**
 
@@ -4217,7 +4342,7 @@ cargo bench -p polars-metal-kernels --bench groupby_build_sort
 Expected: A1 wins at 1K groups (~10 ms vs A2's 80 ms). A2 wins at 1M groups (A1 overflows; A2 ~85 ms). Crossover around 32-64K.
 
 ```bash
-git add benches/groupby_build_sort.rs crates/polars-metal-kernels/Cargo.toml
+git add crates/polars-metal-kernels/benches/groupby_build_sort.rs crates/polars-metal-kernels/Cargo.toml
 git commit -m "Bench: A1 vs A2 across 1024/65K/1M groups × 1M/10M rows
 
 Capability A2 perf evidence; crossover tuning input for Phase 6 router.
