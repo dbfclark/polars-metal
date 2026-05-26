@@ -182,3 +182,71 @@ pub fn sort_u128(device: &MetalDevice, keys: &[u128]) -> Result<(Vec<u128>, Vec<
     }
     Ok((current_keys, current_idx))
 }
+
+use crate::groupby_build_partitioned::BuildOutput;
+
+/// A2 entry point: GPU-sort u128 keys, then derive per-row group ids
+/// via a segment-boundary kernel + CPU scan. Mirrors A1's `BuildOutput`
+/// so the router (Phase 6) can dispatch either build interchangeably.
+pub fn sort_and_segment(device: &MetalDevice, keys: &[u128]) -> Result<BuildOutput, SortError> {
+    if keys.is_empty() {
+        return Ok(BuildOutput {
+            row_to_group: vec![],
+            first_row_per_group: vec![],
+            n_groups: 0,
+        });
+    }
+    let n_rows: u32 = keys.len().try_into().map_err(|_| SortError::RowOverflow)?;
+
+    // 1. GPU radix sort.
+    let (sorted_keys, sorted_idx) = sort_u128(device, keys)?;
+    let sorted_lo: Vec<u64> = sorted_keys.iter().map(|k| *k as u64).collect();
+    let sorted_hi: Vec<u64> = sorted_keys.iter().map(|k| (*k >> 64) as u64).collect();
+
+    // SAFETY: u64 is POD; reinterpret as bytes for synchronous copy.
+    let u64_bytes = |s: &[u64]| unsafe {
+        std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s))
+    };
+
+    // 2. Segment-starts kernel: pack 1 bit per row into a byte buffer.
+    // Pad to a multiple of 4 bytes so 32-bit atomic OR writes stay
+    // in-bounds at the trailing edge.
+    let starts_size_bytes = ((keys.len() + 7) >> 3).next_multiple_of(4).max(4);
+    let lib = shared_library(device)?;
+    let pso = lib.pipeline("segment_starts")?;
+    let buf_lo = device.new_buffer_from_bytes(u64_bytes(&sorted_lo))?;
+    let buf_hi = device.new_buffer_from_bytes(u64_bytes(&sorted_hi))?;
+    let buf_starts = device.new_buffer_zeroed(starts_size_bytes)?;
+    let buf_n = device.new_buffer_from_bytes(&n_rows.to_le_bytes())?;
+
+    let mut queue = CommandQueue::new(device)?;
+    queue.dispatch_1d(
+        &pso,
+        &[&buf_lo, &buf_hi, &buf_starts, &buf_n],
+        n_rows as usize,
+    )?;
+    queue.wait_until_complete()?;
+
+    let starts = buf_starts.as_slice();
+
+    // 3. CPU scan: derive group ids in sorted order, then permute back
+    // to original row order via sorted_idx.
+    let mut row_to_group = vec![0u32; keys.len()];
+    let mut first_row_per_group: Vec<u32> = Vec::new();
+    let mut cur_group: u32 = 0;
+    for i in 0..keys.len() {
+        let bit = (starts[i >> 3] >> (i & 7)) & 1u8;
+        if i > 0 && bit == 1 {
+            cur_group += 1;
+        }
+        if i == 0 || bit == 1 {
+            first_row_per_group.push(sorted_idx[i]);
+        }
+        row_to_group[sorted_idx[i] as usize] = cur_group;
+    }
+    Ok(BuildOutput {
+        row_to_group,
+        first_row_per_group,
+        n_groups: cur_group + 1,
+    })
+}
