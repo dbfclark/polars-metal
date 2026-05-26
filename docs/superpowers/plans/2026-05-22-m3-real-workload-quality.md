@@ -2846,7 +2846,7 @@ fn round_trip_first_row_per_group_indexes_original_rows() {
 //! constraint); per-threadgroup hash tables (no global atomic-CAS).
 
 pub mod reference;
-pub mod gpu;
+// `pub mod gpu;` lands in Task 20 alongside its first kernel.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildOutput {
@@ -3048,6 +3048,8 @@ kernel void partition_scatter(
 // crates/polars-metal-kernels/tests/test_groupby_build_partitioned_scatter.rs
 use polars_metal_buffer::MetalDevice;
 use polars_metal_kernels::groupby_build_partitioned::gpu::partition_and_scatter;
+use polars_metal_kernels::groupby_build_partitioned::reference::cpu_partition_layout;
+use proptest::prelude::*;
 
 #[test]
 fn scatter_produces_partition_layout_matching_cpu_reference() {
@@ -3055,35 +3057,49 @@ fn scatter_produces_partition_layout_matching_cpu_reference() {
     // Build a small case: 8 keys, 4 partitions.
     let keys: Vec<u128> = vec![10, 20, 30, 10, 20, 30, 10, 50];
     let n_partitions = 4;
-    let (row_indices, partition_offsets) = partition_and_scatter(&device, &keys, n_partitions).unwrap();
+    let (row_indices, partition_offsets) =
+        partition_and_scatter(&device, &keys, n_partitions).unwrap();
 
     // Each row index appears exactly once in `row_indices`.
     let mut seen = vec![false; keys.len()];
-    for &r in &row_indices { seen[r as usize] = true; }
+    for &r in &row_indices {
+        seen[r as usize] = true;
+    }
     assert!(seen.iter().all(|&b| b));
 
     // partition_offsets is non-decreasing and ends at keys.len().
-    for w in partition_offsets.windows(2) { assert!(w[0] <= w[1]); }
+    for w in partition_offsets.windows(2) {
+        assert!(w[0] <= w[1]);
+    }
     assert_eq!(*partition_offsets.last().unwrap(), keys.len() as u32);
 }
 
-#[test]
-fn scatter_proptest_matches_cpu_reference() {
-    use proptest::test_runner::TestRunner;
-    use proptest::strategy::Strategy;
-    let device = MetalDevice::system_default().unwrap();
-    let mut runner = TestRunner::default();
-    let strat = proptest::collection::vec(any::<u128>(), 1..1024usize)
-        .prop_map(|v| v);
-    runner.run(&strat, |keys| {
-        for n_part in [2u32, 4, 8, 16] {
-            let (gpu_idx, gpu_off) = partition_and_scatter(&device, &keys, n_part).unwrap();
-            let cpu = polars_metal_kernels::groupby_build_partitioned::reference::cpu_partition_layout(&keys, n_part);
-            assert_eq!(gpu_idx, cpu.row_indices);
-            assert_eq!(gpu_off, cpu.partition_offsets);
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn scatter_proptest_matches_cpu_reference(
+        keys in proptest::collection::vec(any::<u128>(), 1..1024usize),
+        n_part in proptest::sample::select(vec![2u32, 4, 8, 16]),
+    ) {
+        // Note: ordering inside a partition is non-deterministic on the GPU
+        // (atomic_fetch_add cursor; threads race) but the *set* of rows per
+        // partition is deterministic. Sort within each partition slice
+        // before comparing.
+        let device = MetalDevice::system_default().unwrap();
+        let (gpu_idx, gpu_off) = partition_and_scatter(&device, &keys, n_part).unwrap();
+        let cpu = cpu_partition_layout(&keys, n_part);
+        prop_assert_eq!(&gpu_off, &cpu.partition_offsets);
+        for p in 0..n_part as usize {
+            let s = gpu_off[p] as usize;
+            let e = gpu_off[p + 1] as usize;
+            let mut gpu_slice: Vec<u32> = gpu_idx[s..e].to_vec();
+            let mut cpu_slice: Vec<u32> = cpu.row_indices[s..e].to_vec();
+            gpu_slice.sort_unstable();
+            cpu_slice.sort_unstable();
+            prop_assert_eq!(gpu_slice, cpu_slice);
         }
-        Ok(())
-    }).unwrap();
+    }
 }
 ```
 
@@ -3091,54 +3107,122 @@ fn scatter_proptest_matches_cpu_reference() {
 
 - [ ] **Step 3: Add the Rust dispatch**
 
+API notes (real polars-metal-kernels conventions — see `groupby.rs::dispatch_agg_i32` for a worked example):
+- Pipeline lookup: `let lib = crate::shader_lib::shared_library(device)?; let pso = lib.pipeline("entry_point")?;` (one library for all shaders; pipelines cached per-entry).
+- Buffer allocation: `device.new_buffer_from_bytes(&[u8])` (takes raw bytes — cast typed slices via `unsafe { std::slice::from_raw_parts(p as *const u8, n * size_of::<T>()) }`) and `device.new_buffer_zeroed(bytes: usize)` (bytes, not element count).
+- Dispatch: `let mut queue = crate::command::CommandQueue::new(device)?; queue.dispatch_1d(&pso, &[&buf, ...], n_threads)?; queue.wait_until_complete()?;`
+- Read back: `buf.as_slice()` returns `&[u8]`; reinterpret via `bytemuck::cast_slice` or `from_le_bytes`-per-element (mirror `dispatch_agg_i32`).
+- Errors: define `PartitionedBuildError` via `thiserror` in `groupby_build_partitioned/mod.rs` (variants for AllocFailed, Shader, Dispatch, Overflow); convert via `?` from `BufferError`, `ShaderError`, `DispatchError`.
+
 ```rust
 // crates/polars-metal-kernels/src/groupby_build_partitioned/gpu.rs
-use polars_metal_buffer::{MetalDevice, MetalBuffer};
+use crate::command::CommandQueue;
+use crate::shader_lib::shared_library;
+use polars_metal_buffer::MetalDevice;
+use std::mem::size_of;
+
+use super::PartitionedBuildError;
 
 pub fn partition_and_scatter(
     device: &MetalDevice,
     keys: &[u128],
     n_partitions: u32,
-) -> Result<(Vec<u32>, Vec<u32>), String> {
+) -> Result<(Vec<u32>, Vec<u32>), PartitionedBuildError> {
     // Split keys into lo/hi u64 buffers (Metal doesn't have a u128 primitive).
     let keys_lo: Vec<u64> = keys.iter().map(|k| *k as u64).collect();
     let keys_hi: Vec<u64> = keys.iter().map(|k| (*k >> 64) as u64).collect();
-    let n_rows = keys.len() as u32;
-    let log2_tgsm = 10u32;  // 1024 slots
+    let n_rows: u32 = keys.len().try_into().map_err(|_| PartitionedBuildError::RowOverflow)?;
+    let log2_tgsm = 10u32; // 1024 slots
+    let np = n_partitions;
 
-    let lib = device.load_shader_library("groupby_build_partitioned_scatter")?;
-    let pso_count = device.pipeline_for_function(&lib, "partition_count")?;
-    let pso_scatter = device.pipeline_for_function(&lib, "partition_scatter")?;
+    // SAFETY: u64 / u32 are POD; reinterpret as bytes for the synchronous copy
+    // performed inside `new_buffer_from_bytes`.
+    let bytes_of = |s: &[u64]| unsafe {
+        std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * size_of::<u64>())
+    };
+    let u32_bytes = |s: &[u32]| unsafe {
+        std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * size_of::<u32>())
+    };
 
-    let buf_keys_lo = device.new_buffer_from_slice(&keys_lo);
-    let buf_keys_hi = device.new_buffer_from_slice(&keys_hi);
-    let buf_counts = device.new_buffer_zeroed::<u32>(n_partitions as usize);
-    let buf_n_rows = device.new_buffer_from_slice(&[n_rows]);
-    let buf_n_part = device.new_buffer_from_slice(&[n_partitions]);
-    let buf_log2 = device.new_buffer_from_slice(&[log2_tgsm]);
+    let lib = shared_library(device)?;
+    let pso_count = lib.pipeline("partition_count")?;
+    let pso_scatter = lib.pipeline("partition_scatter")?;
 
-    let queue = device.new_command_queue();
-    queue.dispatch_1d(&pso_count, &[
-        &buf_keys_lo, &buf_keys_hi, &buf_counts,
-        &buf_n_rows, &buf_n_part, &buf_log2,
-    ], n_rows)?;
-    let counts: Vec<u32> = buf_counts.to_vec();
-    let mut partition_offsets = vec![0u32; n_partitions as usize + 1];
-    for i in 0..n_partitions as usize {
+    let buf_keys_lo = device.new_buffer_from_bytes(bytes_of(&keys_lo))?;
+    let buf_keys_hi = device.new_buffer_from_bytes(bytes_of(&keys_hi))?;
+    let buf_counts = device.new_buffer_zeroed(np as usize * size_of::<u32>())?;
+    let buf_n_rows = device.new_buffer_from_bytes(&n_rows.to_le_bytes())?;
+    let buf_n_part = device.new_buffer_from_bytes(&np.to_le_bytes())?;
+    let buf_log2 = device.new_buffer_from_bytes(&log2_tgsm.to_le_bytes())?;
+
+    let mut queue = CommandQueue::new(device)?;
+    queue.dispatch_1d(
+        &pso_count,
+        &[&buf_keys_lo, &buf_keys_hi, &buf_counts, &buf_n_rows, &buf_n_part, &buf_log2],
+        n_rows as usize,
+    )?;
+    queue.wait_until_complete()?;
+
+    // Read per-partition counts back from the buffer.
+    let counts_bytes = buf_counts.as_slice();
+    let mut counts = vec![0u32; np as usize];
+    for i in 0..np as usize {
+        let b = &counts_bytes[i * 4..(i + 1) * 4];
+        counts[i] = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    }
+    let mut partition_offsets = vec![0u32; np as usize + 1];
+    for i in 0..np as usize {
         partition_offsets[i + 1] = partition_offsets[i] + counts[i];
     }
 
-    let buf_offsets = device.new_buffer_from_slice(&partition_offsets);
-    let buf_cursors = device.new_buffer_zeroed::<u32>(n_partitions as usize);
-    let buf_row_idx = device.new_buffer_zeroed::<u32>(n_rows as usize);
+    let buf_offsets = device.new_buffer_from_bytes(u32_bytes(&partition_offsets))?;
+    let buf_cursors = device.new_buffer_zeroed(np as usize * size_of::<u32>())?;
+    let buf_row_idx = device.new_buffer_zeroed(n_rows as usize * size_of::<u32>())?;
 
-    queue.dispatch_1d(&pso_scatter, &[
-        &buf_keys_lo, &buf_keys_hi, &buf_offsets, &buf_cursors, &buf_row_idx,
-        &buf_n_rows, &buf_n_part, &buf_log2,
-    ], n_rows)?;
-    let row_indices: Vec<u32> = buf_row_idx.to_vec();
+    queue.dispatch_1d(
+        &pso_scatter,
+        &[
+            &buf_keys_lo, &buf_keys_hi, &buf_offsets, &buf_cursors, &buf_row_idx,
+            &buf_n_rows, &buf_n_part, &buf_log2,
+        ],
+        n_rows as usize,
+    )?;
+    queue.wait_until_complete()?;
+
+    let row_bytes = buf_row_idx.as_slice();
+    let mut row_indices = vec![0u32; n_rows as usize];
+    for i in 0..n_rows as usize {
+        let b = &row_bytes[i * 4..(i + 1) * 4];
+        row_indices[i] = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    }
     Ok((row_indices, partition_offsets))
 }
+```
+
+And declare the module + error type in `groupby_build_partitioned/mod.rs`:
+
+```rust
+pub mod gpu;
+
+#[derive(Debug, thiserror::Error)]
+pub enum PartitionedBuildError {
+    #[error(transparent)]
+    Buffer(#[from] polars_metal_buffer::BufferError),
+    #[error(transparent)]
+    Shader(#[from] crate::shader_lib::ShaderError),
+    #[error(transparent)]
+    Dispatch(#[from] crate::command::DispatchError),
+    #[error("input row count overflows u32")]
+    RowOverflow,
+    #[error("A1 TGSM overflow; fallback to A2")]
+    Overflow,
+}
+```
+
+And export it from `crates/polars-metal-kernels/src/lib.rs`:
+
+```rust
+pub mod groupby_build_partitioned;
 ```
 
 - [ ] **Step 4: Run**
@@ -3361,7 +3445,110 @@ proptest! {
 
 - [ ] **Step 3: Add `partition_and_build` Rust dispatch**
 
-In `crates/polars-metal-kernels/src/groupby_build_partitioned/gpu.rs`, add the higher-level entry that chains scatter + build + offset assignment. Returns `BuildOutput`.
+In `crates/polars-metal-kernels/src/groupby_build_partitioned/gpu.rs`, add the higher-level entry that chains scatter + build + offset assignment. Use the same API conventions as `partition_and_scatter` (`shared_library` + `CommandQueue::new` + `new_buffer_from_bytes` + `as_slice` readback). Returns `BuildOutput`. Sketch:
+
+```rust
+pub fn partition_and_build(
+    device: &MetalDevice,
+    keys: &[u128],
+    n_partitions: u32,
+) -> Result<crate::groupby_build_partitioned::BuildOutput, PartitionedBuildError> {
+    use crate::groupby_build_partitioned::BuildOutput;
+
+    if keys.is_empty() {
+        return Ok(BuildOutput { row_to_group: vec![], first_row_per_group: vec![], n_groups: 0 });
+    }
+    let n_rows: u32 = keys.len().try_into().map_err(|_| PartitionedBuildError::RowOverflow)?;
+    let np = n_partitions;
+
+    // 1. Scatter: pack (keys_lo, keys_hi, row_indices, partition_offsets).
+    let (row_indices, partition_offsets) = partition_and_scatter(device, keys, np)?;
+    let keys_lo: Vec<u64> = keys.iter().map(|k| *k as u64).collect();
+    let keys_hi: Vec<u64> = keys.iter().map(|k| (*k >> 64) as u64).collect();
+
+    // 2. Build: dispatch one threadgroup per partition.
+    let lib = shared_library(device)?;
+    let pso_build = lib.pipeline("partition_build")?;
+
+    let bytes_of_u64 = |s: &[u64]| unsafe {
+        std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * size_of::<u64>())
+    };
+    let bytes_of_u32 = |s: &[u32]| unsafe {
+        std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * size_of::<u32>())
+    };
+
+    let buf_keys_lo = device.new_buffer_from_bytes(bytes_of_u64(&keys_lo))?;
+    let buf_keys_hi = device.new_buffer_from_bytes(bytes_of_u64(&keys_hi))?;
+    let buf_row_idx = device.new_buffer_from_bytes(bytes_of_u32(&row_indices))?;
+    let buf_offsets = device.new_buffer_from_bytes(bytes_of_u32(&partition_offsets))?;
+    let buf_r2lg = device.new_buffer_zeroed(n_rows as usize * size_of::<u32>())?;
+    let buf_ng_per_part = device.new_buffer_zeroed(np as usize * size_of::<u32>())?;
+    let buf_overflow = device.new_buffer_zeroed(size_of::<u32>())?;
+    let buf_n_rows = device.new_buffer_from_bytes(&n_rows.to_le_bytes())?;
+
+    // Dispatch one threadgroup per partition. Use a custom threadgroup width
+    // (e.g. 256) and a grid size of np × tg_width so each partition gets one
+    // group. Use `dispatch_1d_with_tg` and set n_threads = np * tg_width.
+    let tg_width = 256usize;
+    let mut queue = CommandQueue::new(device)?;
+    queue.dispatch_1d_with_tg(
+        &pso_build,
+        &[
+            &buf_keys_lo, &buf_keys_hi, &buf_row_idx, &buf_offsets,
+            &buf_r2lg, &buf_ng_per_part, &buf_overflow, &buf_n_rows,
+        ],
+        np as usize * tg_width,
+        tg_width,
+    )?;
+    queue.wait_until_complete()?;
+
+    // 3. Overflow check (Task 22 wires this).
+    let of_bytes = buf_overflow.as_slice();
+    let overflow = u32::from_le_bytes([of_bytes[0], of_bytes[1], of_bytes[2], of_bytes[3]]);
+    if overflow != 0 {
+        return Err(PartitionedBuildError::Overflow);
+    }
+
+    // 4. Read per-partition group counts and per-row local group ids.
+    let ngp_bytes = buf_ng_per_part.as_slice();
+    let mut n_groups_per_part = vec![0u32; np as usize];
+    for i in 0..np as usize {
+        let b = &ngp_bytes[i * 4..(i + 1) * 4];
+        n_groups_per_part[i] = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    }
+    let r2lg_bytes = buf_r2lg.as_slice();
+    let mut row_to_local_group = vec![0u32; n_rows as usize];
+    for i in 0..n_rows as usize {
+        let b = &r2lg_bytes[i * 4..(i + 1) * 4];
+        row_to_local_group[i] = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    }
+
+    // 5. CPU exclusive scan → global group ids + first_row_per_group.
+    let mut partition_group_offset = vec![0u32; np as usize + 1];
+    for i in 0..np as usize {
+        partition_group_offset[i + 1] = partition_group_offset[i] + n_groups_per_part[i];
+    }
+    let n_groups = partition_group_offset[np as usize];
+    let mut row_to_group = vec![0u32; n_rows as usize];
+    let mut first_row_per_group = vec![u32::MAX; n_groups as usize];
+    // Reuse hash_u128 / partition_id from the reference module so we
+    // recompute each row's partition deterministically.
+    use crate::groupby_build_partitioned::reference::{partition_id, TGSM_SLOTS_PER_PARTITION};
+    let _ = TGSM_SLOTS_PER_PARTITION; // silence unused-import warning if shape changes
+    for r in 0..n_rows as usize {
+        let p = partition_id(keys[r], np) as usize;
+        let local = row_to_local_group[r];
+        let global = partition_group_offset[p] + local;
+        row_to_group[r] = global;
+        if first_row_per_group[global as usize] == u32::MAX {
+            first_row_per_group[global as usize] = r as u32;
+        }
+    }
+    Ok(BuildOutput { row_to_group, first_row_per_group, n_groups })
+}
+```
+
+(Expose `partition_id` and `TGSM_SLOTS_PER_PARTITION` as `pub` from the reference module so the GPU dispatch can share the same partitioner.)
 
 - [ ] **Step 4: Run**
 
@@ -3390,30 +3577,25 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 **Files:**
 - Modify: `crates/polars-metal-kernels/src/groupby_build_partitioned/gpu.rs`
 
-- [ ] **Step 1: Add overflow detection + fallback signal**
+- [ ] **Step 1: Confirm overflow detection landed in Task 21**
 
-```rust
-// In partition_and_build (after dispatch):
-let overflow = buf_overflow_flag.to_vec();
-if overflow[0] != 0 {
-    return Err("A1 TGSM overflow; fallback to A2".into());
-}
-```
-
-The caller (groupby pipeline orchestrator, Phase 6 Task 32) handles this error by re-dispatching as A2.
+Task 21's `partition_and_build` already reads `buf_overflow.as_slice()` and returns `PartitionedBuildError::Overflow`. This task just adds the dedicated test plus a docstring on the variant explaining the orchestrator path (Phase 6 Task 30 routes to A2 on `Overflow`).
 
 - [ ] **Step 2: Test the overflow path**
 
 ```rust
 #[test]
 fn build_signals_overflow_at_extreme_cardinality() {
-    let device = MetalDevice::system_default().unwrap();
+    let device = polars_metal_buffer::MetalDevice::system_default().unwrap();
+    use polars_metal_kernels::groupby_build_partitioned::{
+        gpu::partition_and_build,
+        PartitionedBuildError,
+    };
     // 10K unique keys into 4 partitions = 2.5K per partition, exceeds
     // the 1024 TGSM slot cap → overflow expected.
     let keys: Vec<u128> = (0u128..10_000).collect();
     let result = partition_and_build(&device, &keys, 4);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("overflow"));
+    assert!(matches!(result, Err(PartitionedBuildError::Overflow)));
 }
 ```
 
@@ -3432,26 +3614,41 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ### Task 23: Criterion bench — A1 vs M2 CPU HashMap
 
 **Files:**
-- Create: `benches/groupby_build_partitioned.rs`
+- Create: `crates/polars-metal-kernels/benches/groupby_build_partitioned.rs`
+- Modify: `crates/polars-metal-kernels/Cargo.toml`
 
 - [ ] **Step 1: Write the bench**
 
+Bench lives **inside** the kernels crate (`crates/polars-metal-kernels/benches/groupby_build_partitioned.rs`) — mirror the existing `groupby_aggregate` bench. The 16K-groups row must respect the A1 overflow cap: at 16 partitions × 1024 TGSM slots ≈ 16K capacity, so 16K unique keys with even distribution sits at the edge. If the bench observes `PartitionedBuildError::Overflow`, treat it as expected for that input and report it (don't panic the bench harness).
+
 ```rust
-// benches/groupby_build_partitioned.rs
+// crates/polars-metal-kernels/benches/groupby_build_partitioned.rs
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use polars_metal_buffer::MetalDevice;
 use polars_metal_kernels::groupby_build_partitioned::gpu::partition_and_build;
+use polars_metal_kernels::groupby_build_partitioned::PartitionedBuildError;
 
 fn bench_a1(c: &mut Criterion) {
     let device = MetalDevice::system_default().unwrap();
     let mut group = c.benchmark_group("groupby_build_partitioned");
     for &n_rows in &[100_000usize, 1_000_000, 10_000_000] {
         for &n_groups in &[4u32, 1024, 16_384] {
-            let keys: Vec<u128> = (0..n_rows).map(|i| (i % n_groups as usize) as u128).collect();
+            let keys: Vec<u128> =
+                (0..n_rows).map(|i| (i % n_groups as usize) as u128).collect();
+            // Smoke once: if overflow at this cardinality, skip the bench row
+            // instead of crashing the harness.
+            match partition_and_build(&device, &keys, 16) {
+                Ok(_) => {}
+                Err(PartitionedBuildError::Overflow) => {
+                    eprintln!("skipping rows={n_rows} groups={n_groups}: A1 overflow");
+                    continue;
+                }
+                Err(e) => panic!("dispatch failed: {e}"),
+            }
             group.bench_with_input(
                 BenchmarkId::new(format!("rows{n_rows}_groups{n_groups}"), n_rows),
                 &keys,
-                |b, keys| b.iter(|| partition_and_build(&device, keys, 16)),
+                |b, keys| b.iter(|| partition_and_build(&device, keys, 16).unwrap()),
             );
         }
     }
@@ -3480,7 +3677,7 @@ Expected: A1 at 10M rows × 1K groups completes in ~10-30 ms (per spec). At 16K 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add benches/groupby_build_partitioned.rs crates/polars-metal-kernels/Cargo.toml
+git add crates/polars-metal-kernels/benches/groupby_build_partitioned.rs crates/polars-metal-kernels/Cargo.toml
 git commit -m "Bench: A1 partitioned-hash across 100K/1M/10M × 4/1K/16K groups
 
 Capability A1 perf evidence.
