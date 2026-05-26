@@ -302,6 +302,25 @@ impl MetalBuffer {
         //   once any in-flight command buffer has completed.
         unsafe { std::slice::from_raw_parts(ptr.as_ptr(), len) }
     }
+
+    /// View the buffer's contents as a mutable byte slice.
+    ///
+    /// Caller must guarantee no GPU command buffer is in-flight against
+    /// this buffer; mutating bytes while the GPU is reading them is a
+    /// data race. Used for scratch-arena patterns where the host re-seeds
+    /// the buffer between dispatches (counts, cursors, scalar params,
+    /// etc.).
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        let ptr = self.inner.contents().cast::<u8>();
+        let len = self.len();
+        // SAFETY:
+        // - Same address validity as `as_slice`.
+        // - `&mut self` (not `&self`) statically excludes concurrent
+        //   reads through Rust references. Concurrent GPU access is the
+        //   caller's responsibility (see doc comment).
+        // - StorageModeShared backs the address; the CPU can write to it.
+        unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), len) }
+    }
 }
 
 #[cfg(test)]

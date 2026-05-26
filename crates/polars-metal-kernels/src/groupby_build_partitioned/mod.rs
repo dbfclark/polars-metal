@@ -15,6 +15,9 @@
 
 pub mod gpu;
 pub mod reference;
+pub mod scratch;
+
+pub use scratch::BuildScratch;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildOutput {
