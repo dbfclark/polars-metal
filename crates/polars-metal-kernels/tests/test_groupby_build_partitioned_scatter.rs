@@ -15,22 +15,27 @@ fn scatter_produces_partition_layout_matching_cpu_reference() {
         MetalDevice::system_default().expect("Metal-capable hardware required for this test");
     let keys: Vec<u128> = vec![10, 20, 30, 10, 20, 30, 10, 50];
     let n_partitions = 4;
-    let (row_indices, partition_offsets) = partition_and_scatter(&device, &keys, n_partitions)
+    let out = partition_and_scatter(&device, &keys, n_partitions)
         .expect("partition_and_scatter dispatch must succeed");
     let mut seen = vec![false; keys.len()];
-    for &r in &row_indices {
+    for &r in &out.row_indices {
         seen[r as usize] = true;
     }
     assert!(seen.iter().all(|&b| b));
-    for w in partition_offsets.windows(2) {
+    for w in out.partition_offsets.windows(2) {
         assert!(w[0] <= w[1]);
     }
     assert_eq!(
-        *partition_offsets
+        *out.partition_offsets
             .last()
             .expect("partition_offsets has n_partitions+1 >= 1 elements"),
         keys.len() as u32
     );
+    // Each row's partition_id matches the partition it landed in.
+    use polars_metal_kernels::groupby_build_partitioned::reference::partition_id;
+    for (r, &k) in keys.iter().enumerate() {
+        assert_eq!(out.partition_id_per_row[r], partition_id(k, n_partitions));
+    }
 }
 
 proptest! {
@@ -43,18 +48,23 @@ proptest! {
     ) {
         let device =
             MetalDevice::system_default().expect("Metal-capable hardware required for this test");
-        let (gpu_idx, gpu_off) = partition_and_scatter(&device, &keys, n_part)
+        let out = partition_and_scatter(&device, &keys, n_part)
             .expect("partition_and_scatter dispatch must succeed");
         let cpu = cpu_partition_layout(&keys, n_part);
-        prop_assert_eq!(&gpu_off, &cpu.partition_offsets);
+        prop_assert_eq!(&out.partition_offsets, &cpu.partition_offsets);
         for p in 0..n_part as usize {
-            let s = gpu_off[p] as usize;
-            let e = gpu_off[p + 1] as usize;
-            let mut gpu_slice: Vec<u32> = gpu_idx[s..e].to_vec();
+            let s = out.partition_offsets[p] as usize;
+            let e = out.partition_offsets[p + 1] as usize;
+            let mut gpu_slice: Vec<u32> = out.row_indices[s..e].to_vec();
             let mut cpu_slice: Vec<u32> = cpu.row_indices[s..e].to_vec();
             gpu_slice.sort_unstable();
             cpu_slice.sort_unstable();
             prop_assert_eq!(gpu_slice, cpu_slice);
+        }
+        // partition_id_per_row matches the CPU reference for every row.
+        use polars_metal_kernels::groupby_build_partitioned::reference::partition_id;
+        for (r, &k) in keys.iter().enumerate() {
+            prop_assert_eq!(out.partition_id_per_row[r], partition_id(k, n_part));
         }
     }
 }

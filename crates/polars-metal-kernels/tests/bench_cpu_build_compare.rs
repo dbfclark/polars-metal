@@ -3,13 +3,18 @@
 //!     --release -- --nocapture --test-threads=1
 //! This is a one-shot perf-data collector; not run by `make test`.
 
-#![allow(clippy::expect_used, clippy::print_stdout)]
+#![allow(
+    clippy::expect_used,
+    clippy::print_stdout,
+    clippy::unwrap_used,
+    clippy::panic
+)]
 
 use polars_metal_buffer::MetalDevice;
 use polars_metal_kernels::command::CommandQueue;
 use polars_metal_kernels::groupby::dispatch_build;
-use polars_metal_kernels::groupby_build_partitioned::PartitionedBuildError;
 use polars_metal_kernels::groupby_build_partitioned::gpu::partition_and_build;
+use polars_metal_kernels::groupby_build_partitioned::PartitionedBuildError;
 use polars_metal_kernels::groupby_build_sort::gpu::sort_and_segment;
 use std::time::Instant;
 
@@ -65,9 +70,19 @@ fn print_build_comparison_table() {
         // A2 — only run if n_rows × cost is reasonable (skip if it would take > 30s).
         let a2_ms = if n_rows >= 10_000_000 && iters >= 3 {
             // 10M × 1 iter ≈ 2s; do 3 iters minimum.
-            time_fn(|| { sort_and_segment(&device, &keys).expect("a2"); }, 3)
+            time_fn(
+                || {
+                    sort_and_segment(&device, &keys).expect("a2");
+                },
+                3,
+            )
         } else {
-            time_fn(|| { sort_and_segment(&device, &keys).expect("a2"); }, iters.min(5))
+            time_fn(
+                || {
+                    sort_and_segment(&device, &keys).expect("a2");
+                },
+                iters.min(5),
+            )
         };
 
         // CPU HashMap (M2's existing build).
