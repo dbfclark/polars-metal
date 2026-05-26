@@ -60,8 +60,7 @@ use polars_metal_kernels::aggregate_fused::cache::FusedLibraryCache;
 use polars_metal_kernels::aggregate_fused::signature::{AggOp as KAggOp, AggSpec as KAggSpec};
 use polars_metal_kernels::command::CommandQueue;
 use polars_metal_kernels::groupby::{
-    dispatch_groupby, dispatch_groupby_fused, AggKind, AggRequest, KeyColumn, KeyDtype,
-    ValueColumn,
+    dispatch_groupby, dispatch_groupby_fused, AggKind, AggRequest, KeyColumn, KeyDtype, ValueColumn,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -262,9 +261,17 @@ fn try_fused_dispatch(
             },
         );
     }
-    dispatch_groupby_fused(device, queue, cache, &key_cols, aggs, &value_columns, n_rows)
-        .map(|_| ())
-        .map_err(|e| format!("{e:?}"))
+    dispatch_groupby_fused(
+        device,
+        queue,
+        cache,
+        &key_cols,
+        aggs,
+        &value_columns,
+        n_rows,
+    )
+    .map(|_| ())
+    .map_err(|e| format!("{e:?}"))
 }
 
 fn try_per_agg_dispatch(
@@ -340,8 +347,7 @@ fn bench_fused_vs_per_agg(c: &mut Criterion) {
         // dispatch error, we skip that path for this size and print a
         // diagnostic — criterion would otherwise abort the entire bench
         // run on the first panic.
-        let fused_ok = match try_fused_dispatch(&device, &mut queue, &cache, &inputs, &fused_aggs)
-        {
+        let fused_ok = match try_fused_dispatch(&device, &mut queue, &cache, &inputs, &fused_aggs) {
             Ok(()) => true,
             Err(e) => {
                 eprintln!("[bench] fused_q1 size={size} probe failed, skipping: {e}");
@@ -365,13 +371,8 @@ fn bench_fused_vs_per_agg(c: &mut Criterion) {
                     let mut total = Duration::ZERO;
                     for _ in 0..n_iters {
                         let start = Instant::now();
-                        let _ = try_fused_dispatch(
-                            &device,
-                            &mut queue,
-                            &cache,
-                            &inputs,
-                            &fused_aggs,
-                        );
+                        let _ =
+                            try_fused_dispatch(&device, &mut queue, &cache, &inputs, &fused_aggs);
                         total += start.elapsed();
                         thread::sleep(pause);
                     }
@@ -386,12 +387,8 @@ fn bench_fused_vs_per_agg(c: &mut Criterion) {
                     let mut total = Duration::ZERO;
                     for _ in 0..n_iters {
                         let start = Instant::now();
-                        let _ = try_per_agg_dispatch(
-                            &device,
-                            &mut queue,
-                            &inputs,
-                            &per_agg_requests,
-                        );
+                        let _ =
+                            try_per_agg_dispatch(&device, &mut queue, &inputs, &per_agg_requests);
                         total += start.elapsed();
                         thread::sleep(pause);
                     }

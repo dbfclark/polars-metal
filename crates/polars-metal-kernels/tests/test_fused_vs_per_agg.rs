@@ -48,9 +48,7 @@ use std::sync::Mutex;
 
 use polars_metal_buffer::MetalDevice;
 use polars_metal_kernels::aggregate_fused::cache::FusedLibraryCache;
-use polars_metal_kernels::aggregate_fused::signature::{
-    AggOp as KAggOp, AggSpec as KAggSpec,
-};
+use polars_metal_kernels::aggregate_fused::signature::{AggOp as KAggOp, AggSpec as KAggSpec};
 use polars_metal_kernels::command::CommandQueue;
 use polars_metal_kernels::groupby::{
     dispatch_groupby, dispatch_groupby_fused, AggKind, AggOutput, AggRequest, DecodedColumn,
@@ -118,7 +116,9 @@ fn synth_inputs_f32(
         .collect();
     // Use finite-only values; range bounded so total sums stay well
     // within f32 precision (avoid >2^24 magnitudes where ulp dominates).
-    let values: Vec<f32> = (0..n_rows).map(|_| rng.gen_range(-100.0f32..100.0)).collect();
+    let values: Vec<f32> = (0..n_rows)
+        .map(|_| rng.gen_range(-100.0f32..100.0))
+        .collect();
     let valid: Vec<bool> = (0..n_rows)
         .map(|_| rng.gen::<f32>() >= null_density)
         .collect();
@@ -274,7 +274,10 @@ fn run_fused_sum_f32(
         AggOutput::F32 { values, .. } => values,
         other => return Err(format!("expected F32 sum, got {other:?}")),
     };
-    let sums: BTreeMap<i32, f32> = idx_by_key.into_iter().map(|(k, i)| (k, sums_vec[i])).collect();
+    let sums: BTreeMap<i32, f32> = idx_by_key
+        .into_iter()
+        .map(|(k, i)| (k, sums_vec[i]))
+        .collect();
     Ok(OneColResult { sums })
 }
 
@@ -313,7 +316,10 @@ fn run_per_agg_sum_f32(
         AggOutput::F32 { values, .. } => values,
         other => return Err(format!("expected F32 sum, got {other:?}")),
     };
-    let sums: BTreeMap<i32, f32> = idx_by_key.into_iter().map(|(k, i)| (k, sums_vec[i])).collect();
+    let sums: BTreeMap<i32, f32> = idx_by_key
+        .into_iter()
+        .map(|(k, i)| (k, sums_vec[i]))
+        .collect();
     Ok(OneColResult { sums })
 }
 
@@ -466,7 +472,9 @@ fn q1_inputs(
         .map(|_| (rng.gen::<u32>() % n_groups) as i32)
         .collect();
     let mut gen_col = || -> (Vec<f32>, Vec<bool>) {
-        let vals: Vec<f32> = (0..n_rows).map(|_| rng.gen_range(-100.0f32..100.0)).collect();
+        let vals: Vec<f32> = (0..n_rows)
+            .map(|_| rng.gen_range(-100.0f32..100.0))
+            .collect();
         let valid: Vec<bool> = (0..n_rows)
             .map(|_| rng.gen::<f32>() >= null_density)
             .collect();
@@ -487,10 +495,7 @@ fn q1_inputs(
     )
 }
 
-fn assemble_q1_result(
-    decoded_keys: &[DecodedColumn],
-    agg_outputs: &[AggOutput],
-) -> Q1Result {
+fn assemble_q1_result(decoded_keys: &[DecodedColumn], agg_outputs: &[AggOutput]) -> Q1Result {
     let idx_by_key = group_indices_by_key(&decoded_keys[0]);
     let mut by_key: BTreeMap<i32, BTreeMap<Q1AggSelector, PerKeyOutput>> = BTreeMap::new();
     for (&k, &i) in idx_by_key.iter() {
@@ -552,7 +557,10 @@ fn run_fused_q1(
         n_rows,
     )
     .map_err(|e| format!("fused dispatch: {e:?}"))?;
-    Ok(assemble_q1_result(&result.decoded_keys, &result.agg_outputs))
+    Ok(assemble_q1_result(
+        &result.decoded_keys,
+        &result.agg_outputs,
+    ))
 }
 
 fn run_per_agg_q1(
@@ -596,7 +604,10 @@ fn run_per_agg_q1(
     }
     let result = dispatch_groupby(device, queue, &key_cols, &agg_specs, n_rows)
         .map_err(|e| format!("per-agg dispatch: {e:?}"))?;
-    Ok(assemble_q1_result(&result.decoded_keys, &result.agg_outputs))
+    Ok(assemble_q1_result(
+        &result.decoded_keys,
+        &result.agg_outputs,
+    ))
 }
 
 // ---------- proptest entry points -----------------------------------------

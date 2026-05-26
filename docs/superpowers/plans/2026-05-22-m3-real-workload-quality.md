@@ -3531,10 +3531,9 @@ pub fn partition_and_build(
     let n_groups = partition_group_offset[np as usize];
     let mut row_to_group = vec![0u32; n_rows as usize];
     let mut first_row_per_group = vec![u32::MAX; n_groups as usize];
-    // Reuse hash_u128 / partition_id from the reference module so we
-    // recompute each row's partition deterministically.
-    use crate::groupby_build_partitioned::reference::{partition_id, TGSM_SLOTS_PER_PARTITION};
-    let _ = TGSM_SLOTS_PER_PARTITION; // silence unused-import warning if shape changes
+    // Reuse partition_id from the reference module so we recompute each
+    // row's partition deterministically (and identically to the MSL side).
+    use crate::groupby_build_partitioned::reference::partition_id;
     for r in 0..n_rows as usize {
         let p = partition_id(keys[r], np) as usize;
         let local = row_to_local_group[r];
