@@ -159,3 +159,26 @@ pub fn run_radix_lane(
     }
     Ok((sorted_keys, sorted_idx))
 }
+
+/// Sort a slice of `u128` keys using a stable LSD radix sort.
+///
+/// Chains 16 calls of [`run_radix_lane`] (lanes 0..15, least-significant
+/// byte first). Because each lane pass is stable, the composition produces
+/// a fully-stable sort: equal keys retain their original input order.
+///
+/// Returns `(sorted_keys, sorted_idx)` where `sorted_keys[i] ==
+/// keys[sorted_idx[i]]` for all `i`.
+pub fn sort_u128(device: &MetalDevice, keys: &[u128]) -> Result<(Vec<u128>, Vec<u32>), SortError> {
+    if keys.is_empty() {
+        return Ok((vec![], vec![]));
+    }
+    let n: u32 = keys.len().try_into().map_err(|_| SortError::RowOverflow)?;
+    let mut current_keys: Vec<u128> = keys.to_vec();
+    let mut current_idx: Vec<u32> = (0..n).collect();
+    for lane in 0u32..16 {
+        let (next_keys, next_idx) = run_radix_lane(device, &current_keys, &current_idx, lane)?;
+        current_keys = next_keys;
+        current_idx = next_idx;
+    }
+    Ok((current_keys, current_idx))
+}
