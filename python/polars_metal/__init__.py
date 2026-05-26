@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 from functools import partial, wraps
 from typing import Any
@@ -153,10 +154,8 @@ def _warmup_kernels() -> None:
     swallowed so module import never breaks. Real failures resurface when
     a query of that shape actually runs.
     """
-    try:
+    with contextlib.suppress(Exception):
         _native.warmup_common_fused_signatures()
-    except Exception:  # noqa: BLE001 — best-effort, never fail import
-        pass
 
 
 _warmup_kernels()

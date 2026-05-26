@@ -31,17 +31,10 @@ def test_first_query_after_warmup_is_fast() -> None:
         }
     )
     t0 = time.perf_counter()
-    result = (
-        df.lazy()
-        .group_by("k")
-        .agg(pl.col("v").sum())
-        .collect(engine=pm.MetalEngine())
-    )
+    result = df.lazy().group_by("k").agg(pl.col("v").sum()).collect(engine=pm.MetalEngine())
     dt_ms = (time.perf_counter() - t0) * 1000
     # Without warmup, first F32 Sum query pays ~100-300ms MSL compile.
     # With warmup, expected <50ms (full query including encode/dispatch/finalize).
     # Allow generous headroom; we're only testing the warmup ran, not perf.
-    assert dt_ms < 250, (
-        f"first query took {dt_ms:.1f}ms — likely MSL compile not amortized"
-    )
+    assert dt_ms < 250, f"first query took {dt_ms:.1f}ms — likely MSL compile not amortized"
     assert result.height == 3
