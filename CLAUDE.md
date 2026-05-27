@@ -47,6 +47,7 @@ Both cuDF and Polars are checked out locally under `references/` (gitignored, re
 - **`references/cudf/cpp/src/`** — CUDA kernel sources. Read the matching kernel before writing the MSL port (per "Working with Claude Code in this repo" below).
 - **`references/polars/crates/polars-plan/`** — defines the IR node types we must handle. The `IR` enum is the spec.
 - **`references/polars/crates/polars-core/src/chunked_array/`** — Polars' columnar layout. Our buffers must round-trip through this.
+- **`references/candle/candle-metal-kernels/`** — HuggingFace's Metal-shader collection (binary ops, cast, fill, indexing, gemm, quantized, etc.). Read for MSL idioms and Apple-Silicon-specific patterns when authoring new shaders; the `src/metal_src/` directory has the `.metal` source files and `src/metal/` has Rust-side Metal API abstractions (buffer, command_buffer, compute_pipeline, etc.). Particularly useful where cuDF's CUDA reference doesn't translate cleanly to MSL.
 - **MLX docs** — `ml-explore/mlx`, especially the C++ API and the `mlx::core::array` memory model. We mostly use the C++ side from Rust.
 - **Apple Metal Shading Language spec** — for the custom kernels. The MSL 3.x feature set is our floor.
 - **Apache Arrow columnar format spec** — the source of truth for null semantics and layout.

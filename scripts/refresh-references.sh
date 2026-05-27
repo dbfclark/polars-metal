@@ -13,11 +13,14 @@ set -euo pipefail
 
 CUDF_REPO="https://github.com/rapidsai/cudf.git"
 POLARS_REPO="https://github.com/pola-rs/polars.git"
+CANDLE_REPO="https://github.com/huggingface/candle.git"
 
 # Pinned commits. Update at milestone boundaries; cuDF when porting a new
-# kernel family, Polars whenever Cargo.toml's polars rev is bumped.
+# kernel family, Polars whenever Cargo.toml's polars rev is bumped, candle
+# when consulting candle-metal-kernels for MSL idioms.
 CUDF_REF="f57751a743ccf6a1b693375eb089a5cf08723bef"  # main as of 2026-05-19
 POLARS_REF="344a0ea39753771f893144939f2b70c3144f8ebf"  # py-1.40.1 tag, matches pyproject.toml's pin
+CANDLE_REF="main"  # tracks main; pin to a SHA at next milestone boundary
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REFS_DIR="$REPO_ROOT/references"
@@ -39,8 +42,10 @@ refresh() {
 
 refresh cudf   "$CUDF_REPO"   "$CUDF_REF"
 refresh polars "$POLARS_REPO" "$POLARS_REF"
+refresh candle "$CANDLE_REPO" "$CANDLE_REF"
 
 echo
 echo "References refreshed:"
 (cd "$REFS_DIR/cudf"   && echo "  cudf   $(git rev-parse HEAD)")
 (cd "$REFS_DIR/polars" && echo "  polars $(git rev-parse HEAD)")
+(cd "$REFS_DIR/candle" && echo "  candle $(git rev-parse HEAD)")
