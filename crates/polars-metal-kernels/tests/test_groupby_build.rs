@@ -51,7 +51,7 @@ fn run_build(encoded: &[u128]) -> (Vec<u32>, u32, Vec<u32>) {
     dispatch_hash(&device, &mut queue, encoded, encoded.len(), &mut hashes).expect("dispatch_hash");
     let out = dispatch_build(&device, &mut queue, encoded, &hashes, encoded.len())
         .expect("dispatch_build");
-    (out.row_to_group, out.group_count, out.first_row_per_group)
+    (out.row_to_group, out.n_groups, out.first_row_per_group)
 }
 
 #[test]

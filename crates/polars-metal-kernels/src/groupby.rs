@@ -366,16 +366,15 @@ pub fn dispatch_hash(
     Ok(())
 }
 
-/// Output of the build phase.
-pub struct BuildOutput {
-    /// `row_to_group[i]` = group ID for row i.
-    pub row_to_group: Vec<u32>,
-    /// Total number of distinct groups produced by the build.
-    pub group_count: u32,
-    /// `first_row_per_group[g]` = a representative source-row index for
-    /// group g, used to reconstruct key columns in the result.
-    pub first_row_per_group: Vec<u32>,
-}
+/// Output of the build phase. Fields: `row_to_group`, `n_groups`,
+/// `first_row_per_group`.
+///
+/// Re-exported from `crate::groupby_build_partitioned` so the CPU build
+/// (`dispatch_build`), the GPU A1 build (`partition_and_build`), and
+/// the A2 sort-based build (`sort_and_segment`) all return the same
+/// shape — the engine's UDF dispatch can swap among them without
+/// adapter code.
+pub use crate::groupby_build_partitioned::BuildOutput;
 
 /// Dispatch the `groupby_build` phase.
 ///
@@ -398,24 +397,22 @@ pub struct BuildOutput {
 ///    the contested slots settle, especially when many rows hash to a small
 ///    cluster of keys.
 ///
-/// Both failure modes produce 0xFFFFFFFF sentinels in `row_to_group` and
-/// manifest as equivalence-class divergence in the proptest.
+/// The CPU build path remains correct, simple, and fast for the small
+/// cardinalities that dominate typical workloads. Phase 4 / 4.5 added a
+/// GPU build (capability A1 — `partition_and_build_with_scratch`) that
+/// wins at high row counts and low-to-medium cardinality. The router
+/// here picks A1 above [`A1_ROWS_THRESHOLD`] and falls back to CPU on
+/// A1 overflow (cardinality exceeds A1's TGSM capacity).
 ///
-/// The build phase is NOT where GPU parallelism pays off for GroupBy:
-/// the key cardinality is small (≤ millions of groups vs. ≥ billions of
-/// rows), so the table fills quickly and most threads merely lookup an
-/// existing key.  The aggregation phase (Phase 6 shaders) IS where the
-/// parallelism matters — one thread per row, no contention.
-///
-/// **Conclusion**: run the build phase on CPU using a `HashMap`, which is
-/// correct, simple, and fast for realistic cardinalities.  The aggregation
-/// kernels receive the CPU-produced `row_to_group` mapping and run fully
-/// on-GPU.
+/// Empirical crossover from `tests/bench_cpu_build_compare.rs`:
+///   - 100K rows: CPU wins (A1 is 3-5× slower; GPU dispatch overhead dominates)
+///   - 1M rows × 1024 groups: A1 ~2× CPU win
+///   - 10M rows × 1024 groups: A1 ~4× CPU win
+///   - >16K unique groups: A1 overflows; CPU is the fallback
 ///
 /// `hashes` is accepted but unused (kept in the signature for API
-/// compatibility — callers that compute hashes for the GPU hash kernel can
-/// pass them here without branching).
-#[allow(unused_variables)]
+/// compatibility — callers that compute hashes for the GPU hash kernel
+/// can pass them here without branching).
 pub fn dispatch_build(
     device: &MetalDevice,
     queue: &mut CommandQueue,
@@ -423,13 +420,13 @@ pub fn dispatch_build(
     hashes: &[u32],
     n_rows: usize,
 ) -> Result<BuildOutput, GroupByError> {
-    let _ = device;
     let _ = queue;
+    let _ = hashes;
 
     if n_rows == 0 {
         return Ok(BuildOutput {
             row_to_group: vec![],
-            group_count: 0,
+            n_groups: 0,
             first_row_per_group: vec![],
         });
     }
@@ -441,16 +438,37 @@ pub fn dispatch_build(
         });
     }
 
-    // Open-addressing hash table on CPU.  Uses `HashMap` for simplicity
-    // and correctness; a raw linear-probe table would be faster but the
-    // build phase is not the bottleneck for typical GroupBy workloads.
+    // A1 (GPU) path for inputs large enough that the GPU dispatch +
+    // host↔device traffic amortizes. Falls back to CPU on overflow.
+    if n_rows >= A1_ROWS_THRESHOLD {
+        if let Some(out) = try_a1_build(device, &encoded[..n_rows]) {
+            return Ok(out);
+        }
+        // None ⇒ A1 overflowed or hit a transient dispatch error; fall
+        // through to CPU.
+    }
+
+    cpu_hashmap_build(&encoded[..n_rows])
+}
+
+/// Row-count crossover above which A1 is empirically faster than CPU.
+/// Measured 2026-05-26 on M2 Ultra: at 1M rows × 4 groups, A1 = 9.1ms
+/// vs CPU = 10.7ms (tied); at 1M × 1024 groups, A1 = 6.5ms vs CPU =
+/// 13.2ms. Below 500K, CPU is faster. Conservative threshold leaves
+/// some margin for jitter.
+pub const A1_ROWS_THRESHOLD: usize = 500_000;
+
+/// CPU HashMap build (original M2 path; remains the fallback for small
+/// inputs and high-cardinality cases where A1 overflows).
+fn cpu_hashmap_build(encoded: &[u128]) -> Result<BuildOutput, GroupByError> {
+    let n_rows = encoded.len();
     let mut group_for_key: std::collections::HashMap<u128, u32> =
         std::collections::HashMap::with_capacity(n_rows.min(1 << 20));
     let mut next_gid: u32 = 0;
     let mut row_to_group = Vec::with_capacity(n_rows);
     let mut first_row_per_group: Vec<u32> = Vec::new();
 
-    for (row, &key) in encoded[..n_rows].iter().enumerate() {
+    for (row, &key) in encoded.iter().enumerate() {
         let gid = *group_for_key.entry(key).or_insert_with(|| {
             let g = next_gid;
             next_gid = next_gid.checked_add(1).unwrap_or(u32::MAX);
@@ -462,9 +480,48 @@ pub fn dispatch_build(
 
     Ok(BuildOutput {
         row_to_group,
-        group_count: next_gid,
+        n_groups: next_gid,
         first_row_per_group,
     })
+}
+
+/// Try A1 GPU build using the process-wide [`BuildScratch`] arena.
+/// Returns `Some(BuildOutput)` on success, `None` on
+/// [`PartitionedBuildError::Overflow`] (caller should fall back to CPU).
+/// Other dispatch errors are converted to `None` and likewise route to
+/// CPU — A1 is the optimization; correctness comes from the CPU path.
+fn try_a1_build(device: &MetalDevice, encoded: &[u128]) -> Option<BuildOutput> {
+    use crate::groupby_build_partitioned::gpu::partition_and_build_with_scratch;
+    use crate::groupby_build_partitioned::PartitionedBuildError;
+
+    let scratch_mutex = a1_scratch(device)?;
+    let mut scratch = scratch_mutex.lock().ok()?;
+    match partition_and_build_with_scratch(device, &mut scratch, encoded, 16) {
+        Ok(out) => Some(out),
+        Err(PartitionedBuildError::Overflow) => None,
+        Err(_) => None,
+    }
+}
+
+/// Process-wide A1 scratch arena, lazily initialized on first GPU build
+/// dispatch. One per device — Polars currently uses a single device.
+/// `Mutex` serializes concurrent queries, which is fine because the
+/// polars callback layer runs queries one at a time per process.
+///
+/// Returns `None` if scratch allocation fails (extremely unusual —
+/// Metal must support 16-byte buffer allocation); the caller then falls
+/// back to the CPU build path so the engine never returns wrong
+/// results, only loses the perf optimization.
+fn a1_scratch(
+    device: &MetalDevice,
+) -> Option<&'static std::sync::Mutex<crate::groupby_build_partitioned::BuildScratch>> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<crate::groupby_build_partitioned::BuildScratch>> = OnceLock::new();
+    if let Some(c) = CACHE.get() {
+        return Some(c);
+    }
+    let scratch = crate::groupby_build_partitioned::BuildScratch::new(device).ok()?;
+    Some(CACHE.get_or_init(|| Mutex::new(scratch)))
 }
 
 // -----------------------------------------------------------------------
@@ -1822,7 +1879,7 @@ pub fn dispatch_groupby(
     let mut hashes = vec![0u32; n_rows];
     dispatch_hash(device, queue, &encoded, n_rows, &mut hashes)?;
     let build = dispatch_build(device, queue, &encoded, &hashes, n_rows)?;
-    let n_groups = build.group_count;
+    let n_groups = build.n_groups;
 
     let mut agg_outputs = Vec::with_capacity(agg_specs.len());
     for (req, vcol) in agg_specs {
@@ -2349,7 +2406,7 @@ pub fn dispatch_groupby_fused(
     let mut hashes = vec![0u32; n_rows];
     dispatch_hash(device, queue, &encoded, n_rows, &mut hashes)?;
     let build = dispatch_build(device, queue, &encoded, &hashes, n_rows)?;
-    let n_groups_u32 = build.group_count;
+    let n_groups_u32 = build.n_groups;
     let n_groups = n_groups_u32 as usize;
 
     // ---- allocate per-slot value/validity buffers in column_order -----------
