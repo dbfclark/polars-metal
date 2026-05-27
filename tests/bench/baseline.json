@@ -67,6 +67,25 @@
       "hardware": "M2 Ultra",
       "_notes": "TPC-H Q1's canonical schema: Utf8 keys (3 returnflags × 2 linestatuses = 6 unique combos) + F64 numerics + expression aggs (l_extendedprice * (1 - l_discount) etc.). Expression aggs route through fused-agg → tied with CPU. Phase 7 (Utf8 dtype) + Phase 10 (walker engagement) + the agg-kernel fix together let this query route end-to-end through Metal at performance parity with CPU. Real Metal-vs-CPU measurement; 14/17 rounds, 2026-05-27.",
       "_gate": {"ratio_lt": 1.10}
+    },
+    "tpch_q1_100m_canonical": {
+      "cpu_ms": 489.47,
+      "metal_ms": 473.33,
+      "ratio_metal_over_cpu": 0.967,
+      "n_rows": 100000000,
+      "n_groups": 6,
+      "hardware": "M2 Ultra (128GB)",
+      "_notes": "Phase 14 — 100M-row scale validation. The canonical Q1 was tied at 10M (1.005); at 100M Metal pulls 3% ahead of CPU as fixed-overhead (encode_keys ~80ms, FFI marshalling ~50ms, A1 build ~150ms) amortizes over 10× the rows. This is the first clean engine-level Metal win on a real TPC-H workload. Phase 3 fused-agg + Phase 4.5 A1 carry the win; canonical schema = Utf8 keys + F64 expression aggs lands in the fused-agg path. Measured 2026-05-27, 5 rounds.",
+      "_gate": {"ratio_lt": 1.0}
+    },
+    "tpch_q1_100m_bool": {
+      "cpu_ms": 401.48,
+      "metal_ms": 970.95,
+      "ratio_metal_over_cpu": 2.42,
+      "n_rows": 100000000,
+      "hardware": "M2 Ultra (128GB)",
+      "_notes": "Phase 14 — 100M-row scale, M2 schema (Bool keys + i64+f64 values + Simple Sum aggs → PerAgg). Same shape as tpch_q1_modified at 10M (2.83x); ratio holds at 2.42x at 100M. The per-agg path remains the dominant engine-level bottleneck for 64-bit-value workloads. Measured 2026-05-27, 5 rounds.",
+      "_gate": {"ratio_lt": 3.0}
     }
   }
 }
