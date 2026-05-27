@@ -52,6 +52,10 @@ pub enum MetalDtype {
     U8,
     U16,
     U32,
+    // M3 Phase 7: dictionary-encoded Utf8. Present in this mirror only to
+    // stay in sync with the IR enum; Utf8 columns are never agg value cols,
+    // so the fused signature will never observe this variant in practice.
+    Utf8,
 }
 
 /// Mirror of `polars_metal_core::plan::AggOp`.

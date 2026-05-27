@@ -78,6 +78,9 @@ fn key_width_bits(dtype: MetalDtype) -> usize {
         MetalDtype::I32 | MetalDtype::F32 | MetalDtype::U32 => 1 + 32,
         MetalDtype::I16 | MetalDtype::U16 => 1 + 16,
         MetalDtype::I8 | MetalDtype::U8 => 1 + 8,
+        // M3 Phase 7: Utf8 keys are dictionary-encoded into u32 codes; same
+        // width as U32 from the composite-key encoder's perspective.
+        MetalDtype::Utf8 => 1 + 32,
     }
 }
 

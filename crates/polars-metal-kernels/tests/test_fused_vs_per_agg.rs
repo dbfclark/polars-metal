@@ -245,6 +245,7 @@ fn run_fused_sum_f32(
         data: &key_data,
         valid: &key_valid,
         n_rows,
+        dict: None,
     }];
     // SAFETY: f32 is plain-old-data; we just built val_data from the same
     // slice via to_le_bytes, so reinterpreting is safe.
@@ -298,6 +299,7 @@ fn run_per_agg_sum_f32(
         data: &key_data,
         valid: &key_valid,
         n_rows,
+        dict: None,
     }];
     let agg_specs: Vec<(AggRequest, ValueColumn<'_>)> = vec![(
         AggRequest {
@@ -532,6 +534,7 @@ fn run_fused_q1(
         data: &key_data,
         valid: &key_valid,
         n_rows,
+        dict: None,
     }];
     // Build owned packed validity vecs so the borrowed slices outlive the
     // HashMap construction.
@@ -578,6 +581,7 @@ fn run_per_agg_q1(
         data: &key_data,
         valid: &key_valid,
         n_rows,
+        dict: None,
     }];
     let valids: Vec<Vec<u8>> = cols.iter().map(|(_, _, v)| pack_valid(v)).collect();
     // The per-agg path indexes by input_col_idx, but each (AggRequest,

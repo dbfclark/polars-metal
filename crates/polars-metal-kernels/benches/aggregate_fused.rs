@@ -250,6 +250,7 @@ fn try_fused_dispatch(
         data: &inputs.key_data,
         valid: &inputs.key_valid,
         n_rows,
+        dict: None,
     }];
     let mut value_columns: HashMap<String, ValueColumn<'_>> = HashMap::new();
     for col in inputs.cols.iter() {
@@ -287,6 +288,7 @@ fn try_per_agg_dispatch(
         data: &inputs.key_data,
         valid: &inputs.key_valid,
         n_rows,
+        dict: None,
     }];
     let agg_specs: Vec<(AggRequest, ValueColumn<'_>)> = requests
         .iter()

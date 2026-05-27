@@ -190,6 +190,10 @@ pub fn emit_msl(sig: &AggSignature, specs: &[AggSpec]) -> String {
 pub fn signature_supported_by_fused(sig: &AggSignature) -> bool {
     sig.column_dtypes().iter().all(|d| match d {
         MetalDtype::F64 | MetalDtype::I64 => false,
+        // Utf8 is never an agg value column (it's a key dtype only), but the
+        // mirror enum carries it. Report unsupported so a bug that lifts a
+        // Utf8 column into the fused path falls back rather than panics.
+        MetalDtype::Utf8 => false,
         // List every other variant so adding one to the mirror is a
         // compile error here (force the author to think about it).
         MetalDtype::F32
@@ -211,6 +215,11 @@ fn msl_value_load_type(dt: MetalDtype) -> &'static str {
         MetalDtype::I32 | MetalDtype::I16 | MetalDtype::I8 | MetalDtype::I64 => "int",
         MetalDtype::U32 | MetalDtype::U16 | MetalDtype::U8 => "uint",
         MetalDtype::Bool => "uchar",
+        // Utf8 is never a value-column dtype reaching the MSL emitter; the
+        // fused-supported predicate above filters it out. Map to a no-op
+        // placeholder so the panic path is unreachable in practice but the
+        // match remains exhaustive.
+        MetalDtype::Utf8 => "uint",
     }
 }
 

@@ -94,6 +94,9 @@ fn canonicalize(
                 DecodedColumn::U8 { values, valid } => (valid[g], values[g] as i64),
                 DecodedColumn::U16 { values, valid } => (valid[g], values[g] as i64),
                 DecodedColumn::U32 { values, valid } => (valid[g], values[g] as i64),
+                DecodedColumn::Utf8 { .. } => {
+                    panic!("pipeline tests do not use Utf8 keys (integer/float/bool only)")
+                }
             })
             .collect();
         let agg_tuple: AggTuple = agg_outputs
@@ -260,6 +263,7 @@ fn pipeline_four_groups_single_i64_key() {
         data: &key_bytes,
         valid: &key_valid_p,
         n_rows,
+        dict: None,
     }];
     let agg_specs = vec![
         (
@@ -323,6 +327,7 @@ fn pipeline_empty_input() {
         data: &[],
         valid: &key_valid,
         n_rows: 0,
+        dict: None,
     }];
     let agg_specs = vec![(
         AggRequest {
@@ -369,6 +374,7 @@ fn pipeline_single_row() {
         data: &key_bytes,
         valid: &key_valid_p,
         n_rows: 1,
+        dict: None,
     }];
     let agg_specs = vec![(
         AggRequest {
@@ -429,6 +435,7 @@ proptest! {
             data: &key_bytes,
             valid: &key_valid_p,
             n_rows: n,
+            dict: None,
         }];
         let agg_specs = vec![
             (

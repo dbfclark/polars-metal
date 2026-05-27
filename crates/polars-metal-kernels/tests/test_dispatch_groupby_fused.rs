@@ -71,6 +71,7 @@ fn fused_groupby_sum_mean_count_len_f32_matches_cpu() {
         data: &key_data_bytes,
         valid: &key_valid_bytes,
         n_rows,
+        dict: None,
     }];
 
     // SAFETY: f32 is plain-old-data.
@@ -202,6 +203,7 @@ fn fused_groupby_expression_sum_a_times_b() {
         data: &key_data_bytes,
         valid: &key_valid_bytes,
         n_rows,
+        dict: None,
     }];
 
     // SAFETY: f32 is plain-old-data.

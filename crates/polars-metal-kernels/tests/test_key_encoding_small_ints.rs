@@ -37,7 +37,7 @@ proptest! {
     fn i8_roundtrip(values in proptest::collection::vec(any::<i8>(), 1..256)) {
         let data = bytes_i8(&values);
         let valid = all_valid(values.len());
-        let col = KeyColumn { name: "k".into(), dtype: KeyDtype::I8, data: &data, valid: &valid, n_rows: values.len() };
+        let col = KeyColumn { name: "k".into(), dtype: KeyDtype::I8, data: &data, valid: &valid, n_rows: values.len(), dict: None };
         let (encoded, schema) = encode_keys(&[col]).expect("encode");
         let decoded = decode_keys(&encoded, &schema);
         match &decoded[0] {
@@ -53,7 +53,7 @@ proptest! {
     fn i16_roundtrip(values in proptest::collection::vec(any::<i16>(), 1..256)) {
         let data = bytes_i16(&values);
         let valid = all_valid(values.len());
-        let col = KeyColumn { name: "k".into(), dtype: KeyDtype::I16, data: &data, valid: &valid, n_rows: values.len() };
+        let col = KeyColumn { name: "k".into(), dtype: KeyDtype::I16, data: &data, valid: &valid, n_rows: values.len(), dict: None };
         let (encoded, schema) = encode_keys(&[col]).expect("encode");
         let decoded = decode_keys(&encoded, &schema);
         match &decoded[0] {
@@ -66,7 +66,7 @@ proptest! {
     fn u8_roundtrip(values in proptest::collection::vec(any::<u8>(), 1..256)) {
         let data = bytes_u8(&values);
         let valid = all_valid(values.len());
-        let col = KeyColumn { name: "k".into(), dtype: KeyDtype::U8, data: &data, valid: &valid, n_rows: values.len() };
+        let col = KeyColumn { name: "k".into(), dtype: KeyDtype::U8, data: &data, valid: &valid, n_rows: values.len(), dict: None };
         let (encoded, schema) = encode_keys(&[col]).expect("encode");
         let decoded = decode_keys(&encoded, &schema);
         match &decoded[0] {
@@ -79,7 +79,7 @@ proptest! {
     fn u16_roundtrip(values in proptest::collection::vec(any::<u16>(), 1..256)) {
         let data = bytes_u16(&values);
         let valid = all_valid(values.len());
-        let col = KeyColumn { name: "k".into(), dtype: KeyDtype::U16, data: &data, valid: &valid, n_rows: values.len() };
+        let col = KeyColumn { name: "k".into(), dtype: KeyDtype::U16, data: &data, valid: &valid, n_rows: values.len(), dict: None };
         let (encoded, schema) = encode_keys(&[col]).expect("encode");
         let decoded = decode_keys(&encoded, &schema);
         match &decoded[0] {
@@ -92,7 +92,7 @@ proptest! {
     fn u32_roundtrip(values in proptest::collection::vec(any::<u32>(), 1..256)) {
         let data = bytes_u32(&values);
         let valid = all_valid(values.len());
-        let col = KeyColumn { name: "k".into(), dtype: KeyDtype::U32, data: &data, valid: &valid, n_rows: values.len() };
+        let col = KeyColumn { name: "k".into(), dtype: KeyDtype::U32, data: &data, valid: &valid, n_rows: values.len(), dict: None };
         let (encoded, schema) = encode_keys(&[col]).expect("encode");
         let decoded = decode_keys(&encoded, &schema);
         match &decoded[0] {
@@ -116,9 +116,9 @@ proptest! {
         let d16 = bytes_i16(i16_vals);
         let d32 = bytes_u32(u32_vals);
         let cols = vec![
-            KeyColumn { name: "a".into(), dtype: KeyDtype::I8,  data: &d8,  valid: &valid, n_rows: n },
-            KeyColumn { name: "b".into(), dtype: KeyDtype::I16, data: &d16, valid: &valid, n_rows: n },
-            KeyColumn { name: "c".into(), dtype: KeyDtype::U32, data: &d32, valid: &valid, n_rows: n },
+            KeyColumn { name: "a".into(), dtype: KeyDtype::I8,  data: &d8,  valid: &valid, n_rows: n, dict: None },
+            KeyColumn { name: "b".into(), dtype: KeyDtype::I16, data: &d16, valid: &valid, n_rows: n, dict: None },
+            KeyColumn { name: "c".into(), dtype: KeyDtype::U32, data: &d32, valid: &valid, n_rows: n, dict: None },
         ];
         let (encoded, schema) = encode_keys(&cols).expect("encode");
         let decoded = decode_keys(&encoded, &schema);
@@ -138,7 +138,7 @@ proptest! {
     fn duplicate_signed_values_encode_identically(values in proptest::collection::vec(any::<i32>(), 2..64)) {
         let data = bytes_i32(&values);
         let valid = all_valid(values.len());
-        let col = KeyColumn { name: "k".into(), dtype: KeyDtype::I32, data: &data, valid: &valid, n_rows: values.len() };
+        let col = KeyColumn { name: "k".into(), dtype: KeyDtype::I32, data: &data, valid: &valid, n_rows: values.len(), dict: None };
         let (encoded, _schema) = encode_keys(&[col]).expect("encode");
         for i in 0..values.len() {
             for j in 0..values.len() {

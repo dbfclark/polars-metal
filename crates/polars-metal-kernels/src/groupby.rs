@@ -48,6 +48,8 @@ pub enum KeyDtype {
     U8,
     U16,
     U32,
+    // M3 Phase 7: dictionary-encoded, 32-bit codes + dict carried in schema.
+    Utf8,
 }
 
 impl KeyDtype {
@@ -56,7 +58,7 @@ impl KeyDtype {
         match self {
             KeyDtype::I64 | KeyDtype::F64 => 64,
             KeyDtype::Bool => 1,
-            KeyDtype::I32 | KeyDtype::F32 | KeyDtype::U32 => 32,
+            KeyDtype::I32 | KeyDtype::F32 | KeyDtype::U32 | KeyDtype::Utf8 => 32,
             KeyDtype::I16 | KeyDtype::U16 => 16,
             KeyDtype::I8 | KeyDtype::U8 => 8,
         }
@@ -75,6 +77,11 @@ pub struct KeyColumn<'a> {
     /// Bit-packed validity bitmap, `ceil(n_rows / 8)` bytes minimum.
     pub valid: &'a [u8],
     pub n_rows: usize,
+    /// Only present for KeyDtype::Utf8. Caller must build the dict via
+    /// `polars_metal_buffer::dict::build_dict_nullable` (or similar) and
+    /// supply the resulting `Vec<String>` here; `data` then holds the
+    /// u32 codes as little-endian bytes. None for all other dtypes.
+    pub dict: Option<Vec<String>>,
 }
 
 /// One field's position in the encoded u128 lane. Both fields and
@@ -87,6 +94,9 @@ pub struct KeyField {
     pub null_bit_offset: u32,
     /// Bit position of this field's data, immediately following the null bit.
     pub data_bit_offset: u32,
+    /// Only present when dtype == Utf8. Carries the dictionary so
+    /// `decode_keys` can map u32 codes back to strings.
+    pub dict: Option<Vec<String>>,
 }
 
 /// Schema for a composite-key encoding. Sufficient to decode an encoded
@@ -131,6 +141,8 @@ pub enum KeyEncodeError {
         got: usize,
         need: usize,
     },
+    #[error("KeyColumn for {col:?} has dtype Utf8 but no dict")]
+    Utf8MissingDict { col: String },
 }
 
 /// Encode `cols` to a `Vec<u128>` (one u128 per row). Returns the
@@ -155,11 +167,16 @@ pub fn encode_keys(cols: &[KeyColumn<'_>]) -> Result<(Vec<u128>, KeySchema), Key
     for c in cols {
         let need_data = match c.dtype {
             KeyDtype::I64 | KeyDtype::F64 => n_rows * 8,
-            KeyDtype::I32 | KeyDtype::F32 | KeyDtype::U32 => n_rows * 4,
+            KeyDtype::I32 | KeyDtype::F32 | KeyDtype::U32 | KeyDtype::Utf8 => n_rows * 4,
             KeyDtype::I16 | KeyDtype::U16 => n_rows * 2,
             KeyDtype::I8 | KeyDtype::U8 => n_rows,
             KeyDtype::Bool => min_valid_bytes,
         };
+        if c.dtype == KeyDtype::Utf8 && c.dict.is_none() {
+            return Err(KeyEncodeError::Utf8MissingDict {
+                col: c.name.clone(),
+            });
+        }
         if c.data.len() < need_data {
             return Err(KeyEncodeError::DataTooShort {
                 col: c.name.clone(),
@@ -188,6 +205,7 @@ pub fn encode_keys(cols: &[KeyColumn<'_>]) -> Result<(Vec<u128>, KeySchema), Key
             dtype: c.dtype,
             null_bit_offset,
             data_bit_offset,
+            dict: c.dict.clone(),
         });
         offset += field_bits;
     }
@@ -224,7 +242,7 @@ pub fn encode_keys(cols: &[KeyColumn<'_>]) -> Result<(Vec<u128>, KeySchema), Key
                     bytes.copy_from_slice(&c.data[row * 4..(row + 1) * 4]);
                     f32::from_le_bytes(bytes).to_bits() as u128
                 }
-                KeyDtype::U32 => {
+                KeyDtype::U32 | KeyDtype::Utf8 => {
                     let mut bytes = [0u8; 4];
                     bytes.copy_from_slice(&c.data[row * 4..(row + 1) * 4]);
                     u32::from_le_bytes(bytes) as u128
@@ -1629,17 +1647,52 @@ pub fn hash_u128_reference(lo: u64, hi: u64) -> u32 {
 /// DataFrames after the kernel returns indices.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecodedColumn {
-    I64 { values: Vec<i64>, valid: Vec<bool> },
-    F64 { values: Vec<f64>, valid: Vec<bool> },
-    Bool { values: Vec<bool>, valid: Vec<bool> },
-    I32 { values: Vec<i32>, valid: Vec<bool> },
-    F32 { values: Vec<f32>, valid: Vec<bool> },
+    I64 {
+        values: Vec<i64>,
+        valid: Vec<bool>,
+    },
+    F64 {
+        values: Vec<f64>,
+        valid: Vec<bool>,
+    },
+    Bool {
+        values: Vec<bool>,
+        valid: Vec<bool>,
+    },
+    I32 {
+        values: Vec<i32>,
+        valid: Vec<bool>,
+    },
+    F32 {
+        values: Vec<f32>,
+        valid: Vec<bool>,
+    },
     // M3 additions
-    I8 { values: Vec<i8>, valid: Vec<bool> },
-    I16 { values: Vec<i16>, valid: Vec<bool> },
-    U8 { values: Vec<u8>, valid: Vec<bool> },
-    U16 { values: Vec<u16>, valid: Vec<bool> },
-    U32 { values: Vec<u32>, valid: Vec<bool> },
+    I8 {
+        values: Vec<i8>,
+        valid: Vec<bool>,
+    },
+    I16 {
+        values: Vec<i16>,
+        valid: Vec<bool>,
+    },
+    U8 {
+        values: Vec<u8>,
+        valid: Vec<bool>,
+    },
+    U16 {
+        values: Vec<u16>,
+        valid: Vec<bool>,
+    },
+    U32 {
+        values: Vec<u32>,
+        valid: Vec<bool>,
+    },
+    // M3 Phase 7: dictionary-decoded Utf8 keys.
+    Utf8 {
+        values: Vec<String>,
+        valid: Vec<bool>,
+    },
 }
 
 /// Decode a u128-encoded composite-key stream back to per-column values.
@@ -1685,6 +1738,10 @@ pub fn decode_keys(encoded: &[u128], schema: &KeySchema) -> Vec<DecodedColumn> {
                 valid: Vec::with_capacity(encoded.len()),
             },
             KeyDtype::U32 => DecodedColumn::U32 {
+                values: Vec::with_capacity(encoded.len()),
+                valid: Vec::with_capacity(encoded.len()),
+            },
+            KeyDtype::Utf8 => DecodedColumn::Utf8 {
                 values: Vec::with_capacity(encoded.len()),
                 valid: Vec::with_capacity(encoded.len()),
             },
@@ -1761,6 +1818,27 @@ pub fn decode_keys(encoded: &[u128], schema: &KeySchema) -> Vec<DecodedColumn> {
                 (DecodedColumn::U8 { values, valid }, KeyDtype::U8) => {
                     let raw = (lane >> field.data_bit_offset) & ((1u128 << 8) - 1);
                     let v = if is_valid { raw as u8 } else { 0u8 };
+                    values.push(v);
+                    valid.push(is_valid);
+                }
+                (DecodedColumn::Utf8 { values, valid }, KeyDtype::Utf8) => {
+                    let raw = (lane >> field.data_bit_offset) & ((1u128 << 32) - 1);
+                    let code = raw as u32;
+                    // `encode_keys` guarantees `dict` is `Some` for every
+                    // Utf8 field it emits (validated up-front via
+                    // `KeyEncodeError::Utf8MissingDict`). A `None` here
+                    // would mean a schema was constructed by some other
+                    // path; degrade gracefully to empty-string output
+                    // rather than panicking on a kernel-layer assumption.
+                    let v = if is_valid {
+                        field
+                            .dict
+                            .as_ref()
+                            .and_then(|d| d.get(code as usize).cloned())
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
                     values.push(v);
                     valid.push(is_valid);
                 }
@@ -2713,6 +2791,10 @@ fn primary_kind_for(op: KAggOp, input_dt: KMetalDtype) -> PrimaryKind {
             KMetalDtype::U32 | KMetalDtype::U16 | KMetalDtype::U8 | KMetalDtype::Bool => {
                 PrimaryKind::U32
             }
+            // Utf8 is never an agg value-column dtype; the dispatch router
+            // filters this out. Treat as U32 (its underlying code dtype) for
+            // exhaustiveness; reaching this arm would mean a router bug.
+            KMetalDtype::Utf8 => PrimaryKind::U32,
         },
     }
 }

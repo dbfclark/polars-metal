@@ -98,6 +98,11 @@ fn wire_dtype_tag_to_kernel(tag: &str) -> Option<KMetalDtype> {
         "U8" => Some(KMetalDtype::U8),
         "U16" => Some(KMetalDtype::U16),
         "U32" => Some(KMetalDtype::U32),
+        // M3 Phase 7: Utf8 is a key dtype only — never a valid agg value
+        // column. Returning None here forces `decide_groupby_dispatch` down
+        // the PerAgg branch (or further fallback) if a router bug ever lifts
+        // a Utf8 column into agg-input position.
+        "Utf8" | "String" => None,
         _ => None,
     }
 }
@@ -569,6 +574,14 @@ fn compact_one_column(
         MetalDtype::I8 | MetalDtype::I16 | MetalDtype::U8 | MetalDtype::U16 | MetalDtype::U32 => {
             Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
                 "polars_metal: filter compaction for {column_name:?} ({dtype:?}) not supported; filter should route CPU"
+            )))
+        }
+        // M3 Phase 7: Utf8 keys go through the composite-key encoder, but the
+        // filter compaction path has no Utf8 support yet. Filter on Utf8 must
+        // route CPU; reaching this arm is a router bug.
+        MetalDtype::Utf8 => {
+            Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                "polars_metal: filter on Utf8 columns ({column_name:?}): not yet wired"
             )))
         }
     }
@@ -1388,6 +1401,7 @@ fn metal_dtype_to_key_dtype(d: MetalDtype) -> KeyDtype {
         MetalDtype::U8 => KeyDtype::U8,
         MetalDtype::U16 => KeyDtype::U16,
         MetalDtype::U32 => KeyDtype::U32,
+        MetalDtype::Utf8 => KeyDtype::Utf8,
     }
 }
 
@@ -1798,6 +1812,32 @@ fn encode_decoded_column(
             let v = pack_valid_bitmap(valid);
             ("U32", data, v)
         }
+        DecodedColumn::Utf8 { values, valid } => {
+            // Wire format (parsed Python-side in Task 34):
+            //   [n_rows: u32 le]
+            //   [offsets: (n_rows+1) × i32 le]   Arrow Utf8 offset convention
+            //   [concatenated string bytes]
+            let n = values.len() as u32;
+            let mut data: Vec<u8> = Vec::new();
+            data.extend_from_slice(&n.to_le_bytes());
+            let mut offsets: Vec<i32> = Vec::with_capacity(values.len() + 1);
+            let mut acc: i32 = 0;
+            offsets.push(0);
+            let mut bytes_blob: Vec<u8> = Vec::new();
+            for (s, &is_valid) in values.iter().zip(valid.iter()) {
+                if is_valid {
+                    bytes_blob.extend_from_slice(s.as_bytes());
+                    acc = acc.saturating_add(s.len() as i32);
+                }
+                offsets.push(acc);
+            }
+            for o in &offsets {
+                data.extend_from_slice(&o.to_le_bytes());
+            }
+            data.extend_from_slice(&bytes_blob);
+            let v = pack_valid_bitmap(valid);
+            ("Utf8", data, v)
+        }
     }
 }
 
@@ -1947,6 +1987,10 @@ pub fn execute_groupby<'py>(
             data,
             valid,
             n_rows,
+            // Phase 7 Task 33: Utf8 keys carry a dict, plumbed in Task 34
+            // (walker emits Utf8 with dict). For all other dtypes (and
+            // until Task 34 lands), no dict.
+            dict: None,
         })
         .collect();
 

@@ -20,6 +20,8 @@ pub enum MetalDtype {
     U8,
     U16,
     U32,
+    // M3 Phase 7: dictionary-encoded Utf8 keys.
+    Utf8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +82,7 @@ impl MetalDtype {
             "U8" => Some(MetalDtype::U8),
             "U16" => Some(MetalDtype::U16),
             "U32" => Some(MetalDtype::U32),
+            "Utf8" | "String" => Some(MetalDtype::Utf8),
             _ => None,
         }
     }
