@@ -108,4 +108,9 @@ def _strip_side_channels(plan: dict) -> dict:
         out["input"] = _strip_side_channels(plan["input"])
         out["keys"] = plan.get("keys", [])
         out["aggs"] = plan.get("aggs", [])
+    elif plan["kind"] == "Sort":
+        out["input"] = _strip_side_channels(plan["input"])
+        out["by_columns"] = plan.get("by_columns", [])
+        out["descending"] = plan.get("descending", [])
+        out["nulls_last"] = plan.get("nulls_last", [])
     return out

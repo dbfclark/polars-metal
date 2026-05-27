@@ -12,7 +12,7 @@ from datetime import date
 import numpy as np
 import polars as pl
 
-# Three returnflag values × two linestatus values = 6 possible
+# Three returnflag values x two linestatus values = 6 possible
 # (returnflag, linestatus) combinations, of which TPC-H reports four
 # rows in the canonical Q1 result (R/O is empty after the date filter).
 _RETURN_FLAGS = ["A", "N", "R"]

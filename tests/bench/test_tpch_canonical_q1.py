@@ -11,10 +11,10 @@ from __future__ import annotations
 from datetime import date
 
 import polars as pl
-import polars_metal
 import pytest
 from polars.testing import assert_frame_equal
 
+import polars_metal
 from tests.bench._canonical_q1_fixture import make_canonical_q1_fixture
 
 _THRESHOLD = date(1998, 9, 2)
@@ -28,9 +28,7 @@ def _query(df: pl.DataFrame, engine):
         .agg(
             pl.col("l_quantity").sum().alias("sum_qty"),
             pl.col("l_extendedprice").sum().alias("sum_base_price"),
-            (pl.col("l_extendedprice") * (1 - pl.col("l_discount")))
-            .sum()
-            .alias("sum_disc_price"),
+            (pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).sum().alias("sum_disc_price"),
             (pl.col("l_extendedprice") * (1 - pl.col("l_discount")) * (1 + pl.col("l_tax")))
             .sum()
             .alias("sum_charge"),

@@ -64,6 +64,8 @@ def build_udf(plan: dict) -> Any:
     """
     if plan["kind"] == "GroupBy":
         return _build_groupby(plan)
+    if plan["kind"] == "Sort":
+        return _build_sort(plan)
     df_pydf, wire_plan = _extract_scan_df_and_wire_plan(plan)
 
     def udf(
@@ -186,6 +188,41 @@ def _dispatch_filter(df_pydf: Any, filter_plan: dict) -> pl.DataFrame:
     return pl.DataFrame(series_list)
 
 
+def _build_sort(plan: dict) -> Any:
+    """Return a UDF for a Sort plan; runs inner pipeline then sorts result."""
+    inner_plan = plan["input"]
+    by_columns: list[str] = list(plan.get("by_columns", []))
+    descending: list[bool] = list(plan.get("descending", [False] * len(by_columns)))
+    nulls_last: list[bool] = list(plan.get("nulls_last", [False] * len(by_columns)))
+
+    if inner_plan["kind"] == "GroupBy":
+        inner_udf = _build_groupby(inner_plan)
+    else:
+        inner_udf = build_udf(inner_plan)
+
+    def udf(
+        with_columns: list[str] | None,
+        predicate: Any,
+        n_rows: int | None,
+        should_time: bool,
+    ) -> Any:
+        inner_result = inner_udf(None, None, None, False)
+        df = inner_result if isinstance(inner_result, pl.DataFrame) else inner_result[0]
+        if by_columns:
+            df = df.sort(
+                by_columns,
+                descending=descending if any(descending) else False,
+                nulls_last=nulls_last if any(nulls_last) else False,
+            )
+        if n_rows is not None:
+            df = df.slice(0, n_rows)
+        if should_time:
+            return df, []
+        return df
+
+    return udf
+
+
 def _build_groupby(plan: dict) -> Any:
     """Return a UDF callable for a GroupBy plan.
 
@@ -233,6 +270,14 @@ def _dispatch_groupby(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
     upstream_plan = wire_plan["input"]
     if upstream_plan["kind"] == "Scan":
         upstream = pl.DataFrame._from_pydf(df_pydf)
+    elif upstream_plan["kind"] == "Filter":
+        upstream = _dispatch_filter(df_pydf, upstream_plan)
+    elif (
+        upstream_plan["kind"] == "Project"
+        and upstream_plan.get("input", {}).get("kind") == "Filter"
+    ):
+        filtered = _dispatch_filter(df_pydf, upstream_plan["input"])
+        upstream = pl.DataFrame._from_pydf(filtered._df.select(list(upstream_plan["columns"])))
     else:
         upstream_pydf = _native.execute_plan(df_pydf, upstream_plan)
         upstream = pl.DataFrame._from_pydf(upstream_pydf)
@@ -309,40 +354,32 @@ def _dispatch_groupby(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
     # Call Rust.
     out_columns = _native.execute_groupby(groupby_plan, n_rows, columns_in)
 
-    # Reassemble. out_columns is a list of (name, dtype_tag, data, valid).
-    # All output columns share the same n_out (number of groups); we determine
-    # it from the first non-Bool column or from the valid bitmap length for
-    # Bool columns.
-    series_list: list[pl.Series] = []
+    # Reassemble. Two-pass: first find n_out from a non-Bool column (Bool's
+    # bit-packed valid-bitmap length over-counts due to 4-byte alignment
+    # padding); then assemble all columns with the established n_out.
     n_out: int | None = None
-
-    for col_entry in out_columns:
-        name, dtype_tag, data, valid = col_entry
-        # Determine the row count from this column.
+    for name, dtype_tag, data, _valid in out_columns:
         if dtype_tag in ("U32", "I32", "F32"):
-            n_this = len(data) // 4
-        elif dtype_tag in ("I64", "F64"):
-            n_this = len(data) // 8
-        elif dtype_tag == "Bool":
-            # Bool data is bit-packed; use n_out from a previous column if
-            # available, otherwise estimate from valid-bitmap byte count
-            # (conservative upper bound, refined once we see a non-Bool col).
-            n_this = n_out if n_out is not None else len(valid) * 8
-        elif dtype_tag == "Utf8":
-            # Wire format header carries n_rows in the first 4 bytes.
+            n_out = len(data) // 4
+            break
+        if dtype_tag in ("I64", "F64"):
+            n_out = len(data) // 8
+            break
+        if dtype_tag == "Utf8":
             if len(data) < 4:
                 raise RuntimeError(
                     f"polars_metal: Utf8 column {name!r} wire payload "
                     f"too short ({len(data)} B; need >= 4 for header)"
                 )
-            n_this = int.from_bytes(data[:4], "little")
-        else:
-            raise RuntimeError(f"polars_metal: unexpected dtype_tag {dtype_tag!r}")
+            n_out = int.from_bytes(data[:4], "little")
+            break
+    if n_out is None:
+        n_out = len(out_columns[0][3]) * 8 if out_columns else 0
 
-        if n_out is None:
-            n_out = n_this
-
-        series_list.append(_assemble_series(name, dtype_tag, data, valid, n_out))
+    series_list: list[pl.Series] = [
+        _assemble_series(name, dtype_tag, data, valid, n_out)
+        for name, dtype_tag, data, valid in out_columns
+    ]
 
     if not series_list:
         return pl.DataFrame()

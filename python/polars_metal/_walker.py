@@ -123,6 +123,8 @@ def _walk_at_current(nt: Any) -> WalkResult:
         return _walk_filter(nt, node)
     if cls == "GroupBy":
         return _walk_group_by(nt, node)
+    if cls == "Sort":
+        return _walk_sort(nt, node)
     return FallBack(reason=f"unsupported IR node: {cls}")
 
 
@@ -271,6 +273,62 @@ def _walk_select(nt: Any, node: Any) -> WalkResult:
         return inner
 
     return Handled(plan={"kind": "Project", "input": inner.plan, "columns": columns})
+
+
+def _walk_sort(nt: Any, node: Any) -> WalkResult:
+    """Lower a Sort node iff every `by_column` is a bare Column reference
+    and no slice is set. The Sort runs CPU via Polars in the UDF;
+    lifting it lets the walker include this node in the lifted subtree
+    so the inner GroupBy/Filter can route to Metal.
+    """
+    by_column = getattr(node, "by_column", None)
+    if by_column is None:
+        return FallBack(reason="Sort node missing .by_column")
+    if getattr(node, "slice", None) is not None:
+        return FallBack(reason="Sort with slice not supported")
+    sort_options = getattr(node, "sort_options", None)
+    if sort_options is None:
+        return FallBack(reason="Sort missing .sort_options")
+    try:
+        _multithreaded, descending, nulls_last = sort_options
+    except (TypeError, ValueError):
+        return FallBack(reason="Sort .sort_options has unexpected shape")
+
+    by_columns: list[str] = []
+    for expr in by_column:
+        node_id = getattr(expr, "node", None)
+        if node_id is None:
+            return FallBack(reason="Sort by_column expression has no .node id")
+        try:
+            inner_expr = nt.view_expression(node_id)
+        except Exception as ex:
+            return FallBack(reason=f"could not view sort expression: {ex!r}")
+        if type(inner_expr).__name__ != "Column":
+            return FallBack(
+                reason=f"Sort by complex expression {type(inner_expr).__name__} not supported"
+            )
+        col_name = getattr(inner_expr, "name", None)
+        if col_name is None:
+            return FallBack(reason="Sort Column missing .name")
+        by_columns.append(str(col_name))
+
+    inputs = nt.get_inputs()
+    if len(inputs) != 1:
+        return FallBack(reason=f"Sort expected 1 input, got {len(inputs)}")
+    nt.set_node(inputs[0])
+    inner = _walk_at_current(nt)
+    if isinstance(inner, FallBack):
+        return inner
+
+    return Handled(
+        plan={
+            "kind": "Sort",
+            "input": inner.plan,
+            "by_columns": by_columns,
+            "descending": list(descending),
+            "nulls_last": list(nulls_last),
+        }
+    )
 
 
 def _walk_filter(nt: Any, node: Any) -> WalkResult:
