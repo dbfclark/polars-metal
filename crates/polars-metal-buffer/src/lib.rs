@@ -9,6 +9,7 @@
 mod alignment;
 mod bridge;
 mod device;
+pub mod dict;
 mod error;
 mod null_bitmap;
 
