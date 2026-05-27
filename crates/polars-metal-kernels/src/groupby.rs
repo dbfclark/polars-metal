@@ -1204,38 +1204,39 @@ pub fn aggregate_sum_f64_cpu(
     n_groups: usize,
 ) -> Vec<f64> {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    let slots: Vec<AtomicU64> = (0..n_groups).map(|_| AtomicU64::new(0)).collect();
+    // Thread-local accumulators + reduce: each rayon work-unit sums into
+    // its own [n_groups]-sized array, then we sum across chunks. Avoids
+    // the per-row atomic-CAS contention that dominated the previous
+    // par_iter design at low cardinality (4 groups × 9.5M rows → 9.5M
+    // CAS retries serialized on 4 slots → 3.4s; this pattern: ~2ms).
     let n = values.len().min(row_to_group.len());
-    values[..n].par_iter().enumerate().for_each(|(i, &v)| {
-        let byte = valid.get(i >> 3).copied().unwrap_or(0);
-        if (byte >> (i & 7)) & 1 == 0 {
-            return;
-        }
-        let g = row_to_group[i] as usize;
-        if g >= n_groups {
-            return;
-        }
-        let mut old_bits = slots[g].load(Ordering::Relaxed);
-        loop {
-            let cur = f64::from_bits(old_bits);
-            let next_bits = (cur + v).to_bits();
-            match slots[g].compare_exchange_weak(
-                old_bits,
-                next_bits,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(latest) => old_bits = latest,
-            }
-        }
-    });
-    slots
-        .into_iter()
-        .map(|a| f64::from_bits(a.into_inner()))
-        .collect()
+
+    (0..n)
+        .into_par_iter()
+        .fold(
+            || vec![0.0f64; n_groups],
+            |mut local, i| {
+                let byte = valid.get(i >> 3).copied().unwrap_or(0);
+                if (byte >> (i & 7)) & 1 == 0 {
+                    return local;
+                }
+                let g = row_to_group[i] as usize;
+                if g < n_groups {
+                    local[g] += values[i];
+                }
+                local
+            },
+        )
+        .reduce(
+            || vec![0.0f64; n_groups],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x += *y;
+                }
+                a
+            },
+        )
 }
 
 /// Sum i64 values by group. Null rows skipped. All-null group → 0.
@@ -1246,22 +1247,36 @@ pub fn aggregate_sum_i64_cpu(
     n_groups: usize,
 ) -> Vec<i64> {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicI64, Ordering};
 
-    let slots: Vec<AtomicI64> = (0..n_groups).map(|_| AtomicI64::new(0)).collect();
+    // Thread-local accumulators + reduce. See `aggregate_sum_f64_cpu`
+    // for the perf rationale; ~10× speedup at low cardinality vs the
+    // atomic-fetch_add design.
     let n = values.len().min(row_to_group.len());
-    values[..n].par_iter().enumerate().for_each(|(i, &v)| {
-        let byte = valid.get(i >> 3).copied().unwrap_or(0);
-        if (byte >> (i & 7)) & 1 == 0 {
-            return;
-        }
-        let g = row_to_group[i] as usize;
-        if g >= n_groups {
-            return;
-        }
-        slots[g].fetch_add(v, Ordering::Relaxed);
-    });
-    slots.into_iter().map(|a| a.into_inner()).collect()
+    (0..n)
+        .into_par_iter()
+        .fold(
+            || vec![0i64; n_groups],
+            |mut local, i| {
+                let byte = valid.get(i >> 3).copied().unwrap_or(0);
+                if (byte >> (i & 7)) & 1 == 0 {
+                    return local;
+                }
+                let g = row_to_group[i] as usize;
+                if g < n_groups {
+                    local[g] = local[g].wrapping_add(values[i]);
+                }
+                local
+            },
+        )
+        .reduce(
+            || vec![0i64; n_groups],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x = x.wrapping_add(*y);
+                }
+                a
+            },
+        )
 }
 
 /// Min i64 values by group. Null rows skipped.
@@ -1273,32 +1288,45 @@ pub fn aggregate_min_i64_cpu(
     n_groups: usize,
 ) -> (Vec<i64>, Vec<bool>) {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
-    let slots: Vec<AtomicI64> = (0..n_groups).map(|_| AtomicI64::new(i64::MAX)).collect();
-    let has_value: Vec<AtomicBool> = (0..n_groups).map(|_| AtomicBool::new(false)).collect();
     let n = values.len().min(row_to_group.len());
-    values[..n].par_iter().enumerate().for_each(|(i, &v)| {
-        let byte = valid.get(i >> 3).copied().unwrap_or(0);
-        if (byte >> (i & 7)) & 1 == 0 {
-            return;
-        }
-        let g = row_to_group[i] as usize;
-        if g >= n_groups {
-            return;
-        }
-        has_value[g].store(true, Ordering::Relaxed);
-        let mut old = slots[g].load(Ordering::Relaxed);
-        while v < old {
-            match slots[g].compare_exchange_weak(old, v, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => break,
-                Err(cur) => old = cur,
-            }
-        }
-    });
-    let vals: Vec<i64> = slots.into_iter().map(|a| a.into_inner()).collect();
-    let valid_out: Vec<bool> = has_value.into_iter().map(|a| a.into_inner()).collect();
-    (vals, valid_out)
+    let (vals, has_value) = (0..n)
+        .into_par_iter()
+        .fold(
+            || (vec![i64::MAX; n_groups], vec![false; n_groups]),
+            |(mut vals, mut has), i| {
+                let byte = valid.get(i >> 3).copied().unwrap_or(0);
+                if (byte >> (i & 7)) & 1 == 0 {
+                    return (vals, has);
+                }
+                let g = row_to_group[i] as usize;
+                if g < n_groups {
+                    let v = values[i];
+                    if v < vals[g] {
+                        vals[g] = v;
+                    }
+                    has[g] = true;
+                }
+                (vals, has)
+            },
+        )
+        .reduce(
+            || (vec![i64::MAX; n_groups], vec![false; n_groups]),
+            |(mut va, mut ha), (vb, hb)| {
+                for ((a, &b), (ah, &bh)) in va
+                    .iter_mut()
+                    .zip(vb.iter())
+                    .zip(ha.iter_mut().zip(hb.iter()))
+                {
+                    if b < *a {
+                        *a = b;
+                    }
+                    *ah |= bh;
+                }
+                (va, ha)
+            },
+        );
+    (vals, has_value)
 }
 
 /// Max i64 values by group. Null rows skipped.
@@ -1310,32 +1338,44 @@ pub fn aggregate_max_i64_cpu(
     n_groups: usize,
 ) -> (Vec<i64>, Vec<bool>) {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
-    let slots: Vec<AtomicI64> = (0..n_groups).map(|_| AtomicI64::new(i64::MIN)).collect();
-    let has_value: Vec<AtomicBool> = (0..n_groups).map(|_| AtomicBool::new(false)).collect();
     let n = values.len().min(row_to_group.len());
-    values[..n].par_iter().enumerate().for_each(|(i, &v)| {
-        let byte = valid.get(i >> 3).copied().unwrap_or(0);
-        if (byte >> (i & 7)) & 1 == 0 {
-            return;
-        }
-        let g = row_to_group[i] as usize;
-        if g >= n_groups {
-            return;
-        }
-        has_value[g].store(true, Ordering::Relaxed);
-        let mut old = slots[g].load(Ordering::Relaxed);
-        while v > old {
-            match slots[g].compare_exchange_weak(old, v, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => break,
-                Err(cur) => old = cur,
-            }
-        }
-    });
-    let vals: Vec<i64> = slots.into_iter().map(|a| a.into_inner()).collect();
-    let valid_out: Vec<bool> = has_value.into_iter().map(|a| a.into_inner()).collect();
-    (vals, valid_out)
+    (0..n)
+        .into_par_iter()
+        .fold(
+            || (vec![i64::MIN; n_groups], vec![false; n_groups]),
+            |(mut vals, mut has), i| {
+                let byte = valid.get(i >> 3).copied().unwrap_or(0);
+                if (byte >> (i & 7)) & 1 == 0 {
+                    return (vals, has);
+                }
+                let g = row_to_group[i] as usize;
+                if g < n_groups {
+                    let v = values[i];
+                    if v > vals[g] {
+                        vals[g] = v;
+                    }
+                    has[g] = true;
+                }
+                (vals, has)
+            },
+        )
+        .reduce(
+            || (vec![i64::MIN; n_groups], vec![false; n_groups]),
+            |(mut va, mut ha), (vb, hb)| {
+                for ((a, &b), (ah, &bh)) in va
+                    .iter_mut()
+                    .zip(vb.iter())
+                    .zip(ha.iter_mut().zip(hb.iter()))
+                {
+                    if b > *a {
+                        *a = b;
+                    }
+                    *ah |= bh;
+                }
+                (va, ha)
+            },
+        )
 }
 
 /// Min f64 values by group. Null rows skipped.
@@ -1349,58 +1389,49 @@ pub fn aggregate_min_f64_cpu(
     n_groups: usize,
 ) -> (Vec<f64>, Vec<bool>) {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    // Seeded with +INFINITY bit pattern so any real value wins.
-    let slots: Vec<AtomicU64> = (0..n_groups)
-        .map(|_| AtomicU64::new(f64::INFINITY.to_bits()))
-        .collect();
-    let has_value: Vec<AtomicBool> = (0..n_groups).map(|_| AtomicBool::new(false)).collect();
     let n = values.len().min(row_to_group.len());
-    values[..n].par_iter().enumerate().for_each(|(i, &v)| {
-        let byte = valid.get(i >> 3).copied().unwrap_or(0);
-        if (byte >> (i & 7)) & 1 == 0 {
-            return;
-        }
-        let g = row_to_group[i] as usize;
-        if g >= n_groups {
-            return;
-        }
-        has_value[g].store(true, Ordering::Relaxed);
-        // NaN poisons: if we see a NaN, force NaN into the slot permanently.
-        if v.is_nan() {
-            slots[g].store(v.to_bits(), Ordering::Relaxed);
-            return;
-        }
-        let mut old_bits = slots[g].load(Ordering::Relaxed);
-        loop {
-            let cur = f64::from_bits(old_bits);
-            // If the slot is already NaN (from a prior NaN row), leave it.
-            if cur.is_nan() {
-                break;
-            }
-            // v is non-NaN (checked above) and cur is non-NaN (checked here),
-            // so plain >= is safe and well-defined.
-            if v >= cur {
-                break;
-            }
-            match slots[g].compare_exchange_weak(
-                old_bits,
-                v.to_bits(),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(latest) => old_bits = latest,
-            }
-        }
-    });
-    let vals: Vec<f64> = slots
-        .into_iter()
-        .map(|a| f64::from_bits(a.into_inner()))
-        .collect();
-    let valid_out: Vec<bool> = has_value.into_iter().map(|a| a.into_inner()).collect();
-    (vals, valid_out)
+    (0..n)
+        .into_par_iter()
+        .fold(
+            || (vec![f64::INFINITY; n_groups], vec![false; n_groups]),
+            |(mut vals, mut has), i| {
+                let byte = valid.get(i >> 3).copied().unwrap_or(0);
+                if (byte >> (i & 7)) & 1 == 0 {
+                    return (vals, has);
+                }
+                let g = row_to_group[i] as usize;
+                if g < n_groups {
+                    let v = values[i];
+                    has[g] = true;
+                    // NaN poisons: once NaN, stay NaN.
+                    if v.is_nan() || vals[g].is_nan() {
+                        vals[g] = f64::NAN;
+                    } else if v < vals[g] {
+                        vals[g] = v;
+                    }
+                }
+                (vals, has)
+            },
+        )
+        .reduce(
+            || (vec![f64::INFINITY; n_groups], vec![false; n_groups]),
+            |(mut va, mut ha), (vb, hb)| {
+                for ((a, &b), (ah, &bh)) in va
+                    .iter_mut()
+                    .zip(vb.iter())
+                    .zip(ha.iter_mut().zip(hb.iter()))
+                {
+                    if a.is_nan() || b.is_nan() {
+                        *a = f64::NAN;
+                    } else if b < *a {
+                        *a = b;
+                    }
+                    *ah |= bh;
+                }
+                (va, ha)
+            },
+        )
 }
 
 /// Max f64 values by group. Null rows skipped.
@@ -1413,91 +1444,108 @@ pub fn aggregate_max_f64_cpu(
     n_groups: usize,
 ) -> (Vec<f64>, Vec<bool>) {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    // Seeded with -INFINITY bit pattern so any real value wins.
-    let slots: Vec<AtomicU64> = (0..n_groups)
-        .map(|_| AtomicU64::new(f64::NEG_INFINITY.to_bits()))
-        .collect();
-    let has_value: Vec<AtomicBool> = (0..n_groups).map(|_| AtomicBool::new(false)).collect();
     let n = values.len().min(row_to_group.len());
-    values[..n].par_iter().enumerate().for_each(|(i, &v)| {
-        let byte = valid.get(i >> 3).copied().unwrap_or(0);
-        if (byte >> (i & 7)) & 1 == 0 {
-            return;
-        }
-        let g = row_to_group[i] as usize;
-        if g >= n_groups {
-            return;
-        }
-        has_value[g].store(true, Ordering::Relaxed);
-        if v.is_nan() {
-            slots[g].store(v.to_bits(), Ordering::Relaxed);
-            return;
-        }
-        let mut old_bits = slots[g].load(Ordering::Relaxed);
-        loop {
-            let cur = f64::from_bits(old_bits);
-            if cur.is_nan() {
-                break;
-            }
-            // v is non-NaN (checked above) and cur is non-NaN (checked here).
-            if v <= cur {
-                break;
-            }
-            match slots[g].compare_exchange_weak(
-                old_bits,
-                v.to_bits(),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(latest) => old_bits = latest,
-            }
-        }
-    });
-    let vals: Vec<f64> = slots
-        .into_iter()
-        .map(|a| f64::from_bits(a.into_inner()))
-        .collect();
-    let valid_out: Vec<bool> = has_value.into_iter().map(|a| a.into_inner()).collect();
-    (vals, valid_out)
+    (0..n)
+        .into_par_iter()
+        .fold(
+            || (vec![f64::NEG_INFINITY; n_groups], vec![false; n_groups]),
+            |(mut vals, mut has), i| {
+                let byte = valid.get(i >> 3).copied().unwrap_or(0);
+                if (byte >> (i & 7)) & 1 == 0 {
+                    return (vals, has);
+                }
+                let g = row_to_group[i] as usize;
+                if g < n_groups {
+                    let v = values[i];
+                    has[g] = true;
+                    if v.is_nan() || vals[g].is_nan() {
+                        vals[g] = f64::NAN;
+                    } else if v > vals[g] {
+                        vals[g] = v;
+                    }
+                }
+                (vals, has)
+            },
+        )
+        .reduce(
+            || (vec![f64::NEG_INFINITY; n_groups], vec![false; n_groups]),
+            |(mut va, mut ha), (vb, hb)| {
+                for ((a, &b), (ah, &bh)) in va
+                    .iter_mut()
+                    .zip(vb.iter())
+                    .zip(ha.iter_mut().zip(hb.iter()))
+                {
+                    if a.is_nan() || b.is_nan() {
+                        *a = f64::NAN;
+                    } else if b > *a {
+                        *a = b;
+                    }
+                    *ah |= bh;
+                }
+                (va, ha)
+            },
+        )
 }
 
 /// Count of non-null rows per group (CPU path).
 pub fn aggregate_count_cpu(valid: &[u8], row_to_group: &[u32], n_groups: usize) -> Vec<u64> {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
+    // Thread-local accumulators + reduce; same rationale as aggregate_sum_*.
     let n = row_to_group.len();
-    let slots: Vec<AtomicU64> = (0..n_groups).map(|_| AtomicU64::new(0)).collect();
-    (0..n).into_par_iter().for_each(|i| {
-        let byte = valid.get(i >> 3).copied().unwrap_or(0);
-        if (byte >> (i & 7)) & 1 == 0 {
-            return;
-        }
-        let g = row_to_group[i] as usize;
-        if g >= n_groups {
-            return;
-        }
-        slots[g].fetch_add(1, Ordering::Relaxed);
-    });
-    slots.into_iter().map(|a| a.into_inner()).collect()
+    (0..n)
+        .into_par_iter()
+        .fold(
+            || vec![0u64; n_groups],
+            |mut local, i| {
+                let byte = valid.get(i >> 3).copied().unwrap_or(0);
+                if (byte >> (i & 7)) & 1 == 0 {
+                    return local;
+                }
+                let g = row_to_group[i] as usize;
+                if g < n_groups {
+                    local[g] += 1;
+                }
+                local
+            },
+        )
+        .reduce(
+            || vec![0u64; n_groups],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x += *y;
+                }
+                a
+            },
+        )
 }
 
 /// Total row count per group, ignoring validity (CPU path).
 pub fn aggregate_len_cpu(row_to_group: &[u32], n_groups: usize) -> Vec<u64> {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    let slots: Vec<AtomicU64> = (0..n_groups).map(|_| AtomicU64::new(0)).collect();
-    row_to_group.par_iter().for_each(|&g| {
-        let g = g as usize;
-        if g < n_groups {
-            slots[g].fetch_add(1, Ordering::Relaxed);
-        }
-    });
-    slots.into_iter().map(|a| a.into_inner()).collect()
+    row_to_group
+        .par_iter()
+        .fold(
+            || vec![0u64; n_groups],
+            |mut local, &g| {
+                let g = g as usize;
+                if g < n_groups {
+                    local[g] += 1;
+                }
+                local
+            },
+        )
+        .reduce(
+            || vec![0u64; n_groups],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x += *y;
+                }
+                a
+            },
+        )
 }
 
 // -----------------------------------------------------------------------
