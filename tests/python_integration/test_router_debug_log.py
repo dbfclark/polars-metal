@@ -44,12 +44,14 @@ def test_filter_query_logs_cpu_leave_for_all_nodes(caplog) -> None:
     assert decisions["Scan#0"] == "cpu_leave"
 
 
-def test_sort_query_logs_fallback_for_unrecognized_node(caplog) -> None:
+def test_sort_query_inherits_child_decision(caplog) -> None:
+    """Phase 10 made Sort a CPU-passthrough wrapper in the walker. Its
+    router decision inherits from the inner subtree: a small Sort-over-
+    Scan still routes to CPU (Scan defaults CpuLeave below the groupby
+    threshold), but the walker no longer falls back at this node."""
     caplog.set_level(logging.DEBUG, logger="polars_metal")
     df = pl.DataFrame({"a": [3, 1, 2]})
     df.lazy().sort("a").collect(engine=polars_metal.MetalEngine(debug=True))
-    # The walker itself emits FallBack on Sort (it's not in the walker's
-    # accepted set yet); the router is never called. Confirm the walker
-    # log says so.
-    log_text = " ".join(r.getMessage() for r in caplog.records if r.name == "polars_metal")
-    assert "walker fallback" in log_text
+    decisions = _decisions_from_logs(caplog)
+    assert "Sort#1" in decisions, f"expected Sort entry; got {decisions}"
+    assert decisions["Sort#1"] == "cpu_leave"
