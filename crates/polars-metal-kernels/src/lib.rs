@@ -11,6 +11,7 @@ pub mod filter;
 pub mod groupby;
 pub mod groupby_build_partitioned;
 pub mod groupby_build_sort;
+pub mod groupby_global_hash;
 pub mod logical;
 pub mod pipeline;
 pub mod shader_lib;

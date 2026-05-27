@@ -317,3 +317,57 @@ kernels" — it's:**
 Recorded as an explicit M3 design input. The empirical evidence is in
 `tests/bench/baseline.json` (entries `tpch_q1_modified`,
 `tpch_q1_modified_32bit`, `tpch_q1_modified_32bit_high_card`).
+
+### M3 Phase 5b spike — Single-pass global-atomic GPU hash table doesn't work on Apple Silicon yet (M3, 2026-05-26)
+
+After Phase 4 (A1 partitioned-hash) and Phase 5 (A2 sort-then-segment)
+shipped, profiling showed A2 is strictly worse than CPU at every tested
+cardinality (10M × 65K: A2 2.09s vs CPU 211ms). The Phase 5b spike asked
+whether a single-pass global-atomic GPU hash table — different algorithm
+from A1's partitioned design — might fill the gap.
+
+**Result: the spike's negative finding.** The kernel
+(`shaders/groupby_global_hash.metal`) and dispatch
+(`crates/polars-metal-kernels/src/groupby_global_hash/`) compile and run
+on Apple Silicon, **don't deadlock** (Phase 4's spin-wait risk was
+mitigated by the global hash spreading collisions across the entire
+table rather than a small TGSM), but **produce wrong results**: the test
+`ten_thousand_unique_keys_in_hundred_thousand_rows` observed 20,697
+groups for 10,000 unique keys (~2× inflation).
+
+**Root cause:** the MSL toolchain (32023.883) only accepts
+`memory_order_relaxed` on atomic ops; `acquire`/`release`/`acq_rel` are
+rejected at compile time. The kernel needs to write the non-atomic
+`slot_key` between CAS-claim and state-publish, but without acquire/
+release the slot_key write isn't reliably visible to peer threads when
+they observe the state publish — peers read stale zeros, fail the key
+match, and probe to the next slot, where they also write their key. Same
+key ends up in multiple slots, inflating the group count.
+
+**Mitigations tried (none work on this toolchain):**
+- `acquire` / `release` orderings on individual ops → MSL compile error
+- `__atomic_thread_fence` exists but only accepts `memory_order_relaxed`
+- `threadgroup_barrier(mem_flags::mem_device)` requires non-divergent
+  control flow; our threads return at different points (no go)
+- 128-bit atomic key+gid pack → MSL has no `atomic_ulong2`
+- 64-bit hash summary in state → 32-bit collisions at high cardinality
+  (~100 false-positives per 1M keys) are unacceptable
+
+**Kept in tree as a documented experiment.** The kernel + smoke tests
+(`#[ignore]`'d so CI stays green) serve as the regression-detection
+signal: re-run with `--ignored` after any MSL toolchain bump. When Apple
+ships acquire/release, the failing test will start passing and A3 can
+be productionized.
+
+**Implications for M3:**
+- A1 (post-Phase 4.5 optimization) is the only viable GPU build path
+  shipping in M3. Phase 6 router uses A1 in its narrow win band
+  (≥ 1M rows, est_cardinality ≤ A1's overflow ceiling) and CPU
+  everywhere else.
+- A2 stays in tree but is not wired into the router.
+- The "different algorithm for high cardinality" question (>16K groups
+  where A1 overflows) is *unresolved* on this toolchain. The Phase 6
+  router falls back to CPU for that range.
+
+*Owner:* M4 (revisit when Apple ships better atomics) or earlier if a
+fundamentally different algorithm avoids the memory-ordering trap.
