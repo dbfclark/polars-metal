@@ -95,12 +95,32 @@ def test_groupby_multiple_aggs_emits_all() -> None:
     assert len_spec["output_alias"] == "rows"
 
 
-def test_groupby_string_key_falls_back() -> None:
+def test_groupby_string_key_lowers_to_utf8() -> None:
+    """M3 Phase 7 Task 34: pl.Utf8 keys now route through the dictionary
+    encoder instead of falling back. The walker emits the Utf8 tag on the
+    key entry; the Rust UDF parses the wire payload and builds a (dict,
+    codes) pair before dispatching the kernel."""
     df = pl.DataFrame({"k": ["a", "b", "a"], "v": [1, 2, 3]})
     plan, fallback = _capture_plan(df.lazy().group_by("k").agg(pl.col("v").sum()))
+    assert plan is not None
+    assert fallback is None
+    assert plan["kind"] == "GroupBy"
+    assert plan["keys"] == [["k", "Utf8"]]
+
+
+def test_groupby_string_agg_falls_back() -> None:
+    """min over a Utf8 column still falls back: Utf8 is a key-only dtype
+    (M3 Phase 7). The walker rejects so the whole query runs on CPU
+    rather than dispatching a non-existent string-min kernel.
+
+    Polars CPU does support ``pl.col(str).min()`` (lexicographic), so this
+    is a clean test of the walker rejecting the agg shape rather than
+    Polars rejecting the LazyFrame at construction.
+    """
+    df = pl.DataFrame({"k": [1, 1, 2], "s": ["a", "b", "c"]})
+    plan, fallback = _capture_plan(df.lazy().group_by("k").agg(pl.col("s").min()))
     assert plan is None
     assert fallback is not None
-    assert "String" in fallback or "unsupported dtype" in fallback
 
 
 def test_groupby_unsupported_agg_expression_falls_back() -> None:

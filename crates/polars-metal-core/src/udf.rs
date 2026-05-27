@@ -1967,7 +1967,18 @@ pub fn execute_groupby<'py>(
     //    We collect (data_bytes, valid_bytes) references before constructing
     //    KeyColumn structs so their lifetimes are tied to the PyBytes in
     //    `by_name`, which outlives the dispatch call.
+    //
+    //    Phase 7 Task 34: Utf8 keys need a server-side preprocessing pass.
+    //    The Python walker hands us a packed `[n_rows u32 le | offsets
+    //    (n+1)×i32 le | string bytes]` payload; we parse it into Option<&str>
+    //    rows, build (dict, codes) via `build_dict_nullable`, then transmute
+    //    the Vec<u32> codes to a Vec<u8> that the KeyColumn borrows. Both
+    //    the codes bytes AND the dict must outlive the KeyColumn, so we hold
+    //    them in `utf8_owned_data` here next to `key_byte_refs`.
     let mut key_byte_refs: Vec<(&[u8], &[u8])> = Vec::with_capacity(parsed.keys.len());
+    // Index `parsed.keys` → (codes_bytes, dict). None for non-Utf8 keys.
+    let mut utf8_owned_data: Vec<Option<(Vec<u8>, Vec<String>)>> =
+        Vec::with_capacity(parsed.keys.len());
     for k in &parsed.keys {
         let (_, data_py, valid_py) = by_name.get(&k.name).ok_or_else(|| {
             PyKeyError::new_err(format!(
@@ -1975,22 +1986,149 @@ pub fn execute_groupby<'py>(
                 k.name
             ))
         })?;
-        key_byte_refs.push((data_py.as_bytes(), valid_py.as_bytes()));
+        let data_bytes: &[u8] = data_py.as_bytes();
+        let valid_bytes: &[u8] = valid_py.as_bytes();
+
+        if k.dtype == MetalDtype::Utf8 {
+            // Parse the packed wire payload.
+            if data_bytes.len() < 4 {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Utf8 column {:?} wire payload too short ({} B; \
+                     need >= 4 for header)",
+                    k.name,
+                    data_bytes.len()
+                )));
+            }
+            let header_n =
+                u32::from_le_bytes([data_bytes[0], data_bytes[1], data_bytes[2], data_bytes[3]])
+                    as usize;
+            if header_n != n_rows {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Utf8 column {:?} wire n_rows={header_n} \
+                     disagrees with column n_rows={n_rows}",
+                    k.name
+                )));
+            }
+            let offsets_start = 4usize;
+            let offsets_end = offsets_start + (n_rows + 1) * 4;
+            if data_bytes.len() < offsets_end {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Utf8 column {:?} wire payload truncated in offsets \
+                     ({} B; need >= {})",
+                    k.name,
+                    data_bytes.len(),
+                    offsets_end
+                )));
+            }
+            let mut offsets: Vec<i32> = Vec::with_capacity(n_rows + 1);
+            for i in 0..=n_rows {
+                let off = offsets_start + i * 4;
+                offsets.push(i32::from_le_bytes([
+                    data_bytes[off],
+                    data_bytes[off + 1],
+                    data_bytes[off + 2],
+                    data_bytes[off + 3],
+                ]));
+            }
+            let string_bytes = &data_bytes[offsets_end..];
+
+            // Minimum validity bitmap length.
+            let min_valid = (n_rows + 7) / 8;
+            if valid_bytes.len() < min_valid {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Utf8 column {:?} validity buffer is {} B, \
+                     need at least {} B for {} rows",
+                    k.name,
+                    valid_bytes.len(),
+                    min_valid,
+                    n_rows
+                )));
+            }
+
+            // Build Option<&str> per row, honoring validity. Null rows get
+            // `None` and skip the offset slice entirely (Arrow's null row
+            // typically has offset[i] == offset[i+1], but we don't depend on
+            // that — we simply ignore offsets for null rows).
+            let mut strings_opt: Vec<Option<&str>> = Vec::with_capacity(n_rows);
+            for r in 0..n_rows {
+                let bit_set = (valid_bytes[r >> 3] >> (r & 7)) & 1 == 1;
+                if !bit_set {
+                    strings_opt.push(None);
+                    continue;
+                }
+                let s_off = offsets[r];
+                let e_off = offsets[r + 1];
+                if s_off < 0 || e_off < s_off {
+                    return Err(PyValueError::new_err(format!(
+                        "polars_metal: Utf8 column {:?} row {r} has invalid offsets \
+                         start={s_off} end={e_off}",
+                        k.name
+                    )));
+                }
+                let s_idx = s_off as usize;
+                let e_idx = e_off as usize;
+                if e_idx > string_bytes.len() {
+                    return Err(PyValueError::new_err(format!(
+                        "polars_metal: Utf8 column {:?} row {r} end offset {e_idx} \
+                         exceeds string buffer length {}",
+                        k.name,
+                        string_bytes.len()
+                    )));
+                }
+                let slice = &string_bytes[s_idx..e_idx];
+                let s = std::str::from_utf8(slice).map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "polars_metal: Utf8 column {:?} row {r} is not valid UTF-8: {e}",
+                        k.name
+                    ))
+                })?;
+                strings_opt.push(Some(s));
+            }
+
+            let (dict, codes, _valid_again) =
+                polars_metal_buffer::dict::build_dict_nullable(&strings_opt);
+
+            // Transmute Vec<u32> codes → Vec<u8> bytes for the wire format
+            // that `encode_keys` expects. We can't use a from_raw_parts
+            // reinterpret here because the KeyColumn borrows the slice; the
+            // Vec<u32> itself must live in `utf8_owned_data` and we want a
+            // byte slice over it. Convert via to_le_bytes to keep little-
+            // endian semantics consistent across host endianness (M-series
+            // is little-endian, but be explicit).
+            let mut codes_bytes: Vec<u8> = Vec::with_capacity(codes.len() * 4);
+            for c in &codes {
+                codes_bytes.extend_from_slice(&c.to_le_bytes());
+            }
+
+            utf8_owned_data.push(Some((codes_bytes, dict)));
+            // Push placeholder byte-refs; we'll override in the second pass.
+            key_byte_refs.push((data_bytes, valid_bytes));
+        } else {
+            utf8_owned_data.push(None);
+            key_byte_refs.push((data_bytes, valid_bytes));
+        }
     }
     let key_cols: Vec<KeyColumn<'_>> = parsed
         .keys
         .iter()
         .zip(key_byte_refs.iter())
-        .map(|(k, (data, valid))| KeyColumn {
-            name: k.name.clone(),
-            dtype: metal_dtype_to_key_dtype(k.dtype),
-            data,
-            valid,
-            n_rows,
-            // Phase 7 Task 33: Utf8 keys carry a dict, plumbed in Task 34
-            // (walker emits Utf8 with dict). For all other dtypes (and
-            // until Task 34 lands), no dict.
-            dict: None,
+        .zip(utf8_owned_data.iter())
+        .map(|((k, (data, valid)), utf8_opt)| {
+            // For Utf8 keys we point `data` at the owned codes bytes and
+            // attach the dict. For all other dtypes we keep the original
+            // Python-side bytes and a None dict.
+            let (data_slice, dict): (&[u8], Option<Vec<String>>) = match utf8_opt {
+                Some((codes_bytes, dict)) => (codes_bytes.as_slice(), Some(dict.clone())),
+                None => (*data, None),
+            };
+            KeyColumn {
+                name: k.name.clone(),
+                dtype: metal_dtype_to_key_dtype(k.dtype),
+                data: data_slice,
+                valid,
+                n_rows,
+                dict,
+            }
         })
         .collect();
 

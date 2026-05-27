@@ -329,10 +329,20 @@ def _walk_filter(nt: Any, node: Any) -> WalkResult:
     # Walk the input subtree. We re-validate the *output* schema dtypes
     # for the surviving columns (the post-Filter schema is the same as
     # the input schema — Filter doesn't drop columns).
+    #
+    # Utf8 is a *key-only* dtype (M3 Phase 7 Task 34): the filter
+    # compaction kernels don't speak strings yet. Reject so Polars
+    # routes the entire filter through CPU rather than blowing up
+    # inside `compact_one_column`.
     out_schema = dict(nt.get_schema())
     for name, dtype in out_schema.items():
-        if _map_dtype(dtype) is None:
+        mapped = _map_dtype(dtype)
+        if mapped is None:
             return FallBack(reason=f"unsupported dtype {dtype!s} on column {name!r}")
+        if mapped == "Utf8":
+            return FallBack(
+                reason=f"Filter on frames containing Utf8 column {name!r} not yet supported"
+            )
 
     inputs = nt.get_inputs()
     if len(inputs) != 1:
@@ -398,7 +408,12 @@ def _walk_agg_expr_node(
         if col_name is None:
             return None
         # Validate the column exists in input schema (same check as Simple path).
-        if in_schema.get(str(col_name)) is None:
+        col_dtype = in_schema.get(str(col_name))
+        if col_dtype is None:
+            return None
+        # Utf8 is a key-only dtype; arithmetic agg expressions over strings
+        # have no kernel-side support.
+        if _map_dtype(col_dtype) == "Utf8":
             return None
         return {"kind": "Column", "name": str(col_name)}
 
@@ -617,7 +632,13 @@ def _walk_agg_expression(
     dtype = in_schema.get(str(col_name))
     if dtype is None:
         return None
-    if _map_dtype(dtype) is None:
+    mapped = _map_dtype(dtype)
+    if mapped is None:
+        return None
+    # Utf8 is a key-only dtype: sum/mean/min/max over strings have no
+    # kernel-side implementation. Reject so the whole GroupBy falls
+    # back rather than dispatching a broken kernel.
+    if mapped == "Utf8":
         return None
 
     return {
@@ -816,7 +837,10 @@ def _map_dtype(dt: Any) -> str | None:
 
     M2 set: Int64, Float64, Boolean, Int32, Float32.
     M3 adds: Int8, Int16, UInt8, UInt16, UInt32 (capability F).
-    Everything else (String, Categorical, List, Struct, etc.) is a fallback.
+    M3 Phase 7 (Task 34) adds: String (pl.Utf8) — dictionary-encoded as
+    a key column. py-1.40.1 reports ``str(pl.Utf8) == "String"``; older
+    Polars reported ``"Utf8"`` — accept both for forward/back compat.
+    Everything else (Categorical, List, Struct, etc.) is a fallback.
     """
     s = str(dt)
     if s == "Int64":
@@ -839,4 +863,6 @@ def _map_dtype(dt: Any) -> str | None:
         return "U16"
     if s == "UInt32":
         return "U32"
+    if s in ("String", "Utf8"):
+        return "Utf8"
     return None

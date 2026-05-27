@@ -328,6 +328,14 @@ def _dispatch_groupby(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
             # available, otherwise estimate from valid-bitmap byte count
             # (conservative upper bound, refined once we see a non-Bool col).
             n_this = n_out if n_out is not None else len(valid) * 8
+        elif dtype_tag == "Utf8":
+            # Wire format header carries n_rows in the first 4 bytes.
+            if len(data) < 4:
+                raise RuntimeError(
+                    f"polars_metal: Utf8 column {name!r} wire payload "
+                    f"too short ({len(data)} B; need >= 4 for header)"
+                )
+            n_this = int.from_bytes(data[:4], "little")
         else:
             raise RuntimeError(f"polars_metal: unexpected dtype_tag {dtype_tag!r}")
 
@@ -493,6 +501,10 @@ _DTYPE_TO_TAG: dict[str, str] = {
     "Boolean": "Bool",
     "Int32": "I32",
     "Float32": "F32",
+    # py-1.40.1 reports pl.Utf8 as "String"; older Polars reports "Utf8".
+    # The Rust-side `MetalDtype::from_wire` accepts the "Utf8" tag.
+    "String": "Utf8",
+    "Utf8": "Utf8",
 }
 
 _TAG_TO_PA: dict[str, pa.DataType] = {
@@ -502,6 +514,10 @@ _TAG_TO_PA: dict[str, pa.DataType] = {
     "U32": pa.uint32(),
     "I32": pa.int32(),
     "F32": pa.float32(),
+    # M3 Phase 7: dictionary-encoded Utf8 keys round-trip through pa.string()
+    # (i32 offsets). pl.Utf8 itself materializes as pa.large_string() in
+    # py-1.40.1 — we cast on the way in (see `_data_and_valid_for_dtype`).
+    "Utf8": pa.string(),
 }
 
 
@@ -554,7 +570,66 @@ def _data_and_valid_for_dtype(arr: pa.Array, n_rows: int, dtype_tag: str) -> tup
     For I64/F64 the data is dense (``n_rows * 8`` bytes); for Bool it is
     bit-packed (``ceil(n_rows / 8)`` bytes). Validity is always
     bit-packed and materialised to all-ones when Arrow elided it.
+
+    For Utf8 (M3 Phase 7), the data buffer is the packed wire format
+    ``[n_rows u32 le | offsets (n+1) x i32 le | concatenated bytes]``.
+    pl.Utf8 materializes as ``pa.large_string()`` (i64 offsets) in
+    py-1.40.1; we cast to ``pa.string()`` (i32 offsets) so the wire
+    format matches the Rust-side parser.
     """
+    if dtype_tag == "Utf8":
+        # Cast Polars' native large_string → string (i32 offsets) so the
+        # buffer layout matches the wire format the Rust side expects.
+        # pa.array.cast is a no-op when the type already matches; for
+        # large_string → string it materializes a fresh buffer set with
+        # i32 offsets in one pass (Arrow C++).
+        if arr.type != pa.string():
+            arr = arr.cast(pa.string())
+        bufs = arr.buffers()
+        valid_buf = bufs[0]
+        offsets_buf = bufs[1] if len(bufs) > 1 else None
+        data_buf = bufs[2] if len(bufs) > 2 else None
+        valid = bytes(valid_buf) if valid_buf is not None else _all_ones_bitmap(n_rows)
+        min_valid_bytes = (n_rows + 7) // 8
+        if len(valid) < min_valid_bytes:
+            valid = valid + b"\x00" * (min_valid_bytes - len(valid))
+
+        offsets_bytes = bytes(offsets_buf) if offsets_buf is not None else b""
+        data_bytes = bytes(data_buf) if data_buf is not None else b""
+        expected_offsets_len = (n_rows + 1) * 4
+        if len(offsets_bytes) < expected_offsets_len:
+            # Defensive: an empty array still has at least one offset (0).
+            offsets_bytes = offsets_bytes + b"\x00" * (expected_offsets_len - len(offsets_bytes))
+        else:
+            offsets_bytes = offsets_bytes[:expected_offsets_len]
+
+        # The data buffer is sized by offsets[n_rows]; trim safely.
+        if n_rows == 0:
+            total_data_len = 0
+        else:
+            total_data_len = int.from_bytes(
+                offsets_bytes[n_rows * 4 : (n_rows + 1) * 4],
+                "little",
+                signed=True,
+            )
+        if total_data_len < 0:
+            raise RuntimeError(
+                f"polars_metal: Utf8 column has negative final offset {total_data_len}"
+            )
+        if total_data_len > len(data_bytes):
+            # Pad up to the offset-promised length; should not occur with
+            # well-formed Arrow buffers but matches the I64/F64 defensive
+            # pattern.
+            data_bytes = data_bytes + b"\x00" * (total_data_len - len(data_bytes))
+        else:
+            data_bytes = data_bytes[:total_data_len]
+
+        out = bytearray()
+        out.extend(n_rows.to_bytes(4, "little"))
+        out.extend(offsets_bytes)
+        out.extend(data_bytes)
+        return bytes(out), valid
+
     bufs = arr.buffers()
     valid_buf = bufs[0]
     data_buf = bufs[1]
@@ -599,11 +674,52 @@ def _assemble_series(name: str, dtype_tag: str, data: bytes, valid: bytes, n_out
 
     For Bool: both ``data`` and ``valid`` are bit-packed; same trim.
 
+    For Utf8 (M3 Phase 7): ``data`` is the packed wire format
+    ``[n_rows u32 le | offsets (n+1) x i32 le | concatenated bytes]``;
+    we parse it back to three Arrow buffers for ``pa.string()``.
+
     The validity buffer is always present (the kernel writes one); if the
     column has no nulls we still hand a buffer to PyArrow rather than
     None — PyArrow accepts that and reports the correct null_count via
     ``null_count=-1`` (compute on demand).
     """
+    if dtype_tag == "Utf8":
+        # Wire: [n_rows u32 le | offsets (n+1) x i32 le | bytes].
+        if len(data) < 4:
+            raise RuntimeError(
+                f"polars_metal: Utf8 output column {name!r} wire payload "
+                f"too short ({len(data)} B; need >= 4 for header)"
+            )
+        n = int.from_bytes(data[:4], "little")
+        if n != n_out:
+            raise RuntimeError(
+                f"polars_metal: Utf8 output column {name!r} n_rows mismatch: header={n} out={n_out}"
+            )
+        offsets_end = 4 + (n + 1) * 4
+        if len(data) < offsets_end:
+            raise RuntimeError(
+                f"polars_metal: Utf8 output column {name!r} truncated in offsets "
+                f"({len(data)} B; need >= {offsets_end})"
+            )
+        offsets_bytes = data[4:offsets_end]
+        string_bytes = data[offsets_end:]
+        min_valid_bytes = (n_out + 7) // 8
+        valid_trim = valid[:min_valid_bytes] if min_valid_bytes > 0 else b""
+        if n_out == 0:
+            arr = pa.array([], type=pa.string())
+            return pl.Series(name, arr)
+        arr = pa.Array.from_buffers(
+            pa.string(),
+            n_out,
+            [
+                pa.py_buffer(valid_trim),
+                pa.py_buffer(offsets_bytes),
+                pa.py_buffer(string_bytes),
+            ],
+            null_count=-1,
+        )
+        return pl.Series(name, arr)
+
     pa_type = _TAG_TO_PA[dtype_tag]
     min_valid_bytes = (n_out + 7) // 8
     # The kernel pads valid (and bool data) to 4-byte alignment for the
