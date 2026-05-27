@@ -211,69 +211,80 @@ pub fn encode_keys(cols: &[KeyColumn<'_>]) -> Result<(Vec<u128>, KeySchema), Key
     }
     let total_bits = offset;
 
-    let mut encoded = vec![0u128; n_rows];
-    for (field_idx, c) in cols.iter().enumerate() {
-        let field = &fields[field_idx];
-        for (row, lane) in encoded.iter_mut().enumerate() {
-            let valid_byte = c.valid[row >> 3];
-            let valid_bit = (valid_byte >> (row & 7)) & 1;
-            if valid_bit == 0 {
-                *lane |= 1u128 << field.null_bit_offset;
-                continue;
+    // Parallelize over rows. Each row is independent (different lane);
+    // each column appends bits into its row's lane with disjoint bit
+    // ranges (null_bit_offset + data_bit_offset are per-field). We
+    // rayon-parallelize the row loop and let each thread compute its
+    // lane sequentially over all fields. ~6× speedup at 10M rows × 2
+    // keys vs the serial loop.
+    use rayon::prelude::*;
+    let encoded: Vec<u128> = (0..n_rows)
+        .into_par_iter()
+        .map(|row| {
+            let mut lane: u128 = 0;
+            for (field_idx, c) in cols.iter().enumerate() {
+                let field = &fields[field_idx];
+                let valid_byte = c.valid[row >> 3];
+                let valid_bit = (valid_byte >> (row & 7)) & 1;
+                if valid_bit == 0 {
+                    lane |= 1u128 << field.null_bit_offset;
+                    continue;
+                }
+                let data_value: u128 = match c.dtype {
+                    KeyDtype::I64 => {
+                        let mut bytes = [0u8; 8];
+                        bytes.copy_from_slice(&c.data[row * 8..(row + 1) * 8]);
+                        i64::from_le_bytes(bytes) as u64 as u128
+                    }
+                    KeyDtype::F64 => {
+                        let mut bytes = [0u8; 8];
+                        bytes.copy_from_slice(&c.data[row * 8..(row + 1) * 8]);
+                        f64::from_le_bytes(bytes).to_bits() as u128
+                    }
+                    KeyDtype::I32 => {
+                        let mut bytes = [0u8; 4];
+                        bytes.copy_from_slice(&c.data[row * 4..(row + 1) * 4]);
+                        i32::from_le_bytes(bytes) as u32 as u128
+                    }
+                    KeyDtype::F32 => {
+                        let mut bytes = [0u8; 4];
+                        bytes.copy_from_slice(&c.data[row * 4..(row + 1) * 4]);
+                        f32::from_le_bytes(bytes).to_bits() as u128
+                    }
+                    KeyDtype::U32 | KeyDtype::Utf8 => {
+                        let mut bytes = [0u8; 4];
+                        bytes.copy_from_slice(&c.data[row * 4..(row + 1) * 4]);
+                        u32::from_le_bytes(bytes) as u128
+                    }
+                    KeyDtype::I16 => {
+                        let mut bytes = [0u8; 2];
+                        bytes.copy_from_slice(&c.data[row * 2..(row + 1) * 2]);
+                        i16::from_le_bytes(bytes) as u16 as u128
+                    }
+                    KeyDtype::U16 => {
+                        let mut bytes = [0u8; 2];
+                        bytes.copy_from_slice(&c.data[row * 2..(row + 1) * 2]);
+                        u16::from_le_bytes(bytes) as u128
+                    }
+                    KeyDtype::I8 => {
+                        let byte = c.data[row];
+                        i8::from_le_bytes([byte]) as u8 as u128
+                    }
+                    KeyDtype::U8 => {
+                        let byte = c.data[row];
+                        u8::from_le_bytes([byte]) as u128
+                    }
+                    KeyDtype::Bool => {
+                        let byte = c.data[row >> 3];
+                        let bit = (byte >> (row & 7)) & 1;
+                        bit as u128
+                    }
+                };
+                lane |= data_value << field.data_bit_offset;
             }
-            let data_value: u128 = match c.dtype {
-                KeyDtype::I64 => {
-                    let mut bytes = [0u8; 8];
-                    bytes.copy_from_slice(&c.data[row * 8..(row + 1) * 8]);
-                    i64::from_le_bytes(bytes) as u64 as u128
-                }
-                KeyDtype::F64 => {
-                    let mut bytes = [0u8; 8];
-                    bytes.copy_from_slice(&c.data[row * 8..(row + 1) * 8]);
-                    f64::from_le_bytes(bytes).to_bits() as u128
-                }
-                KeyDtype::I32 => {
-                    let mut bytes = [0u8; 4];
-                    bytes.copy_from_slice(&c.data[row * 4..(row + 1) * 4]);
-                    i32::from_le_bytes(bytes) as u32 as u128
-                }
-                KeyDtype::F32 => {
-                    let mut bytes = [0u8; 4];
-                    bytes.copy_from_slice(&c.data[row * 4..(row + 1) * 4]);
-                    f32::from_le_bytes(bytes).to_bits() as u128
-                }
-                KeyDtype::U32 | KeyDtype::Utf8 => {
-                    let mut bytes = [0u8; 4];
-                    bytes.copy_from_slice(&c.data[row * 4..(row + 1) * 4]);
-                    u32::from_le_bytes(bytes) as u128
-                }
-                KeyDtype::I16 => {
-                    let mut bytes = [0u8; 2];
-                    bytes.copy_from_slice(&c.data[row * 2..(row + 1) * 2]);
-                    i16::from_le_bytes(bytes) as u16 as u128
-                }
-                KeyDtype::U16 => {
-                    let mut bytes = [0u8; 2];
-                    bytes.copy_from_slice(&c.data[row * 2..(row + 1) * 2]);
-                    u16::from_le_bytes(bytes) as u128
-                }
-                KeyDtype::I8 => {
-                    let byte = c.data[row];
-                    i8::from_le_bytes([byte]) as u8 as u128
-                }
-                KeyDtype::U8 => {
-                    let byte = c.data[row];
-                    u8::from_le_bytes([byte]) as u128
-                }
-                KeyDtype::Bool => {
-                    let byte = c.data[row >> 3];
-                    let bit = (byte >> (row & 7)) & 1;
-                    bit as u128
-                }
-            };
-            *lane |= data_value << field.data_bit_offset;
-        }
-    }
+            lane
+        })
+        .collect();
 
     Ok((
         encoded,
@@ -2002,9 +2013,12 @@ pub fn dispatch_groupby(
         });
     }
 
-    let mut hashes = vec![0u32; n_rows];
-    dispatch_hash(device, queue, &encoded, n_rows, &mut hashes)?;
-    let build = dispatch_build(device, queue, &encoded, &hashes, n_rows)?;
+    // The current build path (CPU HashMap + A1 GPU build) ignores
+    // precomputed hashes — they were a relic of the GPU global-CAS hash
+    // table M2 abandoned. Skip the dispatch_hash kernel entirely; an
+    // empty slice satisfies the `hashes` parameter for both build paths.
+    // (~23 ms saved at 10M rows.)
+    let build = dispatch_build(device, queue, &encoded, &[], n_rows)?;
     let n_groups = build.n_groups;
 
     let mut agg_outputs = Vec::with_capacity(agg_specs.len());

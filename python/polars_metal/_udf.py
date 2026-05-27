@@ -115,6 +115,56 @@ def _dispatch(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
     return pl.DataFrame._from_pydf(result_pydf)
 
 
+def _filter_via_polars(df_pydf: Any, filter_plan: dict) -> pl.DataFrame:
+    """Filter the upstream DataFrame via Polars CPU `filter`, using a
+    boolean Series built from the predicate AST.
+
+    The predicate evaluation reuses the Metal kernels in
+    `_evaluate_predicate` to produce a bit-packed `(data, valid)` pair,
+    then we wrap those bytes in a Polars Boolean Series via
+    `pa.Array.from_buffers` and let Polars handle the surviving-row
+    compaction. This bypasses `_native.execute_filter_compact`, which
+    runs one scatter kernel per surviving column — at ~30 ms/column it
+    dominated Q1's wall-clock once the walker engaged (Phase 10
+    diagnosis). Polars CPU filter is single-pass over all columns
+    (~25 ms regardless of n_cols at 10M rows).
+
+    Falls back to `_dispatch_filter` only if a predicate type isn't
+    supported by `_evaluate_predicate`; the walker rejects unsupported
+    predicates earlier, so this fallback is defensive.
+    """
+    upstream_plan = filter_plan["input"]
+    if upstream_plan["kind"] == "Scan":
+        upstream = pl.DataFrame._from_pydf(df_pydf)
+    else:
+        upstream_pydf = _native.execute_plan(df_pydf, upstream_plan)
+        upstream = pl.DataFrame._from_pydf(upstream_pydf)
+
+    n_rows = upstream.height
+    if n_rows == 0:
+        return upstream
+
+    try:
+        pred_data, pred_valid = _evaluate_predicate(upstream, filter_plan["predicate"], n_rows)
+    except Exception:
+        # Defensive: fall back to the GPU-compaction path if predicate eval fails.
+        return _dispatch_filter(df_pydf, filter_plan)
+
+    min_valid_bytes = (n_rows + 7) // 8
+    pred_data_trim = bytes(pred_data[:min_valid_bytes]) if min_valid_bytes > 0 else b""
+    pred_valid_trim = bytes(pred_valid[:min_valid_bytes]) if min_valid_bytes > 0 else b""
+    bool_arr = pa.Array.from_buffers(
+        pa.bool_(),
+        n_rows,
+        [pa.py_buffer(pred_valid_trim), pa.py_buffer(pred_data_trim)],
+        null_count=-1,
+    )
+    mask = pl.Series("__metal_filter_mask", bool_arr)
+    # Eager DataFrame.filter doesn't go through LazyFrame.collect, so the
+    # monkey-patched callback isn't re-entered here.
+    return upstream.filter(mask)
+
+
 def _dispatch_filter(df_pydf: Any, filter_plan: dict) -> pl.DataFrame:
     """Run the GPU compaction pipeline against ``df_pydf`` and return a
     Polars DataFrame containing the surviving rows of every input column.
@@ -265,18 +315,23 @@ def _dispatch_groupby(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
          a Polars DataFrame.
     """
     # The wire_plan root is a GroupBy node; the upstream data lives in its
-    # input subtree. We run the input subtree first to get the actual
-    # upstream DataFrame (which may involve scan/project/filter).
+    # input subtree. Resolve it. For the Filter case we explicitly bypass
+    # the GPU compaction path (which dispatches one scatter kernel per
+    # surviving column — ~30ms x n_cols at 10M rows, dominating Q1's
+    # engine-level wall-clock). Instead we compute the predicate via the
+    # existing Metal kernels, build a Polars Boolean Series from the
+    # bit-packed result, and let Polars' SIMD-tuned filter compact all
+    # columns in one pass (~20-25ms regardless of n_cols).
     upstream_plan = wire_plan["input"]
     if upstream_plan["kind"] == "Scan":
         upstream = pl.DataFrame._from_pydf(df_pydf)
     elif upstream_plan["kind"] == "Filter":
-        upstream = _dispatch_filter(df_pydf, upstream_plan)
+        upstream = _filter_via_polars(df_pydf, upstream_plan)
     elif (
         upstream_plan["kind"] == "Project"
         and upstream_plan.get("input", {}).get("kind") == "Filter"
     ):
-        filtered = _dispatch_filter(df_pydf, upstream_plan["input"])
+        filtered = _filter_via_polars(df_pydf, upstream_plan["input"])
         upstream = pl.DataFrame._from_pydf(filtered._df.select(list(upstream_plan["columns"])))
     else:
         upstream_pydf = _native.execute_plan(df_pydf, upstream_plan)

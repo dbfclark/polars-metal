@@ -31,13 +31,13 @@
       "ratio_metal_over_cpu": 5.27
     },
     "tpch_q1_modified": {
-      "cpu_ms": 38.15,
-      "metal_ms": 326.12,
-      "ratio_metal_over_cpu": 8.55,
+      "cpu_ms": 43.46,
+      "metal_ms": 123.14,
+      "ratio_metal_over_cpu": 2.83,
       "n_rows": 10000000,
       "hardware": "M2 Ultra",
-      "_notes": "Real Metal-vs-CPU measurement after Phase 10 (walker handles Sort + Filter→GroupBy dispatch fix + agg-kernel thread-local-reduce). i64 keys + f64 values + Simple Sum aggs → router picks PerAgg path. Per-agg flow is 8 separate kernel dispatches over 9.5M rows; each ~25-40ms. CPU's single-pass is highly optimized. The kernel-layer agg work is now fast (sum 2ms etc.); residual cost is encode_keys (~50ms), dispatch_build (~50ms), and 8 separate agg passes (~25ms each = ~200ms). Real M3 perf story: per-agg path for 64-bit types is the dominant remaining engine-level bottleneck. Fix is fused-agg-for-64-bit (M4) or reducing per-agg dispatch overhead. Measured 2026-05-27, 27/5 rounds.",
-      "_gate": {"ratio_lt": 10.0}
+      "_notes": "Real Metal-vs-CPU measurement after the Phase 10 diagnosis cascade: walker handles Sort + Filter→GroupBy dispatch fix + agg-kernel thread-local-reduce + dispatch_hash dead-call removal + parallel encode_keys + Polars-CPU filter bypass for the GroupBy(Filter(...)) shape. Down from 326ms (8.55x slower than CPU) to 123ms (2.83x slower). Remaining cost breakdown at 10M rows × 4 groups: A1 GPU build ~43ms (dominant), 8 agg dispatches ~22ms (fast now), encode_keys ~8ms (parallelized), Python↔Rust marshalling ~50ms. Closing the last 2x gap needs orchestrator-level work (fuse 64-bit per-agg into a single kernel, reduce FFI marshalling); diminishing returns from individual kernel tuning. Measured 2026-05-27, 18/5 rounds.",
+      "_gate": {"ratio_lt": 3.5}
     },
     "tpch_q1_modified_32bit": {
       "cpu_ms": 27.72,
