@@ -36,8 +36,8 @@
       "ratio_metal_over_cpu": 0.992,
       "n_rows": 10000000,
       "hardware": "M2 Ultra",
-      "_notes": "Boolean l_returnflag/l_linestatus (encoder 128-bit budget). Post-Phase 6: dispatch_build routes ≥500K rows through A1 (GPU partitioned-hash build). At 4 groups the build phase savings are small; tied with CPU at the engine level. Larger absolute speedup vs M2 baseline (309ms → 37ms) is from Phase 3 fused-agg kernel + warmup; A1 is harmless here, dominant at high cardinality. Measured 2026-05-26 (M2 Ultra), 27/13 rounds.",
-      "_gate": {"ratio_lt": 1.05}
+      "_notes": "⚠ CPU-vs-CPU measurement, not Metal. Investigation 2026-05-27 found the walker falls back at the Sort IR node for every Q1 query, so the Metal engine is a no-op for all `tpch_q1_*` benches. Both `engine='cpu'` and `engine=MetalEngine()` execute the identical CPU plan; the ~1% delta is noise. Real M3 Metal work is at the kernel layer (Phase 4.5: A1 30ms vs CPU 130ms at 10M × 1024 groups in microbench) but doesn't reach this engine-level query path until the walker handles Sort + Filter→GroupBy fusion (deferred to M4 — initial attempt caused a 600× regression).",
+      "_gate": {"ratio_lt": 1.10}
     },
     "tpch_q1_modified_32bit": {
       "cpu_ms": 27.01,
@@ -45,8 +45,8 @@
       "ratio_metal_over_cpu": 0.997,
       "n_rows": 10000000,
       "hardware": "M2 Ultra",
-      "_notes": "All-GPU 32-bit variant. Bool keys + i32/f32 values; fused agg path. Same story as tpch_q1_modified — A1 active above 500K rows but build phase is tiny at 4 groups, so tied with CPU at engine level. Measured 2026-05-26, 38/33 rounds.",
-      "_gate": {"ratio_lt": 1.05}
+      "_notes": "⚠ CPU-vs-CPU — same caveat as tpch_q1_modified. Walker fallback at Sort.",
+      "_gate": {"ratio_lt": 1.10}
     },
     "tpch_q1_modified_32bit_high_card": {
       "cpu_ms": 94.97,
@@ -55,8 +55,8 @@
       "n_rows": 10000000,
       "n_groups_approx": 1024,
       "hardware": "M2 Ultra",
-      "_notes": "Q1-shaped query grouped by l_part_class (~1024 distinct groups). Post-Phase 6: dispatch_build routes through A1 above 500K rows. **Metal 18% faster than CPU** — A1's build-phase savings (CPU HashMap ~127ms → A1 ~30ms at 10M × 1024 groups in microbench) are visible at the query level. This is the win the routing was designed for: high-cardinality groupby beats CPU. Measured 2026-05-26, 14/7 rounds.",
-      "_gate": {"ratio_lt": 1.0}
+      "_notes": "⚠ CPU-vs-CPU — Walker falls back at Sort. The 18% delta is likely noise from pytest-benchmark's variance at this measurement scale (CPU = 94.97 ± 23.22 IQR per the original bench output). Retracted as a Metal win.",
+      "_gate": {"ratio_lt": 1.10}
     },
     "tpch_q1_canonical": {
       "cpu_ms": 61.25,
@@ -65,8 +65,8 @@
       "n_rows": 10000000,
       "n_groups": 6,
       "hardware": "M2 Ultra",
-      "_notes": "TPC-H Q1's actual schema: Utf8 l_returnflag (3 vals) × l_linestatus (2 vals) = 6 unique key combos. Filter on Date l_shipdate <= 1998-09-02 cuts ~5%. Phase 7 (Utf8 dtype) unlocked this fixture; the engine now routes the groupby through fused-agg + A1, but at 6 unique groups the build phase is small and the bottleneck shifts to CPU-routed filter + sort. Ratio 1.005 (tied) — does NOT meet the plan's original 0.7 gate, but that gate was set without measuring what fraction of Q1 was actually filter+sort. The unmet gate is an *honest* measurement input for the M3 retrospective: Q1's intrinsic low cardinality means dispatch routing alone isn't enough; filter and/or sort must move to GPU (Phase 10) to push the ratio below 1. Measured 2026-05-27, 14/16 rounds.",
-      "_gate": {"ratio_lt": 1.05}
+      "_notes": "⚠ CPU-vs-CPU — walker falls back at Sort (Utf8 keys don't change that). Phase 7 (KeyDtype::Utf8) IS shipped and verified correct in-kernel + via test_string_groupby integration tests; this canonical-Q1 bench just doesn't exercise it because the Sort-at-root fallback prevents the engine from engaging. M4 work to handle Sort in the walker is the prerequisite for canonical Q1 becoming a real Metal-vs-CPU measurement.",
+      "_gate": {"ratio_lt": 1.10}
     }
   }
 }
