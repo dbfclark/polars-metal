@@ -368,6 +368,16 @@ std::shared_ptr<MlxArray> mlx_op_mean_axis(const std::shared_ptr<MlxArray>& a, i
     return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
 }
 
+// ── M4 Phase 1 Task 9: sort + argpartition ───────────────────────────────────
+
+MLX_WRAP_UNOP(mlx_op_sort, sort)
+
+std::shared_ptr<MlxArray> mlx_op_argpartition(
+    const std::shared_ptr<MlxArray>& a, int32_t kth) {
+    auto base = std::make_shared<mlx::core::array>(mlx::core::argpartition(*a, kth));
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
 #undef MLX_WRAP_BINOP
 #undef MLX_WRAP_UNOP
 

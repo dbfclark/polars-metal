@@ -201,4 +201,10 @@ std::shared_ptr<MlxArray> mlx_op_argmax_all(const std::shared_ptr<MlxArray>& a);
 std::shared_ptr<MlxArray> mlx_op_sum_axis(const std::shared_ptr<MlxArray>& a, int32_t axis);
 std::shared_ptr<MlxArray> mlx_op_mean_axis(const std::shared_ptr<MlxArray>& a, int32_t axis);
 
+// ── M4 Phase 1 Task 9: sort + argpartition ───────────────────────────────────
+
+std::shared_ptr<MlxArray> mlx_op_sort(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_argpartition(
+    const std::shared_ptr<MlxArray>& a, int32_t kth);
+
 }  // namespace polars_metal_mlx

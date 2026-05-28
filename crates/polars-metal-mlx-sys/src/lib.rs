@@ -15,6 +15,7 @@ pub use error::FfiError;
 pub mod array;
 pub mod elementwise;
 pub mod reduce;
+pub mod sort;
 
 // cxx's SharedPtr<T> implementation expands a panic! macro in the generated
 // Rust glue (inside SharedPtr::is_null()'s unreachable branch). This is
@@ -216,6 +217,11 @@ mod ffi {
 
         fn mlx_op_sum_axis(a: &SharedPtr<MlxArray>, axis: i32) -> Result<SharedPtr<MlxArray>>;
         fn mlx_op_mean_axis(a: &SharedPtr<MlxArray>, axis: i32) -> Result<SharedPtr<MlxArray>>;
+
+        // M4 Phase 1 Task 9: sort + argpartition.
+
+        fn mlx_op_sort(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_argpartition(a: &SharedPtr<MlxArray>, kth: i32) -> Result<SharedPtr<MlxArray>>;
     }
 }
 
