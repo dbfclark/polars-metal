@@ -103,9 +103,11 @@ fn sum_a_mul_b_emits_one_kernel_with_both_loads() {
     let sig = AggSignature::from_specs(&specs, &dts).expect("signature builds");
     let src = emit_msl(&sig, &specs);
 
-    // Both column loads (one per slot) appear.
-    assert!(src.contains("value_0[gid]"), "missing value_0 load:\n{src}");
-    assert!(src.contains("value_1[gid]"), "missing value_1 load:\n{src}");
+    // Both column loads (one per slot) appear. The pre-reduce kernel
+    // strides per-thread, so loads are indexed by the loop variable
+    // `row`, not the global `gid`.
+    assert!(src.contains("value_0[row]"), "missing value_0 load:\n{src}");
+    assert!(src.contains("value_1[row]"), "missing value_1 load:\n{src}");
 
     // The multiplication between the two value references.
     // The emitter casts each Column to `(float)val_<i>` and joins with `*`.
@@ -149,7 +151,7 @@ fn sum_a_mul_one_minus_b_emits_literal_subtraction() {
 }
 
 /// `Sum(a * a)` — same column referenced twice. The shared-load
-/// invariant (one load per column slot) must hold: only ONE `value_0[gid]`
+/// invariant (one load per column slot) must hold: only ONE `value_0[row]`
 /// load appears, and the expression references `val_0` twice.
 #[test]
 fn expression_columns_dedupe() {
@@ -162,11 +164,13 @@ fn expression_columns_dedupe() {
     let sig = AggSignature::from_specs(&specs, &dts).expect("signature builds");
     let src = emit_msl(&sig, &specs);
 
-    // Exactly one shared load of value_0[gid] (Task 12 invariant).
-    let loads = src.matches("value_0[gid]").count();
+    // Exactly one shared load of value_0[row] (Task 12 invariant — the
+    // pre-reduce kernel indexes by the per-thread loop variable `row`,
+    // not the global `gid`).
+    let loads = src.matches("value_0[row]").count();
     assert_eq!(
         loads, 1,
-        "expected exactly 1 shared load of value_0[gid], got {loads}:\n{src}"
+        "expected exactly 1 shared load of value_0[row], got {loads}:\n{src}"
     );
 
     // The expression references val_0 at least twice (lhs and rhs of the

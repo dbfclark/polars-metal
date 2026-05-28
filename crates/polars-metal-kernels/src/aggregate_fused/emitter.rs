@@ -4,43 +4,72 @@
 //! signature was built from, produces an MSL source string with one
 //! `aggregate_fused` entry point. The kernel:
 //!
-//! 1. Loads each value column exactly once per row (shared across every
-//!    Simple agg referencing that column).
-//! 2. Updates each per-group accumulator via 32-bit atomics.
-//! 3. Emits a separate trailing `Length` section (no value column).
+//! 1. Strides each thread over `(row += grid_size)` rows, loading each
+//!    value column exactly once per row (shared across every Simple agg
+//!    referencing that column).
+//! 2. Accumulates per-row updates into **per-thread register arrays**
+//!    sized `[MAX_GROUPS]`. Nothing touches device memory in the inner
+//!    loop.
+//! 3. After the row loop, performs a **simdgroup reduce** of every agg
+//!    accumulator (one per (agg, group)), stages the per-simdgroup
+//!    partial in threadgroup shared memory, threadgroup-syncs, and has
+//!    thread 0 sum the simdgroups and emit a single CAS / fetch-add per
+//!    (TG, group) to the device output buffer.
 //!
-//! ## Scope (Task 12)
+//! ## Why pre-reduce?
+//!
+//! Before this rewrite, every row issued an atomic update directly on
+//! `out[g]`. F32 accumulators use a CAS loop on `atomic_uint` (a bit-
+//! pattern container — Apple Silicon's `atomic_float` rejects
+//! `atomic_fetch_add` at `MTLComputePipelineState` creation), so under
+//! low n_groups every CAS retries against contending threads. At 10M
+//! rows × 4 groups the retry chain is O(N²/2) and trips Metal's GPU
+//! watchdog (`kIOGPUCommandBufferCallbackErrorImpactingInteractivity`).
+//! The pre-reduce structure collapses N atomic-CAS attempts to
+//! (n_threadgroups × n_groups), which is ≤ a few thousand on a Q1-shape
+//! query.
+//!
+//! Integer aggs (Sum/Min/Max over I32/U32) don't have the contention
+//! pathology — `atomic_fetch_add/min/max` on `atomic_int`/`atomic_uint`
+//! is a hardware op with no retry — but they share the same pre-reduce
+//! structure here for uniformity (and to amortize the per-row group
+//! lookup and bounds check).
+//!
+//! ## Scope (Task 12 + Phase-13-bugfix)
 //!
 //! Only **Simple** aggs over **32-bit-input** columns are emitted; this
 //! covers Sum / Mean / Min / Max over F32, I32, U32 inputs plus Count
 //! and Length over any column. F64 / I64 / U64 input columns are
-//! rejected by [`signature_supported_by_fused`]; the dispatcher (Task 15)
-//! routes those to the M2 per-agg fallback, which loads as their 32-bit
-//! equivalent and finalizes the widened sum on CPU (`aggregate_sum_f64_cpu`
-//! pattern).
+//! rejected by [`signature_supported_by_fused`]; the dispatcher routes
+//! those to the M2 per-agg fallback, which loads as their 32-bit
+//! equivalent and finalizes the widened sum on CPU.
 //!
-//! Expression aggs (Task 13) are emitted **after** the per-column-load
-//! loop in their own stanza: each Expression evaluates inline as a
-//! `float`, guarded by the AND of its referenced columns' validity bits,
-//! and feeds the same per-op accumulator template as Simple. Shared
-//! value-column loads (Task 12 invariant) are preserved — Expression aggs
-//! re-use the `val_<i>` / `val_<i>_valid` locals already in scope.
+//! Expression aggs evaluate to `float`, guarded by the AND of their
+//! referenced columns' validity bits. They share the same per-thread
+//! accumulator + reduce + flush pattern as Simple F32 aggs.
+//!
+//! ## `MAX_GROUPS = 16` cap
+//!
+//! The per-thread register arrays are sized `[MAX_GROUPS]`. Higher
+//! cardinality must be routed via the per-agg path (the dispatcher
+//! checks `n_groups <= F32_AGG_MAX_GROUPS` before calling this kernel
+//! and falls back otherwise). Apple Silicon registers comfortably hold
+//! ~16 floats per agg per thread; pushing higher would spill to
+//! threadgroup memory and erase the win.
 //!
 //! ## Apple Silicon atomic constraints
 //!
 //! Toolchain 32023.883 lacks 64-bit atomics. It *also* rejects
 //! `atomic_fetch_add_explicit` on `atomic_float` at
 //! `MTLComputePipelineState` creation, even though the source compiles
-//! via `newLibraryWithSource`. For float Sum/Mean the emitter therefore
-//! uses a CAS-loop over `atomic_uint` (the bit-pattern container) —
-//! matching the M2 `agg_sum_f32` shader in `shaders/aggregate.metal`.
-//! Float Min/Max uses the same CAS-loop pattern because Metal lacks
-//! `atomic_fetch_min/max` on floats. Integer Sum/Min/Max use native
-//! `atomic_fetch_{add,min,max}_explicit` on `atomic_int` / `atomic_uint`.
-//! Count is `atomic_fetch_add_explicit` on `atomic_uint`. Mean is
-//! `(sum, count)` — CPU finalizes the division. The Mean *count*
-//! companion is `atomic_uint` with `atomic_fetch_add_explicit` (the
-//! count of valid rows).
+//! via `newLibraryWithSource`. For float Sum/Mean the final flush uses
+//! a CAS loop over `atomic_uint` (the bit-pattern container). Float
+//! Min/Max uses the same CAS-loop pattern (Metal lacks
+//! `atomic_fetch_min/max` on floats). Integer Sum/Min/Max use native
+//! `atomic_fetch_{add,min,max}_explicit` on `atomic_int` /
+//! `atomic_uint` at the flush step. Count is
+//! `atomic_fetch_add_explicit` on `atomic_uint`. Mean is `(sum, count)`
+//! — CPU finalizes the division.
 //!
 //! ## Slot layout
 //!
@@ -48,15 +77,110 @@
 //! |----------------------|-----------------------------------|
 //! | 0                    | `row_to_group` (uint per row)     |
 //! | 1                    | `n_rows` (1-element uint buffer)  |
-//! | `2 .. 2+C`           | `value_<i>` per column slot       |
-//! | `2+C .. 2+2C`        | `validity_<i>` per column slot    |
-//! | `2+2C ..`            | output buffers, one per agg slot  |
+//! | 2                    | `n_groups` (1-element uint buffer)|
+//! | `3 .. 3+C`           | `value_<i>` per column slot       |
+//! | `3+C .. 3+2C`        | `validity_<i>` per column slot    |
+//! | `3+2C ..`            | output buffers, one per agg slot  |
 //!
 //! Mean reserves two output slots (sum, count); every other agg reserves one.
 
 use std::fmt::Write as _;
 
 use super::signature::{AggExpr, AggOp, AggSignature, AggSpec, BinaryOp, MetalDtype};
+
+/// Per-thread register-array capacity for per-group accumulators. Mirrors
+/// `MAX_GROUPS` in `shaders/aggregate.metal` and the
+/// `F32_AGG_MAX_GROUPS` cap in `groupby.rs`. Callers must guarantee
+/// `n_groups <= 16` before dispatching the fused kernel.
+pub const MAX_GROUPS: usize = 16;
+
+/// Threadgroup width assumed by the emitted kernel. The MSL declares
+/// `tg_partial[MAX_SIMDS_PER_TG * MAX_GROUPS]` with a fixed
+/// `MAX_SIMDS_PER_TG = 8`, which corresponds to a 256-wide threadgroup
+/// on Apple Silicon (32-lane simdgroup). Dispatcher MUST match.
+pub const FUSED_TG_WIDTH: usize = 256;
+
+/// Reduction kind for one accumulator slot. Drives kind-specific source
+/// in `init` / `simd reduce` / `flush` stanzas.
+#[derive(Debug, Clone, Copy)]
+enum ReduceKind {
+    /// `float`, simd_sum, CAS-add on `atomic_uint` (bit pattern).
+    F32Sum,
+    /// `float`, simd_min, CAS-min on `atomic_uint` (bit pattern).
+    F32Min,
+    /// `float`, simd_max, CAS-max on `atomic_uint` (bit pattern).
+    F32Max,
+    /// `int`, simd_sum, `atomic_fetch_add` on `atomic_int`.
+    I32Sum,
+    /// `int`, simd_min, `atomic_fetch_min` on `atomic_int`.
+    I32Min,
+    /// `int`, simd_max, `atomic_fetch_max` on `atomic_int`.
+    I32Max,
+    /// `uint`, simd_sum, `atomic_fetch_add` on `atomic_uint`.
+    U32Sum,
+    /// `uint`, simd_min, `atomic_fetch_min` on `atomic_uint`.
+    U32Min,
+    /// `uint`, simd_max, `atomic_fetch_max` on `atomic_uint`.
+    U32Max,
+    /// `uint`, simd_sum, `atomic_fetch_add` on `atomic_uint`. Used for
+    /// Count / Length / Mean's count companion.
+    Counter,
+}
+
+impl ReduceKind {
+    fn cpp_scalar(self) -> &'static str {
+        match self {
+            ReduceKind::F32Sum | ReduceKind::F32Min | ReduceKind::F32Max => "float",
+            ReduceKind::I32Sum | ReduceKind::I32Min | ReduceKind::I32Max => "int",
+            ReduceKind::U32Sum | ReduceKind::U32Min | ReduceKind::U32Max | ReduceKind::Counter => {
+                "uint"
+            }
+        }
+    }
+
+    /// MSL initial value at the start of the kernel.
+    fn identity(self) -> &'static str {
+        match self {
+            ReduceKind::F32Sum => "0.0f",
+            ReduceKind::F32Min => "INFINITY",
+            ReduceKind::F32Max => "-INFINITY",
+            ReduceKind::I32Sum | ReduceKind::U32Sum | ReduceKind::Counter => "0",
+            ReduceKind::I32Min => "INT_MAX",
+            ReduceKind::I32Max => "INT_MIN",
+            ReduceKind::U32Min => "UINT_MAX",
+            ReduceKind::U32Max => "0u",
+        }
+    }
+
+    /// `simd_*` reduction over the lane-local value.
+    fn simd_reduce_call(self, expr: &str) -> String {
+        match self {
+            ReduceKind::F32Sum | ReduceKind::I32Sum | ReduceKind::U32Sum | ReduceKind::Counter => {
+                format!("simd_sum({expr})")
+            }
+            ReduceKind::F32Min | ReduceKind::I32Min | ReduceKind::U32Min => {
+                format!("simd_min({expr})")
+            }
+            ReduceKind::F32Max | ReduceKind::I32Max | ReduceKind::U32Max => {
+                format!("simd_max({expr})")
+            }
+        }
+    }
+
+    /// Output atomic pointer type for the device buffer.
+    fn atomic_ptr(self) -> &'static str {
+        match self {
+            ReduceKind::F32Sum
+            | ReduceKind::F32Min
+            | ReduceKind::F32Max
+            | ReduceKind::U32Sum
+            | ReduceKind::U32Min
+            | ReduceKind::U32Max
+            | ReduceKind::Counter => "atomic_uint",
+            ReduceKind::I32Sum | ReduceKind::I32Min | ReduceKind::I32Max => "atomic_int",
+        }
+    }
+}
 
 /// Public entry point: emit MSL source for the given signature + specs.
 ///
@@ -72,6 +196,8 @@ pub fn emit_msl(sig: &AggSignature, specs: &[AggSpec]) -> String {
     slot += 1;
     let n_rows_slot = slot;
     slot += 1;
+    let n_groups_slot = slot;
+    slot += 1;
 
     let mut value_slots = Vec::with_capacity(n_cols);
     for _ in 0..n_cols {
@@ -84,7 +210,7 @@ pub fn emit_msl(sig: &AggSignature, specs: &[AggSpec]) -> String {
         slot += 1;
     }
 
-    // Outputs: one slot per agg, two for Mean (sum + count).
+    // Output slots: one per agg, two for Mean (sum + count).
     let mut output_slots: Vec<Vec<usize>> = Vec::with_capacity(specs.len());
     for spec in specs {
         let mut outs = vec![slot];
@@ -106,10 +232,20 @@ pub fn emit_msl(sig: &AggSignature, specs: &[AggSpec]) -> String {
         output_slots.push(outs);
     }
 
+    // Build the per-agg reduce-slot list. Each agg owns one or two
+    // (output_slot_index, reduce_kind) pairs.
+    //
+    // The accumulator variables (`acc_<a>_<j>`) live in private memory;
+    // `j` distinguishes Mean's sum and count slots.
+    let agg_slots = build_agg_slots(specs, column_dtypes, sig);
+
     let mut s = String::new();
     s.push_str("#include <metal_stdlib>\n");
     s.push_str("#include <metal_atomic>\n");
+    s.push_str("#include <metal_simdgroup>\n");
     s.push_str("using namespace metal;\n\n");
+    let _ = writeln!(s, "#define MAX_GROUPS {MAX_GROUPS}u");
+    s.push_str("#define MAX_SIMDS_PER_TG 8u\n\n");
 
     // ---- kernel signature ----
     s.push_str("kernel void aggregate_fused(\n");
@@ -121,6 +257,10 @@ pub fn emit_msl(sig: &AggSignature, specs: &[AggSpec]) -> String {
         s,
         "  device const uint*  n_rows       [[buffer({n_rows_slot})]],"
     );
+    let _ = writeln!(
+        s,
+        "  device const uint*  n_groups     [[buffer({n_groups_slot})]],"
+    );
     for (i, sl) in value_slots.iter().enumerate() {
         let ty = msl_value_load_type(column_dtypes[i]);
         let _ = writeln!(s, "  device const {ty}*  value_{i}    [[buffer({sl})]],");
@@ -130,51 +270,115 @@ pub fn emit_msl(sig: &AggSignature, specs: &[AggSpec]) -> String {
     }
     for (a, outs) in output_slots.iter().enumerate() {
         for (j, sl) in outs.iter().enumerate() {
-            let ty = msl_output_atomic_type(&specs[a], j, column_dtypes, sig);
-            let _ = writeln!(s, "  device {ty}*  out_{a}_{j}     [[buffer({sl})]],");
-        }
-    }
-    s.push_str("  uint gid [[thread_position_in_grid]])\n{\n");
-
-    // ---- bounds + group lookup ----
-    s.push_str("  if (gid >= n_rows[0]) return;\n");
-    s.push_str("  uint g = row_to_group[gid];\n\n");
-
-    // ---- per-column: validity + shared load + per-agg updates ----
-    for (col_idx, name) in column_order.iter().enumerate() {
-        let _ = writeln!(s, "  // --- column slot {col_idx} ({name}) ---");
-        let _ = writeln!(
-            s,
-            "  uchar val_{col_idx}_valid = (validity_{col_idx}[gid >> 3] >> (gid & 7)) & 1u;"
-        );
-        let _ = writeln!(s, "  auto val_{col_idx} = value_{col_idx}[gid];");
-        for (a, spec) in specs.iter().enumerate() {
-            if spec_references_simple_col(spec, name) {
-                emit_simple_agg_update(&mut s, spec, a, col_idx, column_dtypes[col_idx]);
-            }
-        }
-        s.push('\n');
-    }
-
-    // ---- expression aggs (Task 13) ----
-    // Emitted after the per-column-load loop because an Expression may
-    // reference multiple column slots. The `val_<i>` / `val_<i>_valid`
-    // locals are already in scope.
-    for (a, spec) in specs.iter().enumerate() {
-        if let AggSpec::Expression { expr, op, .. } = spec {
-            emit_expression_agg_update(&mut s, expr, *op, a, column_order);
-        }
-    }
-
-    // ---- length aggs (no value column) ----
-    for (a, spec) in specs.iter().enumerate() {
-        if matches!(spec, AggSpec::Length { .. }) {
+            let kind = agg_slots[a][j];
             let _ = writeln!(
                 s,
-                "  atomic_fetch_add_explicit((device atomic_uint*)&out_{a}_0[g], 1u, memory_order_relaxed);"
+                "  device {ptr}*  out_{a}_{j}     [[buffer({sl})]],",
+                ptr = kind.atomic_ptr()
             );
         }
     }
+    s.push_str("  uint gid              [[thread_position_in_grid]],\n");
+    s.push_str("  uint grid_size        [[threads_per_grid]],\n");
+    s.push_str("  uint tid_in_tg        [[thread_index_in_threadgroup]],\n");
+    s.push_str("  uint sg_index         [[simdgroup_index_in_threadgroup]],\n");
+    s.push_str("  uint lane             [[thread_index_in_simdgroup]],\n");
+    s.push_str("  uint n_simdgroups     [[simdgroups_per_threadgroup]])\n{\n");
+
+    s.push_str("  uint nr = n_rows[0];\n");
+    s.push_str("  uint ng = n_groups[0];\n\n");
+
+    // ---- per-thread accumulator declarations + init -------------------------
+    for (a, slots) in agg_slots.iter().enumerate() {
+        for (j, kind) in slots.iter().enumerate() {
+            let _ = writeln!(s, "  {ty} acc_{a}_{j}[MAX_GROUPS];", ty = kind.cpp_scalar());
+            let _ = writeln!(
+                s,
+                "  for (uint i = 0u; i < MAX_GROUPS; ++i) {{ acc_{a}_{j}[i] = {id}; }}",
+                id = kind.identity()
+            );
+        }
+    }
+    s.push('\n');
+
+    // ---- strided main row loop ---------------------------------------------
+    s.push_str("  for (uint row = gid; row < nr; row += grid_size) {\n");
+    s.push_str("    uint g = row_to_group[row];\n");
+    s.push_str("    if (g >= ng) continue;\n\n");
+
+    // Per-column shared load + per-agg update bodies.
+    for (col_idx, _name) in column_order.iter().enumerate() {
+        let _ = writeln!(
+            s,
+            "    uchar val_{col_idx}_valid = (validity_{col_idx}[row >> 3] >> (row & 7)) & 1u;"
+        );
+        let _ = writeln!(s, "    auto val_{col_idx} = value_{col_idx}[row];");
+    }
+    s.push('\n');
+
+    for (a, spec) in specs.iter().enumerate() {
+        emit_agg_row_update(&mut s, spec, a, column_order, column_dtypes, sig);
+    }
+
+    // Length aggs increment unconditionally — emitted last so they share the
+    // same per-row loop body.
+    for (a, spec) in specs.iter().enumerate() {
+        if matches!(spec, AggSpec::Length { .. }) {
+            let _ = writeln!(s, "    acc_{a}_0[g] += 1u;");
+        }
+    }
+
+    s.push_str("  }\n\n");
+
+    // ---- simdgroup reduce + TGSM staging + per-TG final flush --------------
+    //
+    // Each reduce slot uses its own MAX_SIMDS_PER_TG * MAX_GROUPS slab of
+    // threadgroup memory. We declare slabs of the slot's scalar type so
+    // simd reductions can stage without bit-tricking.
+    s.push('\n');
+    for (a, slots) in agg_slots.iter().enumerate() {
+        for (j, kind) in slots.iter().enumerate() {
+            let _ = writeln!(
+                s,
+                "  threadgroup {ty} tg_part_{a}_{j}[MAX_SIMDS_PER_TG * MAX_GROUPS];",
+                ty = kind.cpp_scalar()
+            );
+        }
+    }
+    s.push('\n');
+
+    // simd reduce: each (a, j) reduces its per-thread accumulator slot
+    // across the simdgroup and stages the result.
+    s.push_str("  for (uint gi = 0u; gi < MAX_GROUPS; ++gi) {\n");
+    s.push_str("    if (gi >= ng) break;\n");
+    for (a, slots) in agg_slots.iter().enumerate() {
+        for (j, kind) in slots.iter().enumerate() {
+            let reduce = kind.simd_reduce_call(&format!("acc_{a}_{j}[gi]"));
+            let _ = writeln!(
+                s,
+                "    {ty} sgv_{a}_{j} = {reduce};",
+                ty = kind.cpp_scalar()
+            );
+            let _ = writeln!(
+                s,
+                "    if (lane == 0u) tg_part_{a}_{j}[sg_index * MAX_GROUPS + gi] = sgv_{a}_{j};"
+            );
+        }
+    }
+    s.push_str("  }\n");
+    s.push_str("  threadgroup_barrier(mem_flags::mem_threadgroup);\n\n");
+
+    // Thread 0 of the TG sums simdgroup partials and flushes to device.
+    s.push_str("  if (tid_in_tg == 0u) {\n");
+    s.push_str("    for (uint gi = 0u; gi < MAX_GROUPS; ++gi) {\n");
+    s.push_str("      if (gi >= ng) break;\n");
+    for (a, slots) in agg_slots.iter().enumerate() {
+        for (j, kind) in slots.iter().enumerate() {
+            emit_final_flush(&mut s, a, j, *kind);
+        }
+    }
+    s.push_str("    }\n");
+    s.push_str("  }\n");
 
     s.push_str("}\n");
     s
@@ -223,49 +427,74 @@ fn msl_value_load_type(dt: MetalDtype) -> &'static str {
     }
 }
 
-/// MSL atomic output-pointer type for the `j`th output of `spec`.
-fn msl_output_atomic_type(
-    spec: &AggSpec,
-    j: usize,
+/// Map each agg in `specs` to its list of `(output_slot_index, kind)`
+/// reduce slots. Returns `agg_slots[a][j] = kind` such that the `j`th
+/// device output buffer of agg `a` has reduction kind `kind`.
+fn build_agg_slots(
+    specs: &[AggSpec],
     column_dtypes: &[MetalDtype],
     sig: &AggSignature,
-) -> &'static str {
-    match spec {
-        AggSpec::Simple { op, input_col, .. } => match (op, j) {
-            (AggOp::Count, _) => "atomic_uint",
-            (AggOp::Len, _) => "atomic_uint",
-            (AggOp::Mean, 1) => "atomic_uint",
-            // Sum / Mean (sum slot) / Min / Max: type depends on input
-            // dtype + op. Float Sum/Mean *and* Min/Max use `atomic_uint`
-            // as a bit-pattern container — Apple Silicon Metal toolchain
-            // 32023.883 rejects atomic_fetch_add/min/max on `atomic_float`
-            // at MTLComputePipelineState creation. See
-            // `shaders/aggregate.metal:64-91` and
-            // `docs/kernel-authoring.md` § "Apple Silicon Metal atomic
-            // ops constraint".
-            _ => {
+) -> Vec<Vec<ReduceKind>> {
+    let mut out: Vec<Vec<ReduceKind>> = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let mut slots: Vec<ReduceKind> = Vec::new();
+        match spec {
+            AggSpec::Simple { op, input_col, .. } => {
                 let dt = column_dtype_for(sig, column_dtypes, input_col).unwrap_or(MetalDtype::F32);
-                match (dt, op) {
-                    (MetalDtype::F32 | MetalDtype::F64, _) => "atomic_uint",
-                    (MetalDtype::I32 | MetalDtype::I16 | MetalDtype::I8 | MetalDtype::I64, _) => {
-                        "atomic_int"
+                match op {
+                    AggOp::Count => slots.push(ReduceKind::Counter),
+                    AggOp::Len => slots.push(ReduceKind::Counter),
+                    AggOp::Sum => slots.push(sum_kind_for(dt)),
+                    AggOp::Min => slots.push(min_kind_for(dt)),
+                    AggOp::Max => slots.push(max_kind_for(dt)),
+                    AggOp::Mean => {
+                        slots.push(sum_kind_for(dt));
+                        slots.push(ReduceKind::Counter);
                     }
-                    _ => "atomic_uint",
                 }
             }
-        },
-        AggSpec::Expression { op, .. } => match (op, j) {
-            // Count and Mean's count companion → uint atomic.
-            (AggOp::Count, _) | (AggOp::Mean, 1) | (AggOp::Len, _) => "atomic_uint",
-            // Sum / Mean (sum slot) / Min / Max: expression evaluates to
-            // float (per `emit_expr_msl`), so the accumulator is always
-            // `atomic_uint` used as a float bit-pattern container (same
-            // CAS-loop pattern as Simple-float Sum/Min/Max — Apple Silicon
-            // Metal 32023.883 rejects `atomic_fetch_add` on `atomic_float`
-            // at MTLComputePipelineState creation).
-            _ => "atomic_uint",
-        },
-        AggSpec::Length { .. } => "atomic_uint",
+            AggSpec::Expression { op, .. } => {
+                // Expressions always evaluate to float.
+                match op {
+                    AggOp::Count => slots.push(ReduceKind::Counter),
+                    AggOp::Len => slots.push(ReduceKind::Counter),
+                    AggOp::Sum => slots.push(ReduceKind::F32Sum),
+                    AggOp::Min => slots.push(ReduceKind::F32Min),
+                    AggOp::Max => slots.push(ReduceKind::F32Max),
+                    AggOp::Mean => {
+                        slots.push(ReduceKind::F32Sum);
+                        slots.push(ReduceKind::Counter);
+                    }
+                }
+            }
+            AggSpec::Length { .. } => slots.push(ReduceKind::Counter),
+        }
+        out.push(slots);
+    }
+    out
+}
+
+fn sum_kind_for(dt: MetalDtype) -> ReduceKind {
+    match dt {
+        MetalDtype::F32 | MetalDtype::F64 => ReduceKind::F32Sum,
+        MetalDtype::I32 | MetalDtype::I16 | MetalDtype::I8 | MetalDtype::I64 => ReduceKind::I32Sum,
+        _ => ReduceKind::U32Sum,
+    }
+}
+
+fn min_kind_for(dt: MetalDtype) -> ReduceKind {
+    match dt {
+        MetalDtype::F32 | MetalDtype::F64 => ReduceKind::F32Min,
+        MetalDtype::I32 | MetalDtype::I16 | MetalDtype::I8 | MetalDtype::I64 => ReduceKind::I32Min,
+        _ => ReduceKind::U32Min,
+    }
+}
+
+fn max_kind_for(dt: MetalDtype) -> ReduceKind {
+    match dt {
+        MetalDtype::F32 | MetalDtype::F64 => ReduceKind::F32Max,
+        MetalDtype::I32 | MetalDtype::I16 | MetalDtype::I8 | MetalDtype::I64 => ReduceKind::I32Max,
+        _ => ReduceKind::U32Max,
     }
 }
 
@@ -280,151 +509,269 @@ fn column_dtype_for(
         .map(|i| column_dtypes[i])
 }
 
-fn spec_references_simple_col(spec: &AggSpec, name: &str) -> bool {
-    matches!(spec, AggSpec::Simple { input_col, .. } if input_col == name)
-}
-
-/// Emit the per-row update for a Simple agg over column slot `col_idx`.
-/// The shared `val_<col_idx>` and `val_<col_idx>_valid` are in scope.
-fn emit_simple_agg_update(
+/// Emit the per-row update body for one agg, writing into the per-thread
+/// `acc_<a>_<j>[g]` accumulator. Wrapped by the per-row strided loop in
+/// `emit_msl`.
+fn emit_agg_row_update(
     out: &mut String,
     spec: &AggSpec,
     agg_idx: usize,
-    col_idx: usize,
-    col_dtype: MetalDtype,
+    column_order: &[String],
+    column_dtypes: &[MetalDtype],
+    _sig: &AggSignature,
 ) {
-    let AggSpec::Simple { op, .. } = spec else {
-        return;
+    match spec {
+        AggSpec::Simple { op, input_col, .. } => {
+            let Some(col_idx) = column_order.iter().position(|c| c == input_col) else {
+                return;
+            };
+            let col_dtype = column_dtypes[col_idx];
+            let is_float = matches!(col_dtype, MetalDtype::F32 | MetalDtype::F64);
+            let is_signed = matches!(
+                col_dtype,
+                MetalDtype::I32 | MetalDtype::I16 | MetalDtype::I8 | MetalDtype::I64
+            );
+            let cast = if is_float {
+                "(float)"
+            } else if is_signed {
+                "(int)"
+            } else {
+                "(uint)"
+            };
+            match op {
+                AggOp::Count => {
+                    let _ = writeln!(
+                        out,
+                        "    if (val_{col_idx}_valid) acc_{agg_idx}_0[g] += 1u;"
+                    );
+                }
+                AggOp::Len => {
+                    // Defensive: tolerate Len as Simple (M3 walker emits
+                    // it as AggSpec::Length instead). Unconditional row
+                    // count.
+                    let _ = writeln!(out, "    acc_{agg_idx}_0[g] += 1u;");
+                }
+                AggOp::Sum => {
+                    let _ = writeln!(
+                        out,
+                        "    if (val_{col_idx}_valid) acc_{agg_idx}_0[g] += {cast}val_{col_idx};"
+                    );
+                }
+                AggOp::Min => {
+                    let _ = writeln!(
+                        out,
+                        "    if (val_{col_idx}_valid) acc_{agg_idx}_0[g] = min(acc_{agg_idx}_0[g], {cast}val_{col_idx});"
+                    );
+                }
+                AggOp::Max => {
+                    let _ = writeln!(
+                        out,
+                        "    if (val_{col_idx}_valid) acc_{agg_idx}_0[g] = max(acc_{agg_idx}_0[g], {cast}val_{col_idx});"
+                    );
+                }
+                AggOp::Mean => {
+                    let _ = writeln!(out, "    if (val_{col_idx}_valid) {{");
+                    let _ = writeln!(out, "      acc_{agg_idx}_0[g] += {cast}val_{col_idx};");
+                    let _ = writeln!(out, "      acc_{agg_idx}_1[g] += 1u;");
+                    let _ = writeln!(out, "    }}");
+                }
+            }
+        }
+        AggSpec::Expression { expr, op, .. } => {
+            let guard = emit_expr_validity_check(expr, column_order);
+            let value = emit_expr_msl(expr, column_order);
+            match op {
+                AggOp::Count => {
+                    let _ = writeln!(out, "    if ({guard}) acc_{agg_idx}_0[g] += 1u;");
+                }
+                AggOp::Len => {
+                    let _ = writeln!(out, "    acc_{agg_idx}_0[g] += 1u;");
+                }
+                AggOp::Sum => {
+                    let _ = writeln!(
+                        out,
+                        "    if ({guard}) {{ float ex = (float)({value}); acc_{agg_idx}_0[g] += ex; }}"
+                    );
+                }
+                AggOp::Min => {
+                    let _ = writeln!(
+                        out,
+                        "    if ({guard}) {{ float ex = (float)({value}); acc_{agg_idx}_0[g] = min(acc_{agg_idx}_0[g], ex); }}"
+                    );
+                }
+                AggOp::Max => {
+                    let _ = writeln!(
+                        out,
+                        "    if ({guard}) {{ float ex = (float)({value}); acc_{agg_idx}_0[g] = max(acc_{agg_idx}_0[g], ex); }}"
+                    );
+                }
+                AggOp::Mean => {
+                    let _ = writeln!(
+                        out,
+                        "    if ({guard}) {{ float ex = (float)({value}); acc_{agg_idx}_0[g] += ex; acc_{agg_idx}_1[g] += 1u; }}"
+                    );
+                }
+            }
+        }
+        AggSpec::Length { .. } => {
+            // Emitted by the dedicated loop below the per-column section.
+        }
+    }
+}
+
+/// Emit the per-TG, per-group final flush for one reduce slot. Runs
+/// inside `if (tid_in_tg == 0u) { for (gi …) { … } }`.
+fn emit_final_flush(out: &mut String, agg_idx: usize, j: usize, kind: ReduceKind) {
+    let ty = kind.cpp_scalar();
+    // Combine the per-simdgroup partials.
+    let combine = match kind {
+        ReduceKind::F32Sum | ReduceKind::I32Sum | ReduceKind::U32Sum | ReduceKind::Counter => "+=",
+        ReduceKind::F32Min | ReduceKind::I32Min | ReduceKind::U32Min => "=min",
+        ReduceKind::F32Max | ReduceKind::I32Max | ReduceKind::U32Max => "=max",
     };
-    let is_float = matches!(col_dtype, MetalDtype::F32 | MetalDtype::F64);
-    let is_signed = matches!(
-        col_dtype,
-        MetalDtype::I32 | MetalDtype::I16 | MetalDtype::I8 | MetalDtype::I64
+    let _ = writeln!(
+        out,
+        "      {ty} total_{agg_idx}_{j} = {id};",
+        id = kind.identity()
     );
+    let _ = writeln!(out, "      for (uint s = 0u; s < n_simdgroups; ++s) {{");
+    match combine {
+        "+=" => {
+            let _ = writeln!(
+                out,
+                "        total_{agg_idx}_{j} += tg_part_{agg_idx}_{j}[s * MAX_GROUPS + gi];"
+            );
+        }
+        "=min" => {
+            let _ = writeln!(
+                out,
+                "        total_{agg_idx}_{j} = min(total_{agg_idx}_{j}, tg_part_{agg_idx}_{j}[s * MAX_GROUPS + gi]);"
+            );
+        }
+        "=max" => {
+            let _ = writeln!(
+                out,
+                "        total_{agg_idx}_{j} = max(total_{agg_idx}_{j}, tg_part_{agg_idx}_{j}[s * MAX_GROUPS + gi]);"
+            );
+        }
+        _ => unreachable!(),
+    }
+    let _ = writeln!(out, "      }}");
 
-    match op {
-        AggOp::Count => {
-            let _ = writeln!(out, "  if (val_{col_idx}_valid) {{");
+    // Flush to device atomic. Skip when the combined value is still the
+    // identity — saves a CAS on TGs that saw no rows for this group.
+    match kind {
+        ReduceKind::F32Sum => {
+            let _ = writeln!(out, "      if (total_{agg_idx}_{j} != 0.0f) {{");
             let _ = writeln!(
                 out,
-                "    atomic_fetch_add_explicit((device atomic_uint*)&out_{agg_idx}_0[g], 1u, memory_order_relaxed);"
+                "        uint old_bits = atomic_load_explicit(&out_{agg_idx}_{j}[gi], memory_order_relaxed);"
             );
-            out.push_str("  }\n");
+            let _ = writeln!(out, "        while (true) {{");
+            let _ = writeln!(out, "          float cur = as_type<float>(old_bits);");
+            let _ = writeln!(
+                out,
+                "          uint next_bits = as_type<uint>(cur + total_{agg_idx}_{j});"
+            );
+            let _ = writeln!(
+                out,
+                "          if (atomic_compare_exchange_weak_explicit(&out_{agg_idx}_{j}[gi], &old_bits, next_bits, memory_order_relaxed, memory_order_relaxed)) break;"
+            );
+            let _ = writeln!(out, "        }}");
+            let _ = writeln!(out, "      }}");
         }
-        AggOp::Sum => emit_sum(out, agg_idx, col_idx, is_float, is_signed),
-        AggOp::Mean => {
-            emit_sum(out, agg_idx, col_idx, is_float, is_signed);
-            // Companion count update.
-            let _ = writeln!(out, "  if (val_{col_idx}_valid) {{");
+        ReduceKind::F32Min => {
+            // Skip if total is still +INF.
             let _ = writeln!(
                 out,
-                "    atomic_fetch_add_explicit((device atomic_uint*)&out_{agg_idx}_1[g], 1u, memory_order_relaxed);"
+                "      if (!(isinf(total_{agg_idx}_{j}) && total_{agg_idx}_{j} > 0.0f)) {{"
             );
-            out.push_str("  }\n");
+            let _ = writeln!(
+                out,
+                "        uint old_bits = atomic_load_explicit(&out_{agg_idx}_{j}[gi], memory_order_relaxed);"
+            );
+            let _ = writeln!(out, "        while (true) {{");
+            let _ = writeln!(out, "          float cur = as_type<float>(old_bits);");
+            let _ = writeln!(out, "          if (!(total_{agg_idx}_{j} < cur)) break;");
+            let _ = writeln!(
+                out,
+                "          uint next_bits = as_type<uint>(total_{agg_idx}_{j});"
+            );
+            let _ = writeln!(
+                out,
+                "          if (atomic_compare_exchange_weak_explicit(&out_{agg_idx}_{j}[gi], &old_bits, next_bits, memory_order_relaxed, memory_order_relaxed)) break;"
+            );
+            let _ = writeln!(out, "        }}");
+            let _ = writeln!(out, "      }}");
         }
-        AggOp::Min => emit_min_max(out, agg_idx, col_idx, true, is_float, is_signed),
-        AggOp::Max => emit_min_max(out, agg_idx, col_idx, false, is_float, is_signed),
-        AggOp::Len => {
-            // `Len` normally appears as `AggSpec::Length`; tolerate it
-            // here defensively as an unconditional fetch-add.
+        ReduceKind::F32Max => {
+            // Skip if total is still -INF.
             let _ = writeln!(
                 out,
-                "  atomic_fetch_add_explicit((device atomic_uint*)&out_{agg_idx}_0[g], 1u, memory_order_relaxed);"
+                "      if (!(isinf(total_{agg_idx}_{j}) && total_{agg_idx}_{j} < 0.0f)) {{"
             );
+            let _ = writeln!(
+                out,
+                "        uint old_bits = atomic_load_explicit(&out_{agg_idx}_{j}[gi], memory_order_relaxed);"
+            );
+            let _ = writeln!(out, "        while (true) {{");
+            let _ = writeln!(out, "          float cur = as_type<float>(old_bits);");
+            let _ = writeln!(out, "          if (!(total_{agg_idx}_{j} > cur)) break;");
+            let _ = writeln!(
+                out,
+                "          uint next_bits = as_type<uint>(total_{agg_idx}_{j});"
+            );
+            let _ = writeln!(
+                out,
+                "          if (atomic_compare_exchange_weak_explicit(&out_{agg_idx}_{j}[gi], &old_bits, next_bits, memory_order_relaxed, memory_order_relaxed)) break;"
+            );
+            let _ = writeln!(out, "        }}");
+            let _ = writeln!(out, "      }}");
+        }
+        ReduceKind::I32Sum | ReduceKind::U32Sum | ReduceKind::Counter => {
+            let _ = writeln!(out, "      if (total_{agg_idx}_{j} != 0) {{");
+            let _ = writeln!(
+                out,
+                "        atomic_fetch_add_explicit(&out_{agg_idx}_{j}[gi], total_{agg_idx}_{j}, memory_order_relaxed);"
+            );
+            let _ = writeln!(out, "      }}");
+        }
+        ReduceKind::I32Min => {
+            let _ = writeln!(out, "      if (total_{agg_idx}_{j} != INT_MAX) {{");
+            let _ = writeln!(
+                out,
+                "        atomic_fetch_min_explicit(&out_{agg_idx}_{j}[gi], total_{agg_idx}_{j}, memory_order_relaxed);"
+            );
+            let _ = writeln!(out, "      }}");
+        }
+        ReduceKind::I32Max => {
+            let _ = writeln!(out, "      if (total_{agg_idx}_{j} != INT_MIN) {{");
+            let _ = writeln!(
+                out,
+                "        atomic_fetch_max_explicit(&out_{agg_idx}_{j}[gi], total_{agg_idx}_{j}, memory_order_relaxed);"
+            );
+            let _ = writeln!(out, "      }}");
+        }
+        ReduceKind::U32Min => {
+            let _ = writeln!(out, "      if (total_{agg_idx}_{j} != UINT_MAX) {{");
+            let _ = writeln!(
+                out,
+                "        atomic_fetch_min_explicit(&out_{agg_idx}_{j}[gi], total_{agg_idx}_{j}, memory_order_relaxed);"
+            );
+            let _ = writeln!(out, "      }}");
+        }
+        ReduceKind::U32Max => {
+            let _ = writeln!(out, "      if (total_{agg_idx}_{j} != 0u) {{");
+            let _ = writeln!(
+                out,
+                "        atomic_fetch_max_explicit(&out_{agg_idx}_{j}[gi], total_{agg_idx}_{j}, memory_order_relaxed);"
+            );
+            let _ = writeln!(out, "      }}");
         }
     }
 }
 
-fn emit_sum(out: &mut String, agg_idx: usize, col_idx: usize, is_float: bool, is_signed: bool) {
-    let _ = writeln!(out, "  if (val_{col_idx}_valid) {{");
-    if is_float {
-        // Float Sum via CAS-loop on `atomic_uint` (bit-pattern container).
-        // `atomic_fetch_add_explicit` on `atomic_float` fails at
-        // MTLComputePipelineState creation on Apple Silicon Metal
-        // toolchain 32023.883 even though source compiles. Mirrors
-        // `agg_sum_f32` in `shaders/aggregate.metal`.
-        let _ = writeln!(
-            out,
-            "    uint old_bits_a = atomic_load_explicit((device atomic_uint*)&out_{agg_idx}_0[g], memory_order_relaxed);"
-        );
-        out.push_str("    while (true) {\n");
-        out.push_str("      float cur = as_type<float>(old_bits_a);\n");
-        let _ = writeln!(
-            out,
-            "      uint next_bits = as_type<uint>(cur + (float)val_{col_idx});"
-        );
-        let _ = writeln!(
-            out,
-            "      if (atomic_compare_exchange_weak_explicit((device atomic_uint*)&out_{agg_idx}_0[g], &old_bits_a, next_bits, memory_order_relaxed, memory_order_relaxed)) {{ break; }}"
-        );
-        out.push_str("    }\n");
-    } else if is_signed {
-        let _ = writeln!(
-            out,
-            "    atomic_fetch_add_explicit((device atomic_int*)&out_{agg_idx}_0[g], (int)val_{col_idx}, memory_order_relaxed);"
-        );
-    } else {
-        let _ = writeln!(
-            out,
-            "    atomic_fetch_add_explicit((device atomic_uint*)&out_{agg_idx}_0[g], (uint)val_{col_idx}, memory_order_relaxed);"
-        );
-    }
-    out.push_str("  }\n");
-}
-
-fn emit_min_max(
-    out: &mut String,
-    agg_idx: usize,
-    col_idx: usize,
-    is_min: bool,
-    is_float: bool,
-    is_signed: bool,
-) {
-    if is_float {
-        let break_cond = if is_min {
-            "curf <= valf"
-        } else {
-            "curf >= valf"
-        };
-        let _ = writeln!(out, "  if (val_{col_idx}_valid) {{");
-        let _ = writeln!(out, "    float valf = (float)val_{col_idx};");
-        let _ = writeln!(
-            out,
-            "    uint old_bits = atomic_load_explicit((device atomic_uint*)&out_{agg_idx}_0[g], memory_order_relaxed);"
-        );
-        out.push_str("    while (true) {\n");
-        out.push_str("      float curf = as_type<float>(old_bits);\n");
-        let _ = writeln!(out, "      if ({break_cond}) {{ break; }}");
-        out.push_str("      uint next_bits = as_type<uint>(valf);\n");
-        let _ = writeln!(
-            out,
-            "      if (atomic_compare_exchange_weak_explicit((device atomic_uint*)&out_{agg_idx}_0[g], &old_bits, next_bits, memory_order_relaxed, memory_order_relaxed)) {{ break; }}"
-        );
-        out.push_str("    }\n");
-        out.push_str("  }\n");
-    } else {
-        let fn_name = if is_min {
-            "atomic_fetch_min_explicit"
-        } else {
-            "atomic_fetch_max_explicit"
-        };
-        let _ = writeln!(out, "  if (val_{col_idx}_valid) {{");
-        if is_signed {
-            let _ = writeln!(
-                out,
-                "    {fn_name}((device atomic_int*)&out_{agg_idx}_0[g], (int)val_{col_idx}, memory_order_relaxed);"
-            );
-        } else {
-            let _ = writeln!(
-                out,
-                "    {fn_name}((device atomic_uint*)&out_{agg_idx}_0[g], (uint)val_{col_idx}, memory_order_relaxed);"
-            );
-        }
-        out.push_str("  }\n");
-    }
-}
-
-// ---------- Expression-agg emission (Task 13) ------------------------------
+// ---------- Expression-agg helpers (Task 13) -------------------------------
 
 /// Convert a kernel-layer `AggExpr` to an MSL `float`-typed expression.
 ///
@@ -502,117 +849,4 @@ fn emit_expr_validity_check(expr: &AggExpr, col_order: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" & ")
-}
-
-/// Emit the per-row update for one `AggSpec::Expression` agg. The
-/// `val_<i>` / `val_<i>_valid` locals are already in scope (the
-/// per-column-load loop ran first). The expression evaluates to a
-/// `float`; the accumulator pattern matches Simple-float for Sum/Min/Max
-/// (CAS loop on `atomic_uint` as a bit-pattern container) and
-/// `atomic_fetch_add_explicit` on `atomic_uint` for Count and Mean's
-/// count companion.
-fn emit_expression_agg_update(
-    out: &mut String,
-    expr: &AggExpr,
-    op: AggOp,
-    agg_idx: usize,
-    col_order: &[String],
-) {
-    let _ = writeln!(out, "  // --- expression agg slot {agg_idx} ---");
-    let guard = emit_expr_validity_check(expr, col_order);
-    let value = emit_expr_msl(expr, col_order);
-
-    match op {
-        AggOp::Count => {
-            let _ = writeln!(out, "  if ({guard}) {{");
-            let _ = writeln!(
-                out,
-                "    atomic_fetch_add_explicit((device atomic_uint*)&out_{agg_idx}_0[g], 1u, memory_order_relaxed);"
-            );
-            out.push_str("  }\n");
-        }
-        AggOp::Len => {
-            // Len normally appears as AggSpec::Length; tolerate it here
-            // defensively — semantics match an unconditional row count.
-            let _ = writeln!(
-                out,
-                "  atomic_fetch_add_explicit((device atomic_uint*)&out_{agg_idx}_0[g], 1u, memory_order_relaxed);"
-            );
-        }
-        AggOp::Sum => emit_expression_sum(out, agg_idx, &guard, &value),
-        AggOp::Mean => {
-            emit_expression_sum(out, agg_idx, &guard, &value);
-            // Companion count update — increments per valid-row.
-            let _ = writeln!(out, "  if ({guard}) {{");
-            let _ = writeln!(
-                out,
-                "    atomic_fetch_add_explicit((device atomic_uint*)&out_{agg_idx}_1[g], 1u, memory_order_relaxed);"
-            );
-            out.push_str("  }\n");
-        }
-        AggOp::Min => emit_expression_min_max(out, agg_idx, &guard, &value, true),
-        AggOp::Max => emit_expression_min_max(out, agg_idx, &guard, &value, false),
-    }
-}
-
-fn emit_expression_sum(out: &mut String, agg_idx: usize, guard: &str, value: &str) {
-    // Float Sum via CAS loop on `atomic_uint` (bit-pattern container),
-    // matching the Simple-float Sum pattern.
-    let _ = writeln!(out, "  if ({guard}) {{");
-    let _ = writeln!(out, "    float ex_{agg_idx} = (float)({value});");
-    let _ = writeln!(
-        out,
-        "    uint old_bits_e{agg_idx} = atomic_load_explicit((device atomic_uint*)&out_{agg_idx}_0[g], memory_order_relaxed);"
-    );
-    out.push_str("    while (true) {\n");
-    let _ = writeln!(
-        out,
-        "      float cur_e{agg_idx} = as_type<float>(old_bits_e{agg_idx});"
-    );
-    let _ = writeln!(
-        out,
-        "      uint next_bits_e{agg_idx} = as_type<uint>(cur_e{agg_idx} + ex_{agg_idx});"
-    );
-    let _ = writeln!(
-        out,
-        "      if (atomic_compare_exchange_weak_explicit((device atomic_uint*)&out_{agg_idx}_0[g], &old_bits_e{agg_idx}, next_bits_e{agg_idx}, memory_order_relaxed, memory_order_relaxed)) {{ break; }}"
-    );
-    out.push_str("    }\n");
-    out.push_str("  }\n");
-}
-
-fn emit_expression_min_max(
-    out: &mut String,
-    agg_idx: usize,
-    guard: &str,
-    value: &str,
-    is_min: bool,
-) {
-    let break_cond = if is_min {
-        format!("curf_e{agg_idx} <= valf_e{agg_idx}")
-    } else {
-        format!("curf_e{agg_idx} >= valf_e{agg_idx}")
-    };
-    let _ = writeln!(out, "  if ({guard}) {{");
-    let _ = writeln!(out, "    float valf_e{agg_idx} = (float)({value});");
-    let _ = writeln!(
-        out,
-        "    uint old_bits_e{agg_idx} = atomic_load_explicit((device atomic_uint*)&out_{agg_idx}_0[g], memory_order_relaxed);"
-    );
-    out.push_str("    while (true) {\n");
-    let _ = writeln!(
-        out,
-        "      float curf_e{agg_idx} = as_type<float>(old_bits_e{agg_idx});"
-    );
-    let _ = writeln!(out, "      if ({break_cond}) {{ break; }}");
-    let _ = writeln!(
-        out,
-        "      uint next_bits_e{agg_idx} = as_type<uint>(valf_e{agg_idx});"
-    );
-    let _ = writeln!(
-        out,
-        "      if (atomic_compare_exchange_weak_explicit((device atomic_uint*)&out_{agg_idx}_0[g], &old_bits_e{agg_idx}, next_bits_e{agg_idx}, memory_order_relaxed, memory_order_relaxed)) {{ break; }}"
-    );
-    out.push_str("    }\n");
-    out.push_str("  }\n");
 }

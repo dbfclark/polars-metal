@@ -2173,124 +2173,159 @@ pub fn execute_groupby<'py>(
         .map_err(|e| crate::engine_err(crate::EngineError::Other(format!("command queue: {e}"))))?;
 
     // 6. Routing: fused single-kernel vs M2 per-agg.
-    let choice = decide_groupby_dispatch(&parsed.aggs, &name_byte_refs);
+    //
+    // The fused kernel caps `n_groups` at 16 (per-thread register array
+    // size in `aggregate_fused::emitter::MAX_GROUPS`). The router can't
+    // know n_groups ahead of time (it's a runtime build output), so when
+    // Fused is selected and the dispatch returns NgroupsExceedsFusedCap
+    // we transparently retry on the per-agg path. Expression aggs can't
+    // go through per-agg, so they surface as a hard error.
+    let initial_choice = decide_groupby_dispatch(&parsed.aggs, &name_byte_refs);
+    let has_expression = parsed
+        .aggs
+        .iter()
+        .any(|a| matches!(a, ParsedAgg::Expression { .. }));
 
-    let result = match choice {
-        GroupByDispatchChoice::Fused => {
-            // Build kernel-layer specs.
-            let kernel_specs: Vec<KAggSpec> = parsed
-                .aggs
-                .iter()
-                .map(|pa| match pa {
-                    ParsedAgg::Simple {
-                        input_col,
-                        op,
-                        output_alias,
-                    } => KAggSpec::Simple {
-                        input_col: input_col.clone(),
-                        op: convert_agg_op(*op),
-                        output_alias: output_alias.clone(),
-                    },
-                    ParsedAgg::Expression {
-                        expr,
-                        op,
-                        output_alias,
-                    } => KAggSpec::Expression {
-                        expr: convert_agg_expr(expr),
-                        op: convert_agg_op(*op),
-                        output_alias: output_alias.clone(),
-                    },
-                    ParsedAgg::Length { output_alias } => KAggSpec::Length {
-                        output_alias: output_alias.clone(),
-                    },
-                })
-                .collect();
+    // First, attempt the chosen path; on NgroupsExceedsFusedCap, fall back.
+    let mut fused_attempt: Option<
+        Result<
+            polars_metal_kernels::groupby::GroupByResult,
+            polars_metal_kernels::groupby::FusedDispatchError,
+        >,
+    > = None;
+    if matches!(initial_choice, GroupByDispatchChoice::Fused) {
+        // Build kernel-layer specs.
+        let kernel_specs: Vec<KAggSpec> = parsed
+            .aggs
+            .iter()
+            .map(|pa| match pa {
+                ParsedAgg::Simple {
+                    input_col,
+                    op,
+                    output_alias,
+                } => KAggSpec::Simple {
+                    input_col: input_col.clone(),
+                    op: convert_agg_op(*op),
+                    output_alias: output_alias.clone(),
+                },
+                ParsedAgg::Expression {
+                    expr,
+                    op,
+                    output_alias,
+                } => KAggSpec::Expression {
+                    expr: convert_agg_expr(expr),
+                    op: convert_agg_op(*op),
+                    output_alias: output_alias.clone(),
+                },
+                ParsedAgg::Length { output_alias } => KAggSpec::Length {
+                    output_alias: output_alias.clone(),
+                },
+            })
+            .collect();
 
-            // Materialize each referenced column as a typed ValueColumn.
-            let mut value_columns: HashMap<String, ValueColumn<'_>> = HashMap::new();
-            for (name, (dt_tag, data, valid)) in name_byte_refs.iter() {
-                let vcol = build_value_column(dt_tag, data, valid, n_rows).map_err(|e| {
-                    PyValueError::new_err(format!(
-                        "polars_metal: fused groupby — value column {name:?}: {e}"
-                    ))
-                })?;
-                value_columns.insert(name.clone(), vcol);
-            }
-
-            let cache = get_or_init_fused_cache(&device);
-            dispatch_groupby_fused(
-                &device,
-                &mut queue,
-                cache,
-                &key_cols,
-                &kernel_specs,
-                &value_columns,
-                n_rows,
-            )
-            .map_err(|e| {
-                PyValueError::new_err(format!("polars_metal: fused groupby dispatch: {e}"))
-            })?
+        // Materialize each referenced column as a typed ValueColumn.
+        let mut value_columns: HashMap<String, ValueColumn<'_>> = HashMap::new();
+        for (name, (dt_tag, data, valid)) in name_byte_refs.iter() {
+            let vcol = build_value_column(dt_tag, data, valid, n_rows).map_err(|e| {
+                PyValueError::new_err(format!(
+                    "polars_metal: fused groupby — value column {name:?}: {e}"
+                ))
+            })?;
+            value_columns.insert(name.clone(), vcol);
         }
-        GroupByDispatchChoice::PerAgg => {
-            // M2's per-agg path. Len uses a zero-length I64 placeholder; Simple
-            // looks up its single input column from `name_byte_refs`.
-            let empty_data: &[u8] = &[];
-            let empty_valid: &[u8] = &[];
-            // SAFETY: &[] cast to &[i64] is a zero-length slice — no pointer
-            // arithmetic occurs. The slice is valid and the pointer is
-            // non-null (a valid empty slice). This is the established
-            // pattern for zero-length typed slices in this codebase.
-            let empty_i64: &[i64] =
-                unsafe { std::slice::from_raw_parts(empty_data.as_ptr() as *const i64, 0) };
 
-            let mut agg_specs: Vec<(AggRequest, ValueColumn<'_>)> =
-                Vec::with_capacity(parsed.aggs.len());
-            for (i, agg) in parsed.aggs.iter().enumerate() {
-                match agg {
-                    ParsedAgg::Length { .. } => {
-                        agg_specs.push((
-                            AggRequest {
-                                kind: AggKind::Len,
-                                input_col_idx: i,
-                            },
-                            ValueColumn::I64 {
-                                data: empty_i64,
-                                valid: empty_valid,
-                            },
-                        ));
-                    }
-                    ParsedAgg::Simple { input_col, op, .. } => {
-                        let (dtype_tag, data, valid) =
-                            name_byte_refs.get(input_col).ok_or_else(|| {
-                                PyValueError::new_err(
-                                    "polars_metal: internal error: missing byte ref for Simple agg",
-                                )
-                            })?;
-                        let (kind, vcol) =
-                            build_agg_kind_and_vcol(*op, dtype_tag, data, valid, n_rows)?;
-                        agg_specs.push((
-                            AggRequest {
-                                kind,
-                                input_col_idx: i,
-                            },
-                            vcol,
-                        ));
-                    }
-                    ParsedAgg::Expression { .. } => {
-                        // Expression specs should never route here (the
-                        // router decides Fused above). Defensive guard.
-                        return Err(PyValueError::new_err(
+        let cache = get_or_init_fused_cache(&device);
+        fused_attempt = Some(dispatch_groupby_fused(
+            &device,
+            &mut queue,
+            cache,
+            &key_cols,
+            &kernel_specs,
+            &value_columns,
+            n_rows,
+        ));
+    }
+
+    // Decide which path's output to use:
+    //   - Fused attempt succeeded → use it directly.
+    //   - Fused attempt rejected with NgroupsExceedsFusedCap and we can
+    //     fall back to per-agg (query has no Expression aggs) → run per-agg.
+    //   - Fused attempt failed irrecoverably → surface the error.
+    //   - We never attempted fused (initial choice was PerAgg) → run per-agg.
+    let early_result: Option<polars_metal_kernels::groupby::GroupByResult> = match fused_attempt {
+        Some(Ok(r)) => Some(r),
+        Some(Err(polars_metal_kernels::groupby::FusedDispatchError::NgroupsExceedsFusedCap {
+            ..
+        })) if !has_expression => None,
+        Some(Err(e)) => {
+            return Err(PyValueError::new_err(format!(
+                "polars_metal: fused groupby dispatch: {e}"
+            )));
+        }
+        None => None,
+    };
+
+    let result = if let Some(r) = early_result {
+        r
+    } else {
+        // M2's per-agg path. Len uses a zero-length I64 placeholder; Simple
+        // looks up its single input column from `name_byte_refs`.
+        let empty_data: &[u8] = &[];
+        let empty_valid: &[u8] = &[];
+        // SAFETY: &[] cast to &[i64] is a zero-length slice — no pointer
+        // arithmetic occurs. The slice is valid and the pointer is
+        // non-null (a valid empty slice). This is the established
+        // pattern for zero-length typed slices in this codebase.
+        let empty_i64: &[i64] =
+            unsafe { std::slice::from_raw_parts(empty_data.as_ptr() as *const i64, 0) };
+
+        let mut agg_specs: Vec<(AggRequest, ValueColumn<'_>)> =
+            Vec::with_capacity(parsed.aggs.len());
+        for (i, agg) in parsed.aggs.iter().enumerate() {
+            match agg {
+                ParsedAgg::Length { .. } => {
+                    agg_specs.push((
+                        AggRequest {
+                            kind: AggKind::Len,
+                            input_col_idx: i,
+                        },
+                        ValueColumn::I64 {
+                            data: empty_i64,
+                            valid: empty_valid,
+                        },
+                    ));
+                }
+                ParsedAgg::Simple { input_col, op, .. } => {
+                    let (dtype_tag, data, valid) =
+                        name_byte_refs.get(input_col).ok_or_else(|| {
+                            PyValueError::new_err(
+                                "polars_metal: internal error: missing byte ref for Simple agg",
+                            )
+                        })?;
+                    let (kind, vcol) =
+                        build_agg_kind_and_vcol(*op, dtype_tag, data, valid, n_rows)?;
+                    agg_specs.push((
+                        AggRequest {
+                            kind,
+                            input_col_idx: i,
+                        },
+                        vcol,
+                    ));
+                }
+                ParsedAgg::Expression { .. } => {
+                    // Expression specs should never route here (the
+                    // router decides Fused above). Defensive guard.
+                    return Err(PyValueError::new_err(
                             "polars_metal: AggSpec::Expression routed to per-agg path; this is a routing bug",
                         ));
-                    }
                 }
             }
-
-            polars_metal_kernels::groupby::dispatch_groupby(
-                &device, &mut queue, &key_cols, &agg_specs, n_rows,
-            )
-            .map_err(groupby_err)?
         }
+
+        polars_metal_kernels::groupby::dispatch_groupby(
+            &device, &mut queue, &key_cols, &agg_specs, n_rows,
+        )
+        .map_err(groupby_err)?
     };
 
     // 7. Encode result as a list of (name, dtype_tag, data, valid) tuples.

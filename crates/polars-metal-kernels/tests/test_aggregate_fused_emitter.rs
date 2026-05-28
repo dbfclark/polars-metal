@@ -91,21 +91,27 @@ fn emitted_kernel_compiles() {
 }
 
 #[test]
-fn fused_sum_only_emits_one_atomic_per_row() {
-    // For `[Sum F32]`: the kernel must perform exactly one atomic update
-    // per row. F32 Sum uses a CAS loop on `atomic_uint` (one
-    // `atomic_compare_exchange_weak_explicit` per row of input under no
-    // contention; `atomic_fetch_add_explicit` is *not* valid for
-    // `atomic_float` at MTLComputePipelineState creation on Apple
-    // Silicon Metal 32023.883). Verify the kernel structure has exactly
-    // one CAS loop and no fetch-add primitives slipped in.
+fn fused_sum_emits_one_cas_per_tg_in_final_flush() {
+    // For `[Sum F32]`: the pre-reduce kernel performs at most ONE atomic
+    // update per (threadgroup, group) — in the final flush step, not
+    // per-row. That collapses the original O(n_rows) CAS contention to
+    // O(n_threadgroups * n_groups), which is the whole point of the
+    // pre-reduce rewrite (the per-row CAS was tripping the Metal GPU
+    // watchdog at 10M rows × 4 groups).
+    //
+    // Verify exactly one `atomic_compare_exchange_weak_explicit` site
+    // appears in the emitted source (the F32 Sum flush) and zero
+    // `atomic_fetch_add_explicit` (Sum doesn't use fetch_add anywhere).
     let specs = vec![simple("v", AggOp::Sum, "sum_v")];
     let dts = col_dtypes(&[("v", MetalDtype::F32)]);
     let sig = AggSignature::from_specs(&specs, &dts).expect("signature builds");
     let src = emit_msl(&sig, &specs);
     let cas = src.matches("atomic_compare_exchange_weak_explicit").count();
     let fetch_add = src.matches("atomic_fetch_add_explicit").count();
-    assert_eq!(cas, 1, "expected 1 CAS loop, got {cas}:\n{src}");
+    assert_eq!(
+        cas, 1,
+        "expected 1 CAS site (final flush), got {cas}:\n{src}"
+    );
     assert_eq!(
         fetch_add, 0,
         "expected 0 fetch_add (F32 Sum is CAS), got {fetch_add}:\n{src}"
@@ -157,9 +163,12 @@ fn fused_sum_mean_count_shares_load_once() {
     let dts = col_dtypes(&[("v", MetalDtype::F32)]);
     let sig = AggSignature::from_specs(&specs, &dts).expect("signature builds");
     let src = emit_msl(&sig, &specs);
-    let loads = src.matches("value_0[gid]").count();
+    // The pre-reduce kernel strides per-thread by `row` (not the global
+    // `gid`); each column slot must still emit exactly one shared load
+    // inside the per-row loop.
+    let loads = src.matches("value_0[row]").count();
     assert_eq!(
         loads, 1,
-        "expected exactly 1 shared load of value_0[gid], got {loads}:\n{src}"
+        "expected exactly 1 shared load of value_0[row], got {loads}:\n{src}"
     );
 }

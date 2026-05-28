@@ -629,7 +629,11 @@ proptest! {
     fn fused_eq_per_agg_sum_only(
         seed in any::<u64>(),
         n_rows in 100usize..5_000,
-        n_groups in 2u32..32,
+        // Cap at MAX_GROUPS=16 — the pre-reduce fused kernel rejects
+        // higher cardinality at dispatch (the caller falls back to the
+        // M2 per-agg path in production, but we want this proptest to
+        // exercise the fused dispatch directly).
+        n_groups in 2u32..=16,
         null_density in 0.0f32..1.0,
     ) {
         let _guard = lock_metal();
