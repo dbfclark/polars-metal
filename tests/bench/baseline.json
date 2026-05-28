@@ -40,43 +40,53 @@
       "_gate": {"ratio_lt": 3.5}
     },
     "tpch_q1_modified_32bit": {
-      "cpu_ms": 27.72,
-      "metal_ms": 27.86,
-      "ratio_metal_over_cpu": 1.005,
+      "cpu_ms": 28.33,
+      "metal_ms": 128.69,
+      "ratio_metal_over_cpu": 4.54,
       "n_rows": 10000000,
       "hardware": "M2 Ultra",
-      "_notes": "32-bit variant uses fused-agg path → tied with CPU. Bool keys + i32/f32 values let the fused kernel handle all 8 aggs in one MSL dispatch. Measured 2026-05-27, 35/36 rounds.",
-      "_gate": {"ratio_lt": 1.10}
+      "_notes": "Honest measurement after Phase 13 TG-pre-reduce kernel rewrite. The fused F32 kernel previously hit the Metal watchdog (kIOGPUCommandBufferCallbackErrorImpactingInteractivity) intermittently at low cardinality (CAS-loop contention is O(N²/2) at N=10M threads on 4 atomic slots). The new per-thread register pre-reduce → simdgroup_sum → TGSM staging → 1 device atomic per group per TG eliminates the watchdog. Reliable, but the per-thread overhead exceeds the benefit when contention isn't pathological: 128ms vs the 28ms claimed previously. The previous '1.005 tied' measurement was a flake — when the watchdog didn't fire, the original kernel ran fast; when it did, the test silently fell back. The honest baseline is 4.54× CPU. M2 Ultra GPU is bandwidth- and dispatch-overhead-bound on this workload. Measured 2026-05-27, 8 rounds.",
+      "_gate": {"ratio_lt": 5.0}
     },
     "tpch_q1_modified_32bit_high_card": {
       "cpu_ms": 68.56,
-      "metal_ms": 69.83,
-      "ratio_metal_over_cpu": 1.019,
+      "metal_ms": 420.0,
+      "ratio_metal_over_cpu": 6.20,
       "n_rows": 10000000,
       "n_groups_approx": 1024,
       "hardware": "M2 Ultra",
-      "_notes": "32-bit + ~1024 distinct groups. A1 (GPU build) saves ~100ms vs CPU HashMap at this cardinality per microbench, but encode_keys + per-query overhead eats the win → tied with CPU at the engine level. Earlier reported 'Metal 18% faster' was CPU-vs-CPU noise (walker had fallen back at Sort). Measured 2026-05-27 with walker engagement confirmed, 14/15 rounds.",
-      "_gate": {"ratio_lt": 1.10}
+      "_notes": "Honest measurement after Phase 13. 1024 groups > MAX_GROUPS=16 so falls through to the per-agg path; per-agg also uses the new pre-reduce standalone kernel internally. Original '1.019' was masked by intermittent watchdog firings. Measured 2026-05-27.",
+      "_gate": {"ratio_lt": 7.0}
     },
     "tpch_q1_canonical": {
-      "cpu_ms": 60.76,
-      "metal_ms": 61.06,
-      "ratio_metal_over_cpu": 1.005,
+      "cpu_ms": 63.34,
+      "metal_ms": 526.5,
+      "ratio_metal_over_cpu": 8.31,
       "n_rows": 10000000,
       "n_groups": 6,
       "hardware": "M2 Ultra",
-      "_notes": "TPC-H Q1's canonical schema: Utf8 keys (3 returnflags × 2 linestatuses = 6 unique combos) + F64 numerics + expression aggs (l_extendedprice * (1 - l_discount) etc.). Expression aggs route through fused-agg → tied with CPU. Phase 7 (Utf8 dtype) + Phase 10 (walker engagement) + the agg-kernel fix together let this query route end-to-end through Metal at performance parity with CPU. Real Metal-vs-CPU measurement; 14/17 rounds, 2026-05-27.",
-      "_gate": {"ratio_lt": 1.10}
+      "_notes": "Honest measurement after Phase 13. Walker now actually engages Metal for canonical Q1 (Date predicate widening + HStack walker support + Utf8-Filter guard removal). Previous '1.005 tied' was CPU-vs-CPU noise — walker fell back at the Date filter, so Metal was a no-op. Current path: Date+I32 predicates on Metal → Polars-CPU filter via _filter_via_polars → HStack CSE columns materialized via Polars → GroupBy via PerAgg (F64-Expression rewritten as Simple via Polars eval). Bottleneck is the per-agg loop: 8 separate Metal kernels × ~50ms dispatch. Closing this needs a fused F64 multi-agg kernel (toolchain blocker: no 64-bit atomics on Apple Silicon). Measured 2026-05-27, 5 rounds.",
+      "_gate": {"ratio_lt": 10.0}
+    },
+    "tpch_q1_canonical_f32": {
+      "cpu_ms": 57.41,
+      "metal_ms": 589.0,
+      "ratio_metal_over_cpu": 10.26,
+      "n_rows": 10000000,
+      "n_groups": 6,
+      "hardware": "M2 Ultra",
+      "_notes": "Phase 13 architectural-reading bench. Same shape as tpch_q1_canonical but F32 numerics — supposed to demonstrate 'what the chip can do with the right primitives' since Metal has F32 atomic primitives but not F64. Result: 10.26× CPU. The thesis fails — even with hand-tuned register pre-reduce kernels, M2 Ultra GPU loses to its own CPU on TPC-H Q1. Apple Silicon's unified memory removes the discrete-GPU copy-cost advantage; CPU SIMD + cache hierarchy + Polars tuning dominate the bandwidth-limited scan. Note: previous similar measurements on F64 canonical claimed 'Metal 3% faster' — they were artifacts of walker-fallback measuring CPU-vs-CPU. Measured 2026-05-27, 5 rounds.",
+      "_gate": {"ratio_lt": 12.0}
     },
     "tpch_q1_100m_canonical": {
-      "cpu_ms": 489.47,
-      "metal_ms": 473.33,
-      "ratio_metal_over_cpu": 0.967,
+      "cpu_ms": 682.0,
+      "metal_ms": 6020.0,
+      "ratio_metal_over_cpu": 8.83,
       "n_rows": 100000000,
       "n_groups": 6,
       "hardware": "M2 Ultra (128GB)",
-      "_notes": "Phase 14 — 100M-row scale validation. The canonical Q1 was tied at 10M (1.005); at 100M Metal pulls 3% ahead of CPU as fixed-overhead (encode_keys ~80ms, FFI marshalling ~50ms, A1 build ~150ms) amortizes over 10× the rows. This is the first clean engine-level Metal win on a real TPC-H workload. Phase 3 fused-agg + Phase 4.5 A1 carry the win; canonical schema = Utf8 keys + F64 expression aggs lands in the fused-agg path. Measured 2026-05-27, 5 rounds.",
-      "_gate": {"ratio_lt": 1.0}
+      "_notes": "Honest measurement after Phase 13 walker fixes. Previous '0.967 — first clean engine-level Metal win' was CPU-vs-CPU noise (walker fell back at the Date filter; Metal never engaged). Reality at 100M: 8.83× slower than CPU. Same bottleneck as 10M canonical — F64-Expression aggs route via PerAgg path with 8 separate Metal kernel dispatches. The 100M scale doesn't help because the bottleneck is per-agg launch overhead, not bandwidth. Measured 2026-05-27, 3 rounds.",
+      "_gate": {"ratio_lt": 10.0}
     },
     "tpch_q1_100m_bool": {
       "cpu_ms": 401.48,
@@ -86,6 +96,26 @@
       "hardware": "M2 Ultra (128GB)",
       "_notes": "Phase 14 — 100M-row scale, M2 schema (Bool keys + i64+f64 values + Simple Sum aggs → PerAgg). Same shape as tpch_q1_modified at 10M (2.83x); ratio holds at 2.42x at 100M. The per-agg path remains the dominant engine-level bottleneck for 64-bit-value workloads. Measured 2026-05-27, 5 rounds.",
       "_gate": {"ratio_lt": 3.0}
+    },
+    "tpch_q6": {
+      "cpu_ms": 9.27,
+      "metal_ms": 123.23,
+      "ratio_metal_over_cpu": 13.35,
+      "n_rows": 10000000,
+      "n_groups": 1,
+      "hardware": "M2 Ultra",
+      "_notes": "Phase 13 — TPC-H Q6 routes through Metal end-to-end via the empty-keys (single-group reduction) walker path. Filter (4 cmp + 4 AND on Date + I32 + F32 widened to I64/F64) runs on Metal via _filter_via_polars; Expression a*b materialized via Polars CPU; single-group sum runs CPU (the kernel-side empty-keys path was watchdogging at single-slot CAS contention). Bottleneck is the 8 filter kernel dispatches × ~15ms each. Predicate fusion (one MSL kernel that walks the AST inline) would cut ~70ms; queued for M4. Measured 2026-05-27, 9 rounds.",
+      "_gate": {"ratio_lt": 16.0}
+    },
+    "tpch_q6_f32": {
+      "cpu_ms": 7.03,
+      "metal_ms": 137.24,
+      "ratio_metal_over_cpu": 19.56,
+      "n_rows": 10000000,
+      "n_groups": 1,
+      "hardware": "M2 Ultra",
+      "_notes": "F32 variant of Q6 — architectural-reading. Same shape as F64 but F32 numerics. Slightly worse ratio than F64 because CPU is even faster on F32 (more SIMD lanes), while Metal pays the same dispatch overhead. Measured 2026-05-27, 8 rounds.",
+      "_gate": {"ratio_lt": 22.0}
     }
   }
 }
