@@ -84,4 +84,25 @@ void mlx_array_copy_to_f32(
 // cxx converts that to a Rust error.
 void mlx_array_eval_one(const std::shared_ptr<MlxArray>& arr);
 
+// ── Zero-copy MTLBuffer view (Task 5) ────────────────────────────────────────
+//
+// Construct an MLX array that views an existing Metal buffer without copying.
+//
+// `mtl_buffer_ptr` is a `MTL::Buffer*` cast to `const uint8_t*` (the Rust
+// side passes it as `*const u8` because cxx maps that cleanly; the C++ side
+// immediately casts it back to `const void*` and then to `MTL::Buffer*` for
+// use in mlx::core::allocator::Buffer).
+//
+// `shape` describes the array dimensions (product must match element count).
+// `dtype` is the MlxDtype tag: 0=float32, 1=float64, 2=int32, 3=bool_.
+//
+// MLX is given a no-op Deleter so it never frees the buffer; lifetime is
+// enforced on the Rust side by `MlxArrayHandle::_input_refs`.
+//
+// Throws std::invalid_argument for unknown dtype tags (cxx converts to Err).
+std::shared_ptr<MlxArray> mlx_array_view_mtl_buffer(
+    const uint8_t* mtl_buffer_ptr,
+    rust::Slice<const int64_t> shape,
+    uint32_t dtype);
+
 }  // namespace polars_metal_mlx

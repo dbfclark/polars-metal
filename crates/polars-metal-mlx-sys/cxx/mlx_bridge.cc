@@ -1,5 +1,6 @@
 // crates/polars-metal-mlx-sys/cxx/mlx_bridge.cc
 #include "mlx_bridge.h"
+#include "mlx/allocator.h"
 #include "mlx/array.h"
 #include "mlx/device.h"
 #include "mlx/ops.h"
@@ -132,6 +133,64 @@ void mlx_array_eval_one(const std::shared_ptr<MlxArray>& arr) {
     // MlxArray publicly inherits from mlx::core::array.
     mlx::core::array& base = static_cast<mlx::core::array&>(*arr);
     mlx::core::eval(base);
+}
+
+// ── Zero-copy MTLBuffer view (Task 5) ────────────────────────────────────────
+
+std::shared_ptr<MlxArray> mlx_array_view_mtl_buffer(
+    const uint8_t* mtl_buffer_ptr,
+    rust::Slice<const int64_t> shape,
+    uint32_t dtype)
+{
+    // Convert shape from rust::Slice<const int64_t> to std::vector<int32_t>
+    // (mlx::core::Shape = std::vector<ShapeElem> = std::vector<int32_t>).
+    std::vector<int32_t> shape_vec;
+    shape_vec.reserve(shape.size());
+    for (auto d : shape) {
+        shape_vec.push_back(static_cast<int32_t>(d));
+    }
+
+    // Wrap the MTL::Buffer* into mlx::core::allocator::Buffer.
+    // The Rust side passes the ObjC instance pointer (same as MTL::Buffer*)
+    // as *const uint8_t. We cast const away because allocator::Buffer stores
+    // a non-const void*; MLX treats the data as logically immutable for a
+    // view constructed this way (we never write through this pointer from
+    // the MLX side — it was created from a read-only Rust &[f32]).
+    mlx::core::allocator::Buffer mlx_buf(
+        const_cast<void*>(static_cast<const void*>(mtl_buffer_ptr)));
+
+    // No-op Deleter: Rust owns the MetalBuffer lifetime. MLX will call this
+    // function when it decides to release the backing buffer; the empty body
+    // ensures it does nothing and leaves the MTLBuffer untouched.
+    mlx::core::Deleter no_op_deleter = [](mlx::core::allocator::Buffer) {};
+
+    // Map the dtype tag to mlx::core::Dtype.
+    // MLX 0.22.0 has no float64; tag 1 throws rather than silently mapping
+    // to a wrong type.  Tags: 0=float32, 1=float64 (unsupported), 2=int32,
+    // 3=bool_.
+    mlx::core::Dtype dt = mlx::core::float32; // initialise to satisfy compiler
+    switch (dtype) {
+        case 0: dt = mlx::core::float32; break;
+        case 1:
+            throw std::invalid_argument(
+                "mlx_array_view_mtl_buffer: float64 is not supported by "
+                "MLX 0.22.0; use float32");
+        case 2: dt = mlx::core::int32;   break;
+        case 3: dt = mlx::core::bool_;   break;
+        default:
+            throw std::invalid_argument(
+                "mlx_array_view_mtl_buffer: unknown dtype tag");
+    }
+
+    // Construct via the buffer-accepting array constructor:
+    //   explicit array(allocator::Buffer data, Shape shape, Dtype dtype,
+    //                  Deleter deleter = allocator::free);
+    // (see vendor/mlx/mlx/array.h ~line 60).
+    // Use the aliasing shared_ptr constructor to upcast mlx::core::array* to
+    // MlxArray* — same pattern as mlx_array_from_f32_data.
+    auto base = std::make_shared<mlx::core::array>(
+        mlx_buf, std::move(shape_vec), dt, no_op_deleter);
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
 }
 
 }  // namespace polars_metal_mlx

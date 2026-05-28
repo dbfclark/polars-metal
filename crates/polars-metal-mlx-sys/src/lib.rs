@@ -67,6 +67,27 @@ mod ffi {
         // Force evaluation (materialize) of a single array. Wraps
         // `mlx::core::eval(*arr)`. Returns Err on any MLX exception.
         fn mlx_array_eval_one(arr: &SharedPtr<MlxArray>) -> Result<()>;
+
+        // Construct a zero-copy view of an existing MTL::Buffer as an MLX array.
+        //
+        // `mtl_ptr` must be a valid `MTL::Buffer*` cast to `*const u8` (cxx maps
+        // `*const u8` cleanly; we use it as an opaque pointer carrier — the C++
+        // side casts it back to `const void*` before wrapping in
+        // `mlx::core::allocator::Buffer`).  `shape` specifies the array
+        // dimensions; their product must equal the element count implied by the
+        // buffer's byte length and `dtype`. `dtype` is the `MlxDtype` tag cast to
+        // `u32` (0=F32, 1=F64, 2=I32, 3=Bool).
+        //
+        // MLX is given a no-op Deleter so it never tries to free the buffer; the
+        // Rust side (via `_input_refs` in `MlxArrayHandle`) holds the keep-alive.
+        //
+        // SAFETY: `mtl_ptr` must remain valid for the lifetime of every
+        // `MlxArrayHandle` that was built from it (enforced by `_input_refs`).
+        unsafe fn mlx_array_view_mtl_buffer(
+            mtl_ptr: *const u8,
+            shape: &[i64],
+            dtype: u32,
+        ) -> SharedPtr<MlxArray>;
     }
 }
 

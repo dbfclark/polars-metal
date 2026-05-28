@@ -17,6 +17,7 @@ path = "src/lib.rs"
 [dependencies]
 cxx = "1"
 thiserror = "1"
+polars-metal-buffer = { path = "../polars-metal-buffer" }
 
 [build-dependencies]
 cxx-build = "1"

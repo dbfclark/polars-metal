@@ -286,6 +286,49 @@ impl MetalBuffer {
         })
     }
 
+    /// Construct a `MetalBuffer` from an `f32` slice.
+    ///
+    /// The input values are copied into a new Metal allocation via
+    /// [`MetalDevice::new_buffer_from_bytes`]. This is the standard way to
+    /// stage F32 host data for use as an MLX array input.
+    ///
+    /// Returns `BufferError::AllocationFailed` when `data` is empty (Metal
+    /// rejects zero-byte allocations) or when Metal otherwise refuses the
+    /// allocation.
+    pub fn from_f32_slice(device: &MetalDevice, data: &[f32]) -> Result<Self, BufferError> {
+        // SAFETY: Reinterpreting &[f32] as &[u8] is valid. f32 has no padding,
+        // alignment of [u8] (1) is ≤ alignment of [f32] (4), and the resulting
+        // byte length (data.len() * 4) is exact. This is a read-only view with
+        // lifetime bounded by `data`.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
+        };
+        device.new_buffer_from_bytes(bytes)
+    }
+
+    /// Return a raw ObjC pointer to the underlying `MTL::Buffer` object.
+    ///
+    /// This is the address that metal-cpp sees as `MTL::Buffer*`. The caller
+    /// can pass it to C++ code that wraps it in `mlx::core::allocator::Buffer`
+    /// for zero-copy MLX array construction.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer is valid as long as `self` is alive. The caller
+    /// is responsible for ensuring that any C++ use of the pointer (including
+    /// MLX operations that retain it) is completed before `self` drops. When
+    /// used with `mlx_array_view_metal_buffer`, the `Arc<MetalBuffer>` stored
+    /// inside `MlxArrayHandle::_input_refs` enforces this invariant.
+    pub fn as_mtl_buffer_raw_ptr(&self) -> *const std::ffi::c_void {
+        // SAFETY: `self.inner` is a `Retained<ProtocolObject<dyn MTLBuffer>>`.
+        // A reference to `ProtocolObject<dyn MTLBuffer>` IS the ObjC instance
+        // pointer — the ProtocolObject wrapper is a zero-sized newtype around the
+        // ObjC `id`. Taking a reference and casting it through `*const _` gives
+        // the same address that metal-cpp would see as `MTL::Buffer*`.
+        let proto_ref: &ProtocolObject<dyn MTLBuffer> = &self.inner;
+        proto_ref as *const ProtocolObject<dyn MTLBuffer> as *const std::ffi::c_void
+    }
+
     /// View the buffer's contents as a byte slice.
     ///
     /// Valid as long as `self` is alive and no GPU writes are in-flight.
