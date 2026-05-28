@@ -37,6 +37,9 @@ use crate::ffi;
 #[repr(u32)]
 pub enum MlxDtype {
     F32 = 0,
+    /// Not supported in MLX 0.22.0; returns `Err(FfiError::Runtime)` if
+    /// passed to `mlx_array_view_metal_buffer`. Kept for forward compatibility
+    /// when MLX gains F64 support.
     F64 = 1,
     I32 = 2,
     Bool = 3,
@@ -66,7 +69,7 @@ pub struct MlxArrayHandle {
     pub(crate) ptr: SharedPtr<ffi::MlxArray>,
     /// Keep-alives for any `MetalBuffer`s this handle views into (zero-copy
     /// path). Empty for copy-path handles. Cloning shares the Arcs.
-    _input_refs: Vec<Arc<MetalBuffer>>,
+    pub(crate) _input_refs: Vec<Arc<MetalBuffer>>,
 }
 
 impl MlxArrayHandle {
@@ -165,22 +168,32 @@ pub fn mlx_array_to_f32_vec(handle: &MlxArrayHandle) -> Result<Vec<f32>, FfiErro
 /// alive at least as long as the returned handle (and any clones of it).
 ///
 /// `shape` must be consistent with the element count implied by
-/// `buf.len() / dtype.element_size()`. This is not checked here; an
-/// inconsistency would produce undefined behaviour on the C++ side.
+/// `buf.len() / dtype.element_size()`. A `debug_assert_eq!` enforces this in
+/// debug builds; release builds do not check (zero-cost).
 ///
 /// # Errors
+/// Returns `FfiError::Runtime` if the C++ side throws (e.g. unknown `dtype`
+/// tag causes `std::invalid_argument`; cxx propagates the throw as `Err`).
 /// Returns `FfiError::ConstructionFailed` if the C++ bridge returns a null
-/// `SharedPtr`, which happens when an unknown `dtype` tag is passed (throws
-/// `std::invalid_argument` on the C++ side, which cxx converts to an error).
+/// `SharedPtr` without throwing (belt-and-braces; should not occur in practice).
 pub fn mlx_array_view_metal_buffer(
     buf: Arc<MetalBuffer>,
     shape: &[i64],
     dtype: MlxDtype,
 ) -> Result<MlxArrayHandle, FfiError> {
+    let expected_bytes: usize = shape.iter().product::<i64>() as usize * dtype.element_size();
+    debug_assert_eq!(
+        buf.len(),
+        expected_bytes,
+        "MetalBuffer len ({}) != shape.product ({}) * dtype.element_size ({})",
+        buf.len(),
+        shape.iter().product::<i64>(),
+        dtype.element_size(),
+    );
+
     // Obtain a thin ObjC pointer to the MTL::Buffer object.  This is the same
-    // address that metal-cpp uses as `MTL::Buffer*`.  The cast is safe because
-    // `ProtocolObject<dyn MTLBuffer>` is a zero-sized newtype around the ObjC
-    // `id`; a reference to it IS the instance pointer.
+    // address that metal-cpp uses as `MTL::Buffer*`.  See the SAFETY comment on
+    // `MetalBuffer::as_mtl_buffer_raw_ptr` for why the pointer is valid.
     let mtl_ptr = buf.as_mtl_buffer_raw_ptr() as *const u8;
 
     // SAFETY:
@@ -188,7 +201,8 @@ pub fn mlx_array_view_metal_buffer(
     // - `shape` is a valid slice for the duration of the call.
     // - The C++ side uses a no-op Deleter, so it never calls free on this ptr.
     // - `buf` is stored in `_input_refs` below so the buffer outlives the handle.
-    let handle = unsafe { ffi::mlx_array_view_mtl_buffer(mtl_ptr, shape, dtype as u32) };
+    let handle = unsafe { ffi::mlx_array_view_mtl_buffer(mtl_ptr, shape, dtype as u32) }
+        .map_err(FfiError::from)?;
     if handle.is_null() {
         return Err(FfiError::ConstructionFailed);
     }

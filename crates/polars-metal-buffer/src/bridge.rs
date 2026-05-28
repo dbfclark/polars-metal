@@ -320,11 +320,15 @@ impl MetalBuffer {
     /// used with `mlx_array_view_metal_buffer`, the `Arc<MetalBuffer>` stored
     /// inside `MlxArrayHandle::_input_refs` enforces this invariant.
     pub fn as_mtl_buffer_raw_ptr(&self) -> *const std::ffi::c_void {
-        // SAFETY: `self.inner` is a `Retained<ProtocolObject<dyn MTLBuffer>>`.
-        // A reference to `ProtocolObject<dyn MTLBuffer>` IS the ObjC instance
-        // pointer — the ProtocolObject wrapper is a zero-sized newtype around the
-        // ObjC `id`. Taking a reference and casting it through `*const _` gives
-        // the same address that metal-cpp would see as `MTL::Buffer*`.
+        // SAFETY: `Retained<ProtocolObject<dyn MTLBuffer>>` internally holds a
+        // `NonNull<ProtocolObject<...>>` pointing at the underlying ObjC instance.
+        // Calling `Deref` on the `Retained` (i.e. `&self.inner`) materializes a
+        // reference at that instance address — NOT at the stack address of the
+        // Retained struct itself. The subsequent cast to `*const c_void` hands
+        // back the same ObjC `id` pointer that metal-cpp sees as `MTL::Buffer*`,
+        // so the C++ side's `static_cast<MTL::Buffer*>` recovers a valid object
+        // reference. Caller must ensure `self` outlives any use of the returned
+        // pointer.
         let proto_ref: &ProtocolObject<dyn MTLBuffer> = &self.inner;
         proto_ref as *const ProtocolObject<dyn MTLBuffer> as *const std::ffi::c_void
     }

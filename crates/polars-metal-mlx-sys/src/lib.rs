@@ -87,7 +87,7 @@ mod ffi {
             mtl_ptr: *const u8,
             shape: &[i64],
             dtype: u32,
-        ) -> SharedPtr<MlxArray>;
+        ) -> Result<SharedPtr<MlxArray>>;
     }
 }
 
