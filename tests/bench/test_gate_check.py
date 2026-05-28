@@ -84,3 +84,18 @@ def test_check_reports_all_failures_in_one_pass():
     assert "q_a" in names
     assert "q_b" in names
     assert "q_c_ok" not in names
+
+
+def test_pending_entry_with_failing_ratio_is_skipped():
+    """A _pending=true entry, even one whose ratio would fail a gate, is skipped."""
+    baseline = _baseline_with(
+        {
+            "phase8_placeholder": {
+                "ratio_metal_over_cpu": 5.0,  # would fail any reasonable gate
+                "_gate": {"ratio_lt": 1.0},
+                "_pending": True,
+            },
+        }
+    )
+    failures = check_baseline(baseline)
+    assert failures == []

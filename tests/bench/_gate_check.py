@@ -27,6 +27,8 @@ def check_baseline(baseline: dict[str, Any]) -> list[str]:
     for name, entry in queries.items():
         if not isinstance(entry, dict):
             continue
+        if entry.get("_pending"):
+            continue
         gate = entry.get("_gate")
         if gate is None:
             continue

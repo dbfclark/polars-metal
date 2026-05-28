@@ -1,6 +1,6 @@
 {
   "_units": "median wall-clock in milliseconds from pytest-benchmark default config (warmup absorbed)",
-  "_notes": "Post-T30 Step 3 baseline. The cumsum FFI in `crates/polars-metal-mlx-sys` now passes input/output as `rust::Slice` (thin pointer+length) instead of per-element `cxx::CxxVector` push/iter loops. With 10M-row inputs the Rust-side push of 10M u8s plus the iter-copy of 10M u32s was costing ~40ms per call on its own; eliminating those loops drops filter_simple from 117.2ms to 77.8ms (-34%) and brings the Metal/CPU ratio for filter_simple under 9x for the first time. The internal MLX `array(ptr, shape, dtype)` constructor still copies bytes into MLX-managed memory and we memcpy the scan result back into the caller's slice — those two memcpys are the only data-touching passes left in the cumsum call. Pushing the FFI cost lower than this requires the M2 MLX-over-MTLBuffer rewrite tracked in docs/open-questions.md.",
+  "_notes": "Post-T30 Step 3 baseline. The cumsum FFI in `crates/polars-metal-mlx-sys` now passes input/output as `rust::Slice` (thin pointer+length) instead of per-element `cxx::CxxVector` push/iter loops. With 10M-row inputs the Rust-side push of 10M u8s plus the iter-copy of 10M u32s was costing ~40ms per call on its own; eliminating those loops drops filter_simple from 117.2ms to 77.8ms (-34%) and brings the Metal/CPU ratio for filter_simple under 9x for the first time. The internal MLX `array(ptr, shape, dtype)` constructor still copies bytes into MLX-managed memory and we memcpy the scan result back into the caller's slice \u2014 those two memcpys are the only data-touching passes left in the cumsum call. Pushing the FFI cost lower than this requires the M2 MLX-over-MTLBuffer rewrite tracked in docs/open-questions.md.",
   "machine": "Apple M2 Ultra",
   "git_sha": "67f4f85a0eab551691f6463a5ef9b3f792f6d246",
   "date": "2026-05-26",
@@ -18,7 +18,7 @@
     "filter_then_project": {
       "cpu_ms": 11.554,
       "metal_ms": 100.542,
-      "ratio_metal_over_cpu": 8.70
+      "ratio_metal_over_cpu": 8.7
     },
     "filter_then_project_high_selectivity": {
       "cpu_ms": 2.933,
@@ -26,7 +26,7 @@
       "ratio_metal_over_cpu": 17.65
     },
     "filter_then_project_low_selectivity": {
-      "cpu_ms": 15.250,
+      "cpu_ms": 15.25,
       "metal_ms": 80.288,
       "ratio_metal_over_cpu": 5.27
     },
@@ -36,8 +36,10 @@
       "ratio_metal_over_cpu": 2.83,
       "n_rows": 10000000,
       "hardware": "M2 Ultra",
-      "_notes": "Real Metal-vs-CPU measurement after the Phase 10 diagnosis cascade: walker handles Sort + Filter→GroupBy dispatch fix + agg-kernel thread-local-reduce + dispatch_hash dead-call removal + parallel encode_keys + Polars-CPU filter bypass for the GroupBy(Filter(...)) shape. Down from 326ms (8.55x slower than CPU) to 123ms (2.83x slower). Remaining cost breakdown at 10M rows × 4 groups: A1 GPU build ~43ms (dominant), 8 agg dispatches ~22ms (fast now), encode_keys ~8ms (parallelized), Python↔Rust marshalling ~50ms. Closing the last 2x gap needs orchestrator-level work (fuse 64-bit per-agg into a single kernel, reduce FFI marshalling); diminishing returns from individual kernel tuning. Measured 2026-05-27, 18/5 rounds.",
-      "_gate": {"ratio_lt": 3.5}
+      "_notes": "Real Metal-vs-CPU measurement after the Phase 10 diagnosis cascade: walker handles Sort + Filter\u2192GroupBy dispatch fix + agg-kernel thread-local-reduce + dispatch_hash dead-call removal + parallel encode_keys + Polars-CPU filter bypass for the GroupBy(Filter(...)) shape. Down from 326ms (8.55x slower than CPU) to 123ms (2.83x slower). Remaining cost breakdown at 10M rows \u00d7 4 groups: A1 GPU build ~43ms (dominant), 8 agg dispatches ~22ms (fast now), encode_keys ~8ms (parallelized), Python\u2194Rust marshalling ~50ms. Closing the last 2x gap needs orchestrator-level work (fuse 64-bit per-agg into a single kernel, reduce FFI marshalling); diminishing returns from individual kernel tuning. Measured 2026-05-27, 18/5 rounds.",
+      "_gate": {
+        "ratio_lt": 3.5
+      }
     },
     "tpch_q1_modified_32bit": {
       "cpu_ms": 28.33,
@@ -45,18 +47,22 @@
       "ratio_metal_over_cpu": 4.54,
       "n_rows": 10000000,
       "hardware": "M2 Ultra",
-      "_notes": "Honest measurement after Phase 13 TG-pre-reduce kernel rewrite. The fused F32 kernel previously hit the Metal watchdog (kIOGPUCommandBufferCallbackErrorImpactingInteractivity) intermittently at low cardinality (CAS-loop contention is O(N²/2) at N=10M threads on 4 atomic slots). The new per-thread register pre-reduce → simdgroup_sum → TGSM staging → 1 device atomic per group per TG eliminates the watchdog. Reliable, but the per-thread overhead exceeds the benefit when contention isn't pathological: 128ms vs the 28ms claimed previously. The previous '1.005 tied' measurement was a flake — when the watchdog didn't fire, the original kernel ran fast; when it did, the test silently fell back. The honest baseline is 4.54× CPU. M2 Ultra GPU is bandwidth- and dispatch-overhead-bound on this workload. Measured 2026-05-27, 8 rounds.",
-      "_gate": {"ratio_lt": 5.0}
+      "_notes": "Honest measurement after Phase 13 TG-pre-reduce kernel rewrite. The fused F32 kernel previously hit the Metal watchdog (kIOGPUCommandBufferCallbackErrorImpactingInteractivity) intermittently at low cardinality (CAS-loop contention is O(N\u00b2/2) at N=10M threads on 4 atomic slots). The new per-thread register pre-reduce \u2192 simdgroup_sum \u2192 TGSM staging \u2192 1 device atomic per group per TG eliminates the watchdog. Reliable, but the per-thread overhead exceeds the benefit when contention isn't pathological: 128ms vs the 28ms claimed previously. The previous '1.005 tied' measurement was a flake \u2014 when the watchdog didn't fire, the original kernel ran fast; when it did, the test silently fell back. The honest baseline is 4.54\u00d7 CPU. M2 Ultra GPU is bandwidth- and dispatch-overhead-bound on this workload. Measured 2026-05-27, 8 rounds.",
+      "_gate": {
+        "ratio_lt": 5.0
+      }
     },
     "tpch_q1_modified_32bit_high_card": {
       "cpu_ms": 68.56,
       "metal_ms": 420.0,
-      "ratio_metal_over_cpu": 6.20,
+      "ratio_metal_over_cpu": 6.2,
       "n_rows": 10000000,
       "n_groups_approx": 1024,
       "hardware": "M2 Ultra",
       "_notes": "Honest measurement after Phase 13. 1024 groups > MAX_GROUPS=16 so falls through to the per-agg path; per-agg also uses the new pre-reduce standalone kernel internally. Original '1.019' was masked by intermittent watchdog firings. Measured 2026-05-27.",
-      "_gate": {"ratio_lt": 7.0}
+      "_gate": {
+        "ratio_lt": 7.0
+      }
     },
     "tpch_q1_canonical": {
       "cpu_ms": 63.34,
@@ -65,8 +71,10 @@
       "n_rows": 10000000,
       "n_groups": 6,
       "hardware": "M2 Ultra",
-      "_notes": "Honest measurement after Phase 13. Walker now actually engages Metal for canonical Q1 (Date predicate widening + HStack walker support + Utf8-Filter guard removal). Previous '1.005 tied' was CPU-vs-CPU noise — walker fell back at the Date filter, so Metal was a no-op. Current path: Date+I32 predicates on Metal → Polars-CPU filter via _filter_via_polars → HStack CSE columns materialized via Polars → GroupBy via PerAgg (F64-Expression rewritten as Simple via Polars eval). Bottleneck is the per-agg loop: 8 separate Metal kernels × ~50ms dispatch. Closing this needs a fused F64 multi-agg kernel (toolchain blocker: no 64-bit atomics on Apple Silicon). Measured 2026-05-27, 5 rounds.",
-      "_gate": {"ratio_lt": 10.0}
+      "_notes": "Honest measurement after Phase 13. Walker now actually engages Metal for canonical Q1 (Date predicate widening + HStack walker support + Utf8-Filter guard removal). Previous '1.005 tied' was CPU-vs-CPU noise \u2014 walker fell back at the Date filter, so Metal was a no-op. Current path: Date+I32 predicates on Metal \u2192 Polars-CPU filter via _filter_via_polars \u2192 HStack CSE columns materialized via Polars \u2192 GroupBy via PerAgg (F64-Expression rewritten as Simple via Polars eval). Bottleneck is the per-agg loop: 8 separate Metal kernels \u00d7 ~50ms dispatch. Closing this needs a fused F64 multi-agg kernel (toolchain blocker: no 64-bit atomics on Apple Silicon). Measured 2026-05-27, 5 rounds.",
+      "_gate": {
+        "ratio_lt": 10.0
+      }
     },
     "tpch_q1_canonical_f32": {
       "cpu_ms": 57.41,
@@ -75,8 +83,10 @@
       "n_rows": 10000000,
       "n_groups": 6,
       "hardware": "M2 Ultra",
-      "_notes": "Phase 13 architectural-reading bench. Same shape as tpch_q1_canonical but F32 numerics — supposed to demonstrate 'what the chip can do with the right primitives' since Metal has F32 atomic primitives but not F64. Result: 10.26× CPU. The thesis fails — even with hand-tuned register pre-reduce kernels, M2 Ultra GPU loses to its own CPU on TPC-H Q1. Apple Silicon's unified memory removes the discrete-GPU copy-cost advantage; CPU SIMD + cache hierarchy + Polars tuning dominate the bandwidth-limited scan. Note: previous similar measurements on F64 canonical claimed 'Metal 3% faster' — they were artifacts of walker-fallback measuring CPU-vs-CPU. Measured 2026-05-27, 5 rounds.",
-      "_gate": {"ratio_lt": 12.0}
+      "_notes": "Phase 13 architectural-reading bench. Same shape as tpch_q1_canonical but F32 numerics \u2014 supposed to demonstrate 'what the chip can do with the right primitives' since Metal has F32 atomic primitives but not F64. Result: 10.26\u00d7 CPU. The thesis fails \u2014 even with hand-tuned register pre-reduce kernels, M2 Ultra GPU loses to its own CPU on TPC-H Q1. Apple Silicon's unified memory removes the discrete-GPU copy-cost advantage; CPU SIMD + cache hierarchy + Polars tuning dominate the bandwidth-limited scan. Note: previous similar measurements on F64 canonical claimed 'Metal 3% faster' \u2014 they were artifacts of walker-fallback measuring CPU-vs-CPU. Measured 2026-05-27, 5 rounds.",
+      "_gate": {
+        "ratio_lt": 12.0
+      }
     },
     "tpch_q1_100m_canonical": {
       "cpu_ms": 682.0,
@@ -85,8 +95,10 @@
       "n_rows": 100000000,
       "n_groups": 6,
       "hardware": "M2 Ultra (128GB)",
-      "_notes": "Honest measurement after Phase 13 walker fixes. Previous '0.967 — first clean engine-level Metal win' was CPU-vs-CPU noise (walker fell back at the Date filter; Metal never engaged). Reality at 100M: 8.83× slower than CPU. Same bottleneck as 10M canonical — F64-Expression aggs route via PerAgg path with 8 separate Metal kernel dispatches. The 100M scale doesn't help because the bottleneck is per-agg launch overhead, not bandwidth. Measured 2026-05-27, 3 rounds.",
-      "_gate": {"ratio_lt": 10.0}
+      "_notes": "Honest measurement after Phase 13 walker fixes. Previous '0.967 \u2014 first clean engine-level Metal win' was CPU-vs-CPU noise (walker fell back at the Date filter; Metal never engaged). Reality at 100M: 8.83\u00d7 slower than CPU. Same bottleneck as 10M canonical \u2014 F64-Expression aggs route via PerAgg path with 8 separate Metal kernel dispatches. The 100M scale doesn't help because the bottleneck is per-agg launch overhead, not bandwidth. Measured 2026-05-27, 3 rounds.",
+      "_gate": {
+        "ratio_lt": 10.0
+      }
     },
     "tpch_q1_100m_bool": {
       "cpu_ms": 401.48,
@@ -94,8 +106,10 @@
       "ratio_metal_over_cpu": 2.42,
       "n_rows": 100000000,
       "hardware": "M2 Ultra (128GB)",
-      "_notes": "Phase 14 — 100M-row scale, M2 schema (Bool keys + i64+f64 values + Simple Sum aggs → PerAgg). Same shape as tpch_q1_modified at 10M (2.83x); ratio holds at 2.42x at 100M. The per-agg path remains the dominant engine-level bottleneck for 64-bit-value workloads. Measured 2026-05-27, 5 rounds.",
-      "_gate": {"ratio_lt": 3.0}
+      "_notes": "Phase 14 \u2014 100M-row scale, M2 schema (Bool keys + i64+f64 values + Simple Sum aggs \u2192 PerAgg). Same shape as tpch_q1_modified at 10M (2.83x); ratio holds at 2.42x at 100M. The per-agg path remains the dominant engine-level bottleneck for 64-bit-value workloads. Measured 2026-05-27, 5 rounds.",
+      "_gate": {
+        "ratio_lt": 3.0
+      }
     },
     "tpch_q6": {
       "cpu_ms": 9.27,
@@ -104,8 +118,10 @@
       "n_rows": 10000000,
       "n_groups": 1,
       "hardware": "M2 Ultra",
-      "_notes": "Phase 13 — TPC-H Q6 routes through Metal end-to-end via the empty-keys (single-group reduction) walker path. Filter (4 cmp + 4 AND on Date + I32 + F32 widened to I64/F64) runs on Metal via _filter_via_polars; Expression a*b materialized via Polars CPU; single-group sum runs CPU (the kernel-side empty-keys path was watchdogging at single-slot CAS contention). Bottleneck is the 8 filter kernel dispatches × ~15ms each. Predicate fusion (one MSL kernel that walks the AST inline) would cut ~70ms; queued for M4. Measured 2026-05-27, 9 rounds.",
-      "_gate": {"ratio_lt": 16.0}
+      "_notes": "Phase 13 \u2014 TPC-H Q6 routes through Metal end-to-end via the empty-keys (single-group reduction) walker path. Filter (4 cmp + 4 AND on Date + I32 + F32 widened to I64/F64) runs on Metal via _filter_via_polars; Expression a*b materialized via Polars CPU; single-group sum runs CPU (the kernel-side empty-keys path was watchdogging at single-slot CAS contention). Bottleneck is the 8 filter kernel dispatches \u00d7 ~15ms each. Predicate fusion (one MSL kernel that walks the AST inline) would cut ~70ms; queued for M4. Measured 2026-05-27, 9 rounds.",
+      "_gate": {
+        "ratio_lt": 16.0
+      }
     },
     "tpch_q6_f32": {
       "cpu_ms": 7.03,
@@ -114,8 +130,120 @@
       "n_rows": 10000000,
       "n_groups": 1,
       "hardware": "M2 Ultra",
-      "_notes": "F32 variant of Q6 — architectural-reading. Same shape as F64 but F32 numerics. Slightly worse ratio than F64 because CPU is even faster on F32 (more SIMD lanes), while Metal pays the same dispatch overhead. Measured 2026-05-27, 8 rounds.",
-      "_gate": {"ratio_lt": 22.0}
+      "_notes": "F32 variant of Q6 \u2014 architectural-reading. Same shape as F64 but F32 numerics. Slightly worse ratio than F64 because CPU is even faster on F32 (more SIMD lanes), while Metal pays the same dispatch overhead. Measured 2026-05-27, 8 rounds.",
+      "_gate": {
+        "ratio_lt": 22.0
+      }
+    },
+    "phase8_haversine_10m": {
+      "cpu_ms": null,
+      "metal_ms": null,
+      "ratio_metal_over_cpu": null,
+      "n_rows": 10000000,
+      "hardware": "M2 Ultra",
+      "_notes": "M4 placeholder: Haversine over 10M F32 rows via fused MLX subgraph. Target wall-clock < 6.0 ms; ratio gate set at landing.",
+      "_pending": true,
+      "_target_ms": 6.0
+    },
+    "phase8_black_scholes_10m": {
+      "cpu_ms": null,
+      "metal_ms": null,
+      "ratio_metal_over_cpu": null,
+      "n_rows": 10000000,
+      "hardware": "M2 Ultra",
+      "_notes": "M4 placeholder: Black-Scholes-shape log/exp/sqrt/tanh chain. Target wall-clock < 6.0 ms; ratio gate set at landing.",
+      "_pending": true,
+      "_target_ms": 6.0
+    },
+    "phase8_std_var_10m": {
+      "cpu_ms": null,
+      "metal_ms": null,
+      "ratio_metal_over_cpu": null,
+      "n_rows": 10000000,
+      "hardware": "M2 Ultra",
+      "_notes": "M4 placeholder: Std+var reductions on F32 column. Target wall-clock < 2.0 ms; ratio gate set at landing.",
+      "_pending": true,
+      "_target_ms": 2.0
+    },
+    "phase8_sort_f32_10m": {
+      "cpu_ms": null,
+      "metal_ms": null,
+      "ratio_metal_over_cpu": null,
+      "n_rows": 10000000,
+      "hardware": "M2 Ultra",
+      "_notes": "M4 placeholder: Sort F32 column via MLX radix. Target wall-clock < 10.0 ms; ratio gate set at landing.",
+      "_pending": true,
+      "_target_ms": 10.0
+    },
+    "phase8_topk_f32_10m": {
+      "cpu_ms": null,
+      "metal_ms": null,
+      "ratio_metal_over_cpu": null,
+      "n_rows": 10000000,
+      "hardware": "M2 Ultra",
+      "_notes": "M4 placeholder: Top-K=100 on F32 column via MLX argpartition. Target wall-clock < 10.0 ms; ratio gate set at landing.",
+      "_pending": true,
+      "_target_ms": 10.0
+    },
+    "phase8_cumsum_f32_10m": {
+      "cpu_ms": null,
+      "metal_ms": null,
+      "ratio_metal_over_cpu": null,
+      "n_rows": 10000000,
+      "hardware": "M2 Ultra",
+      "_notes": "M4 placeholder: Cumsum on F32 column via MLX parallel scan. Target wall-clock < 8.0 ms; ratio gate set at landing.",
+      "_pending": true,
+      "_target_ms": 8.0
+    },
+    "phase8_corr_matrix_200x200k": {
+      "cpu_ms": null,
+      "metal_ms": null,
+      "ratio_metal_over_cpu": null,
+      "n_rows": 200000,
+      "hardware": "M2 Ultra",
+      "_notes": "M4 placeholder: 200x200000 correlation matrix via MLX matmul. Target wall-clock < 22.0 ms; ratio gate set at landing.",
+      "_pending": true,
+      "_target_ms": 22.0
+    },
+    "phase9_rolling_mean_w1000_10m": {
+      "cpu_ms": null,
+      "metal_ms": null,
+      "ratio_metal_over_cpu": null,
+      "n_rows": 10000000,
+      "hardware": "M2 Ultra",
+      "_notes": "M4 placeholder: rolling_mean W=1000 via cumsum-diff. Target wall-clock < 8.0 ms; ratio gate set at landing.",
+      "_pending": true,
+      "_target_ms": 8.0
+    },
+    "phase10_cosine_topk_q100_n100k": {
+      "cpu_ms": null,
+      "metal_ms": null,
+      "ratio_metal_over_cpu": null,
+      "n_rows": 100000,
+      "hardware": "M2 Ultra",
+      "_notes": "M4 placeholder: Cosine top-k Q=100 N=100k D=768. Target wall-clock < 8.0 ms; ratio gate set at landing.",
+      "_pending": true,
+      "_target_ms": 8.0
+    },
+    "phase10_cosine_topk_q100_n1m": {
+      "cpu_ms": null,
+      "metal_ms": null,
+      "ratio_metal_over_cpu": null,
+      "n_rows": 1000000,
+      "hardware": "M2 Ultra",
+      "_notes": "M4 placeholder: Cosine top-k Q=100 N=1M D=768. Target wall-clock < 50.0 ms; ratio gate set at landing.",
+      "_pending": true,
+      "_target_ms": 50.0
+    },
+    "phase11_fft_8m": {
+      "cpu_ms": null,
+      "metal_ms": null,
+      "ratio_metal_over_cpu": null,
+      "n_rows": 8388608,
+      "hardware": "M2 Ultra",
+      "_notes": "M4 placeholder: FFT 8M-point 1D F32 via Expr.metal.fft(). Target wall-clock < 3.0 ms; ratio gate set at landing.",
+      "_pending": true,
+      "_target_ms": 3.0
     }
   }
 }

@@ -7,7 +7,9 @@ fn check_mlx_version(cmake_lists: &std::path::Path) {
     let contents = match std::fs::read_to_string(cmake_lists) {
         Ok(s) => s,
         Err(_) => {
-            println!("cargo:warning=could not read vendor/mlx/CMakeLists.txt to verify MLX version");
+            println!(
+                "cargo:warning=could not read vendor/mlx/CMakeLists.txt to verify MLX version"
+            );
             return;
         }
     };
