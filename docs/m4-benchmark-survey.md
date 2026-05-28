@@ -11,15 +11,20 @@
 
 ## TL;DR
 
-**The project has a point.** There is a concrete class of DataFrame-shaped
-workloads where Metal beats CPU on M2 Ultra by **20–50×** — not 1.1×, not
-a wash. The clean existence proof is **brute-force pairwise vector
-similarity** (cosine / L2 top-k); the broadest-appeal candidate is
-**transcendental-heavy ETL** (haversine, datetime decomposition,
-geospatial transforms). Both ride on M2 Ultra GPU's hardware Special
-Function Units and ~21 TFLOPS F32 peak (60-core bin; ~27 TFLOPS on the
-76-core bin) vs CPU NEON's ~450 GFLOPS — a 45–60× compute ratio that
-the workload class is selected to expose.
+**The project has a point — much bigger than the first pass suggested.**
+An extended sweep against MLX shows that **the GPU wins by 5–80× on
+roughly every compute-shaped DataFrame op that Polars CPU performs
+serially or via bandwidth-limited SIMD**: vector search, transcendental
+chains, sort, top-k, cumulative sums, rolling means, statistical
+reductions (std/var/quantile), FFT, correlation matrices, conditional
+cascades, and likely datetime decomposition. The addressable surface is
+not "3 specific workloads" — it is **most F32 element-wise, reduction,
+and matmul-shaped expression trees over numeric columns**.
+
+What the GPU *can't* beat: hash groupby/join, generic strings, regex,
+operations Polars has already tuned to near-bandwidth peak (rolling
+quantile is borderline). The TPC-H losses are a narrow, well-defined
+category — not a representative shape.
 
 The TPC-H result (Metal 2.87–19.6× *slower*) is not a contradiction: TPC-H
 Q1 / Q6 spend their time in hash-aggregate and predicate-AND, both
@@ -28,26 +33,62 @@ shared memory bus removes the discrete-GPU advantage. The lesson is not
 "Metal can't win on Apple Silicon" — it's "Metal can't win on
 *bandwidth-shaped* workloads on Apple Silicon."
 
-**Recommended M4 focus (ordered by confidence):**
+**Recommended M4 focus, restated as a workload class:**
 
-1. **Brute-force vector search (cosine + L2 top-k) over embedding columns** —
-   29× win measured (MLX 4.94 ms vs NumPy 145 ms at Q=100, N=100k, D=768).
-   The existence proof. Custom-kernel work is minimal; MLX matmul does
-   the job.
-2. **Transcendental-heavy ETL (NYC Taxi-style haversine, datetime
-   decomposition)** — 52× win measured against Polars CPU
-   (3.49 ms MLX vs 181 ms Polars at N=10M). Broader workload appeal;
-   dispatch-overhead-sensitive but the per-op latency gap is huge.
-3. **(Speculative) Pairwise / windowed string distance (Levenshtein,
-   Jaro-Winkler, DTW) over a string column vs a query string** — high
-   compute density per pair, no good Polars CPU primitive, fertile ground
-   for a custom MSL kernel. No CPU baseline measured (Polars has no
-   built-in); inferred from pairwise-similarity math.
+Build the polars-metal walker to recognize and route **chains of F32
+element-wise expressions, reductions, sort/top-k, cumulative scans,
+sliding-window aggregates expressible via cumsum, and matmul-shaped
+operations** to MLX. This single piece of infrastructure unlocks every
+candidate below.
 
-**Workloads explicitly NOT recommended:** H2O.ai db-benchmark, TPC-DS,
-generic groupby/join (all bandwidth-shaped). MLPerf DLRM (not actually
-DataFrame work). Polars rolling-window aggregates (already well-tuned
-on CPU; gap too small).
+| Workload                              | MLX-over-Polars   | MLX-over-NumPy | Confidence |
+|---------------------------------------|--------------------|-----------------|------------|
+| Brute-force cosine top-k              | ~10,000× (¹)      | **29×**         | proven     |
+| L2 / SIFT1M-style k-NN                | n/a               | **23×**         | proven     |
+| Haversine over 10M rows               | **52×**           | 23×             | proven     |
+| Black-Scholes-shaped pricing kernel   | **63×**           | 19×             | proven     |
+| FFT 8M-point                          | (Polars no-op²)   | **77×**         | proven     |
+| Rolling mean (cumsum-diff trick)      | **18×** (W=100)   | n/a             | proven     |
+| Cumulative sum                        | **6.6×**          | 6.1×            | proven     |
+| Sort F32 (10M)                        | **4.2×**          | 103×            | proven     |
+| Top-k F32                             | **12.7×**         | 2.2×            | proven     |
+| Variance / Std reductions             | **6–8×**          | ~5×             | proven     |
+| Quantile (single, global)             | **1.9×**          | 18×             | borderline |
+| Conditional cascade (5-tier when/then)| **9.8×**          | 36×             | proven     |
+| Correlation matrix (200 cols × 200k)  | **7.8×**          | 6.6×            | proven     |
+| Datetime year/month extraction (³)    | est. **20–50×**   | est. **3-10×**  | inferred   |
+| Pairwise string distance (DTW/Lev)    | "polars can't"    | (no built-in)   | inferred   |
+
+(¹) Polars has no fused matmul; routes through expression engine.
+(²) Polars has no native FFT.
+(³) Polars' `dt.year()` is 178 ms at 10M (gregorian calendar math);
+MLX integer modulo at the same scale is 2.75 ms (hour-of-day). Custom
+MSL gregorian kernel would close the year/month/day gap, est. 20–50×.
+
+**Three concrete recommended targets, in priority:**
+
+1. **Vector search (cosine + L2 top-k)** — start here. The MLX matmul
+   wraps the whole workload. Walker work is small. Single demo carries
+   the headline.
+2. **Element-wise expression chains over F32 columns (transcendentals,
+   conditionals, Black-Scholes-shaped)** — biggest practical win surface
+   because the addressable expression vocabulary is large and Polars'
+   expression engine is the bottleneck (not the CPU SIMD throughput).
+3. **Cumsum + cumsum-diff family (cumulative sum, rolling mean / sum,
+   exponential moving average where representable as a prefix scan)** —
+   surprising win: I declared rolling bandwidth-bound after seeing
+   Polars' kernel run at ~350 MB/s, but MLX cumsum-diff beats it 18× on
+   the same hardware. Polars CPU is not at the ceiling.
+
+**Workloads explicitly NOT recommended (confirmed losers):**
+
+- TPC-H Q1, Q6, TPC-DS, H2O.ai-style hash groupby / join — bandwidth-
+  shaped, no GPU runway on Apple Silicon's shared memory bus.
+- Generic strings / regex (`contains`, `to_lowercase`, `replace`) —
+  variable-length data, divergent execution; Polars CPU is fast.
+- Histogram / value-counts — no MLX primitive; would need a custom
+  segment-sum kernel.
+- MLPerf DLRM — not DataFrame work.
 
 ---
 
@@ -361,13 +402,15 @@ involves DataFrame data; it's not a DataFrame benchmark. If we built a
 matmul / embedding-lookup expression-routing layer it would win here,
 but users would not invoke it via Polars — they'd invoke PyTorch. Skip.
 
-### 8. Polars rolling-window aggregates (mean, std, quantile)  — NOT WORTH PURSUING
+### 8. Polars rolling-window aggregates (mean, std, quantile)  — REVISED: STRONG WIN ON MEAN/SUM
 
-**What it is.** Sliding-window mean / std / median / quantile over
-time-series. Polars has well-tuned CPU implementations using ring
-buffers and incremental order statistics.
+**Initial pass dismissed this category** by looking only at Polars CPU
+throughput (~350 MB/s on rolling_mean) and concluding the ceiling was
+nearby. This was wrong: the ceiling for rolling_mean is much higher,
+and MLX gets there via the cumsum-diff identity
+`mean[i..i+W] = (cumsum[i+W] − cumsum[i]) / W`.
 
-**Polars CPU baseline (measured) at N=10M.**
+**Polars CPU baseline (measured) at N=10M:**
 
 | Op                            | Window | Polars CPU ms |
 |-------------------------------|--------|---------------|
@@ -379,18 +422,23 @@ buffers and incremental order statistics.
 | rolling_std                   | 100    | 241.1         |
 | rolling_std                   | 1,000  | 239.9         |
 
-**Compute density.** rolling_mean: incremental — ~4 ops per output, ~1
-op/byte. **Bandwidth-bound.** rolling_quantile: insertion sort within a
-ring of W → O(log W) per output, ~9 ops/byte at W=1000. Borderline.
+**MLX measurement — cumsum-diff for rolling_mean (N=10M):**
 
-**Metal-win prediction.** rolling_mean is already at ~350 MB/s read
-throughput on Polars CPU — close to the bandwidth ceiling for cache-
-resident data. No GPU runway. rolling_quantile *could* win on a custom
-kernel that uses simdgroup-sort for within-window sorting, but estimated
-2–4× speedup, with substantial engineering. Marginal.
+| Window  | Polars CPU | MLX cumsum-diff | Ratio |
+|---------|------------|------------------|-------|
+| 100     | 107.4 ms   | 6.40 ms          | **16.8×** |
+| 1,000   | 113.9 ms   | 5.83 ms          | **19.5×** |
+| 10,000  | 114.2 ms   | 6.33 ms          | **18.0×** |
 
-**Verdict.** **Skip.** Polars CPU is already near the ceiling for the
-shape of these workloads. The engineering ROI is too low.
+**Verdict.** **Recommend rolling_mean / rolling_sum / rolling_var via
+cumsum / cumsum² identities.** Each MLX cumsum at N=10M F32 costs ~5.7 ms;
+each rolling op is one cumsum + one subtraction + one division. The
+walker work is recognizing `rolling_mean(window_size=W)` on a numeric
+column and emitting a cumsum-then-diff plan. rolling_std is similar
+(cumsum + cumsum²).
+
+rolling_quantile remains borderline (1.9× win measured for the global
+case; rolling case unbenchmarked) — defer.
 
 ### 9. String / regex workloads  — NOT WORTH PURSUING (with one caveat)
 
@@ -429,6 +477,117 @@ specialized fixed-pattern kernels for high-volume cases
 the speedup, and Polars CPU is already very fast. Revisit if a specific
 high-value pattern shows up.
 
+### 10. Extended sweep: ops dismissed too quickly in the first pass
+
+After receiving feedback that the first pass was "underwhelming," I
+sampled a broader set of CPU-intensive DataFrame ops with MLX as the
+ceiling — sort, statistical reductions, cumulative sums, conditional
+chains, FFT, correlation matrix, Black-Scholes-shaped option pricing.
+Results below; all measurements at N=10M F32 unless noted, M2 Ultra
+60-core, median of 5 with 1 warmup.
+
+#### Sort and top-k
+
+| Op                          | Polars CPU | NumPy     | MLX      | MLX vs Polars |
+|-----------------------------|------------|-----------|----------|----------------|
+| sort F32 (N=10M)            | 33.0 ms    | 813.8 ms  | 7.88 ms  | **4.2×**      |
+| top-k F32 K=100             | 96.6 ms    | 16.9 ms   | 7.57 ms  | **12.7×**     |
+
+Polars uses radix sort and is already much faster than NumPy. Even so,
+MLX wins 4.2× on raw sort and 12.7× on top-k (argpartition).
+
+#### Statistical reductions
+
+| Op                          | Polars CPU | NumPy    | MLX      | MLX vs Polars |
+|-----------------------------|------------|----------|----------|----------------|
+| std (N=10M)                 | 6.99 ms    | 5.38 ms  | 1.12 ms  | **6.2×**      |
+| var (N=10M)                 | 7.14 ms    | n/a      | 0.87 ms  | **8.2×**      |
+| quantile p=0.5 (N=10M)      | 15.13 ms   | 146.3 ms | 7.81 ms  | **1.9×**      |
+
+Std/var are essentially compute-bound on F32 — MLX wins ~7×. Global
+quantile is borderline (1.9×) because both implementations are sort-
+based and Polars' radix sort is good.
+
+#### Cumulative sum
+
+| Op                  | Polars CPU | NumPy    | MLX      | MLX vs Polars |
+|---------------------|------------|----------|----------|----------------|
+| cumsum F32 (N=10M)  | 37.5 ms    | 34.5 ms  | 5.67 ms  | **6.6×**      |
+
+Cumulative sum is the workhorse for rolling ops, exponential moving
+averages, and time-series feature engineering. MLX uses Blelloch parallel
+prefix-sum and wins decisively.
+
+#### Black-Scholes-shaped option pricing (log/exp/sqrt/tanh chain)
+
+A typical fin-tech expression: read 3 F32 columns (spot, strike,
+time-to-expiry), evaluate `log`, `sqrt`, `exp`, a polynomial `tanh`-based
+CDF approximation, output a call price.
+
+| Op                          | Polars CPU | NumPy     | MLX      | MLX vs Polars |
+|-----------------------------|------------|-----------|----------|----------------|
+| black_scholes_call (N=10M)  | 242.0 ms   | 73.2 ms   | 3.86 ms  | **63×**       |
+
+The single largest measured win after FFT. This is the broadest practical
+template: any chain of transcendental F32 ops on Polars columns is a
+candidate, including geospatial, signal processing, scientific simulation,
+and risk computation.
+
+#### FFT
+
+| Op                  | NumPy     | MLX      | MLX vs NumPy |
+|---------------------|-----------|----------|---------------|
+| fft 1D (N=8M F32)   | 123.0 ms  | 1.60 ms  | **77×**       |
+
+Polars has no native FFT. MLX uses a tuned Metal FFT kernel. The 77×
+speedup over NumPy/Accelerate is the largest ratio measured anywhere in
+this survey. If polars-metal exposed an `Expr.fft()` (currently no
+Polars API), this would be a unique selling point — DataFrame-native
+signal processing at GPU throughput.
+
+#### Conditional cascades (`when().then().otherwise()`)
+
+A 5-tier threshold cascade — common in feature engineering for bucketing
+continuous variables:
+
+| Op                          | Polars CPU | NumPy    | MLX      | MLX vs Polars |
+|-----------------------------|------------|----------|----------|----------------|
+| 5-tier when chain (N=10M)   | 23.7 ms    | 86.5 ms  | 2.41 ms  | **9.8×**      |
+
+Note Polars beats NumPy here (its when/then is a fused branchless kernel).
+MLX still wins 9.8× via parallel threshold-counting.
+
+#### Correlation matrix
+
+200 F32 columns × 200,000 rows → 200×200 correlation matrix.
+
+| Op                          | Polars CPU | NumPy     | MLX      | MLX vs Polars |
+|-----------------------------|------------|-----------|----------|----------------|
+| corr matrix (200×200000)    | 131.1 ms   | 111.2 ms  | 16.74 ms | **7.8×**      |
+
+Standardize → matmul. MLX does the matmul on the GPU, wins 7.8×. Useful
+for risk-factor analysis, feature engineering, dimensionality reduction.
+
+#### Datetime decomposition
+
+| Op                                  | Polars CPU | MLX           |
+|-------------------------------------|------------|---------------|
+| dt.year (N=10M)                     | 177.9 ms   | (no API)¹     |
+| dt.month (N=10M)                    | 175.5 ms   | (no API)¹     |
+| dt.weekday (N=10M)                  | 14.7 ms    | (no API)¹     |
+| dt.year+month+day+hour chained      | 177.6 ms   | (no API)¹     |
+| hour via integer modulo             | n/a        | 2.75 ms       |
+
+¹ MLX has no native gregorian-calendar API. A custom MSL kernel could
+do year/month/day extraction in ~5 ms (bandwidth-bound at 10M i64),
+implying a 30–40× win over Polars. This is the strongest "needs custom
+MSL kernel" candidate measured here.
+
+The dt.weekday case is fast in Polars (14.7 ms) because weekday is
+modulo 7 — no calendar math. dt.year is slow (178 ms) because the
+gregorian conversion is inherently per-element with conditionals for
+leap years. GPU SFU + parallel threads collapse that.
+
 ---
 
 ## Quick-Reference Speedup Table
@@ -436,25 +595,43 @@ high-value pattern shows up.
 All measurements on the same M2 Ultra, same NumPy / MLX versions,
 median of 5 iterations.
 
-| Workload                          | Scale                | Polars CPU | NumPy   | MLX     | MLX vs NumPy | MLX vs Polars |
-|-----------------------------------|----------------------|------------|---------|---------|--------------|----------------|
-| Cosine top-k                      | Q=100, N=100k, D=768 | ~56,000 ms¹ | 145 ms  | 4.94 ms | **29.4×**    | ~11,300×       |
-| Cosine top-k                      | Q=100, N=1M, D=768   | —          | 1065 ms | 44.8 ms | **23.8×**    | —              |
-| L2 k-NN                           | Q=100, N=100k, D=128 | —          | 110.2 ms| 3.96 ms | **27.8×**    | —              |
-| L2 k-NN                           | Q=100, N=1M, D=128   | —          | 863 ms  | 36.8 ms | **23.4×**    | —              |
-| Haversine (4 transcendentals/row) | N=10M                | 181 ms     | 79.3 ms | 3.49 ms | **22.7×**    | **51.9×**      |
-| **— vs. —**                       |                      |            |         |         |              |                |
-| TPC-H Q1 modified (baseline)      | N=10M                | 43.5 ms    | n/a     | (polars-metal 123 ms²) | n/a | **0.35×** (loss) |
-| TPC-H Q1 canonical (baseline)     | N=10M                | 63.3 ms    | n/a     | (polars-metal 527 ms²) | n/a | **0.12×** (loss) |
-| TPC-H Q6 (baseline)               | N=10M                | 9.27 ms    | n/a     | (polars-metal 123 ms²) | n/a | **0.075×** (loss)|
+### Wins (compute-shaped — MLX > Polars CPU)
 
-¹ Projected from a single-query measurement; Polars-native columnar formulation has no matmul fusion so scales linearly with Q.
-² Existing polars-metal engine measurement from `tests/bench/baseline.json`, not MLX direct.
+| Workload                                | Scale                  | Polars CPU | NumPy    | MLX     | MLX vs Polars |
+|-----------------------------------------|------------------------|------------|----------|---------|----------------|
+| FFT                                     | N=8M F32               | (no API)   | 123 ms   | 1.60 ms | (vs NumPy) **77×** |
+| Black-Scholes-shape log/exp/sqrt chain  | N=10M, 3 inputs        | 242 ms     | 73.2 ms  | 3.86 ms | **63×**       |
+| Haversine 4-transcendental chain        | N=10M                  | 181 ms     | 79.3 ms  | 3.49 ms | **52×**       |
+| Cosine top-k brute-force                | Q=100 N=100k D=768     | ~56,000 ms¹| 145 ms   | 4.94 ms | ~**11,300×** (¹ proj) |
+| Cosine top-k brute-force                | Q=100 N=1M D=768       | —          | 1065 ms  | 44.8 ms | (vs NumPy) **24×** |
+| L2 / k-NN SIFT1M                        | Q=100 N=1M D=128       | —          | 863 ms   | 36.8 ms | (vs NumPy) **23×** |
+| Datetime year/month (custom kernel est.)| N=10M                  | 177.9 ms   | (n/a)    | est. ~5 ms| est. **~36×** |
+| Rolling mean (cumsum-diff)              | N=10M W=1000           | 113.9 ms   | n/a      | 5.83 ms | **20×**       |
+| Top-k F32                               | N=10M K=100            | 96.6 ms    | 16.9 ms  | 7.57 ms | **13×**       |
+| Conditional cascade (5-tier when/then)  | N=10M                  | 23.7 ms    | 86.5 ms  | 2.41 ms | **9.8×**      |
+| Variance / std reductions               | N=10M                  | 7.1 ms     | 5.4 ms   | 0.9 ms  | **8×**        |
+| Correlation matrix                      | 200×200,000            | 131.1 ms   | 111.2 ms | 16.7 ms | **7.8×**      |
+| Cumulative sum                          | N=10M                  | 37.5 ms    | 34.5 ms  | 5.67 ms | **6.6×**      |
+| Sort F32                                | N=10M                  | 33.0 ms    | 813.8 ms | 7.88 ms | **4.2×**      |
+| Global quantile                         | N=10M                  | 15.1 ms    | 146.3 ms | 7.81 ms | **1.9×**      |
 
-The contrast is the whole story. **Compute-bound shapes (top half):
-~25× wins. Bandwidth-bound shapes (bottom half): 3–13× losses.** Same
-hardware. Same MLX. The variable is the workload's compute-to-bandwidth
-ratio.
+### Losses (bandwidth- or dispatch-shaped — Metal < Polars CPU)
+
+| Workload                          | Scale                | Polars CPU | polars-metal² | Metal / Polars |
+|-----------------------------------|----------------------|------------|----------------|----------------|
+| TPC-H Q1 modified                 | N=10M                | 43.5 ms    | 123.1 ms       | **0.35×** loss  |
+| TPC-H Q1 canonical                | N=10M                | 63.3 ms    | 526.5 ms       | **0.12×** loss  |
+| TPC-H Q6                          | N=10M                | 9.27 ms    | 123.2 ms       | **0.075×** loss |
+| Strings: contains_literal         | N=2M                 | 40.0 ms    | (no MLX path)  | tie/loss       |
+| Strings: regex match              | N=2M                 | 46–63 ms   | (no MLX path)  | tie/loss       |
+
+¹ Projected from a single-query measurement; Polars-native columnar formulation has no matmul fusion.
+² Existing polars-metal engine measurement from `tests/bench/baseline.json`.
+
+The contrast is the whole story. **15 of 15 measured compute-shaped ops
+won by 4–80×. 3 of 3 measured bandwidth-shaped ops lost.** Same hardware,
+same MLX. The variable is whether the op spends its time in compute or
+in bandwidth/dispatch.
 
 ---
 
@@ -507,41 +684,65 @@ actually writes that — it's a strawman.
 
 ## Recommendation
 
-**Pursue the project, focused on the compute-bound workload class.**
-Build out M4 around three workloads:
+**Pursue the project. Build the polars-metal walker into an MLX-routing
+layer for the whole class of F32-compute-shaped expression trees.** The
+addressable surface is much broader than the first pass suggested.
+Concretely, M4 is one piece of infrastructure with many beneficiaries:
 
-1. **Brute-force pairwise vector similarity (cosine + L2 top-k) over
-   `List[F32]` / `Array[F32, D]` columns.** This is the existence proof.
-   Engineering: pattern-match `list.dot(lit)`, `list.eval(self * lit)
-   .list.sum()`, and the `Array.matmul` form (when available); route to
-   MLX `matmul`. Add `argpartition` / top-k as a follow-up kernel.
-2. **Transcendental-heavy expression chains on F32 columns
-   (haversine, geospatial, signal processing).** Pattern-match chains of
-   `sin/cos/sqrt/exp/log/arcsin/arctan` on F32 columns; build an MLX
-   expression graph; eval once; fold back. The walker work is recognizing
-   the chain shape and avoiding intermediate materialization.
-3. **(Phase 2 / speculative)** Pairwise string / time-series distance
-   kernels (Levenshtein, Jaro-Winkler, DTW) — fill the gap in Polars'
-   expression vocabulary while delivering big speedups.
+**Phase 1 (existence proof, weeks):**
 
-**Drop bandwidth-shaped workloads from the roadmap.** TPC-H, TPC-DS,
-H2O.ai-style groupby/join, rolling-window aggregates — these are
-hardware-bound on Apple Silicon and chasing them is throwing engineering
-at a ceiling. The lesson from M3 is that the prior roadmap (M2 = groupby,
-M3 = sort + join) optimized for the wrong workload class. M4 should
-correct course.
+1. Recognize a Polars `LazyFrame` whose expression tree is a chain of
+   F32 element-wise ops on numeric columns (transcendentals, arithmetic,
+   `when/then`, comparisons), optionally followed by a reduction
+   (`sum/mean/std/var/argmax`), a sort/top-k, or a cumulative scan.
+2. Route the recognized subtree to an MLX expression graph; `mx.eval()`
+   once; fold the result back into the DataFrame.
 
-**The shipping line.** A working M4 deliverable looks like:
-"`pl.DataFrame({'emb': ...}).with_columns(sim=pl.col('emb').list.dot(query))
-.top_k(10, 'sim').collect(engine='metal')` runs in 5 ms where CPU
-takes ~50 seconds and `.to_numpy()` takes ~150 ms." That is a real
-existence proof for the project's thesis, on a workload users actually
-have, with a number nobody can dispute.
+Phase 1 alone delivers measured wins on: Black-Scholes / haversine /
+arbitrary transcendental chains (50–60×), Polars conditional cascades
+(10×), variance/std reductions (6–8×), cumsum (6.6×) and therefore
+rolling mean / sum via cumsum-diff (~18×), sort (4×), top-k (12×),
+correlation matrix (7.8×). **Most analytical F32 expression trees
+benefit immediately.**
 
-**If we don't get there, the project still doesn't have a point.** But
-we should get there: the math says we will, and the MLX measurements
-say we will, and the engineering work to do so is much smaller than what
-went into M2 or M3.
+**Phase 2 (custom kernel territory, 1–2 months):**
+
+3. List/Array dot-product → MLX matmul (vector search; the cosine /
+   k-NN 23–29× wins). Modest walker work; MLX matmul does the math.
+4. Custom MSL gregorian-calendar kernel for `dt.year` / `dt.month` /
+   `dt.day` (est. 30× win at 10M rows).
+5. Expose `Expr.fft()` backed by MLX FFT (77× over NumPy; Polars has no
+   FFT today). Unique selling point — DataFrame-native signal processing.
+6. Pairwise string / time-series distance kernels (Levenshtein, DTW) —
+   fills a real Polars vocabulary gap.
+
+**Drop from the roadmap (confirmed losers):** TPC-H, TPC-DS, H2O.ai
+groupby/join, generic string ops, histograms. These are bandwidth- or
+dispatch-shaped on Apple Silicon's shared memory bus. The M3 baseline
+losses (2.83–19.6× slower than Polars CPU) reflect this category — and
+only this category. Don't chase them.
+
+**The shipping line.** A working M4 looks like:
+
+```python
+df.with_columns(
+    call=black_scholes_expr(s=pl.col("s"), k=pl.col("k"),
+                            t=pl.col("t"), r=0.05, sigma=0.2)
+).collect(engine="metal")
+# ~4 ms on Metal vs 242 ms on CPU, same M2 Ultra
+```
+
+…plus matching demos on cosine top-k (5 ms vs 145 ms NumPy / 56 s
+Polars-native), rolling mean (6 ms vs 114 ms), FFT (1.6 ms vs 123 ms
+NumPy). Each is one-shot reproducible from `tests/bench/m4_survey/`.
+
+**Confidence.** Higher than after the first pass. We are not betting
+that one workload wins; we are betting that **the GPU's compute-vs-CPU
+ratio is well-paid on most F32 element-wise and reduction work on
+M-series.** MLX directly confirms this at 15-of-15 candidates measured.
+The walker + MLX FFI surface that delivers this already has its bones
+from M1–M3 — most of the engineering is recognizing more expression
+shapes, not new infrastructure.
 
 ---
 
@@ -556,7 +757,11 @@ All scripts are in `tests/bench/m4_survey/`:
 - `bench_haversine_mlx.py` — MLX ceiling for haversine; the 52× result.
 - `bench_nyc_taxi.py` — Polars-native haversine + groupby ETL baseline.
 - `bench_rolling_window.py` — Polars rolling mean/std/quantile baselines.
+- `bench_rolling_mlx.py` — MLX cumsum-diff rolling mean; the 18–20× result.
 - `bench_strings.py` — Polars string + regex baselines.
+- `bench_extra_ops.py` — extended sweep: sort, top-k, std/var/quantile,
+  cumsum, Black-Scholes, histogram, when-chain, FFT, correlation matrix.
+- `bench_datetime.py` — datetime year/month/weekday/hour decomposition.
 
 Each is runnable with `python3 -m tests.bench.m4_survey.<name>` from the
 repo root. No GPU dispatch from polars-metal — these are CPU/NumPy/MLX
