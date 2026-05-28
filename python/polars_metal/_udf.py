@@ -351,9 +351,7 @@ def _dispatch_groupby(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
         upstream = pl.DataFrame._from_pydf(upstream_pydf)
 
     if hstack_exprs:
-        new_cols = [
-            _agg_expr_dict_to_polars(e["expr"]).alias(e["name"]) for e in hstack_exprs
-        ]
+        new_cols = [_agg_expr_dict_to_polars(e["expr"]).alias(e["name"]) for e in hstack_exprs]
         upstream = upstream.lazy().with_columns(new_cols).collect()
 
     n_rows = upstream.height
@@ -576,9 +574,7 @@ _AGG_OP_TO_POLARS: dict[str, str] = {
 }
 
 
-def _empty_keys_via_polars(
-    upstream: pl.DataFrame, aggs: list[dict]
-) -> pl.DataFrame:
+def _empty_keys_via_polars(upstream: pl.DataFrame, aggs: list[dict]) -> pl.DataFrame:
     """Evaluate empty-keys aggs via Polars CPU. See call site for rationale.
 
     All Expression aggs are already materialized to Simple-<op> referencing
@@ -601,9 +597,7 @@ def _empty_keys_via_polars(
         polars_op = _AGG_OP_TO_POLARS.get(op)
         if polars_op is None:
             raise RuntimeError(f"polars_metal: unknown empty-keys agg op {op!r}")
-        expr = getattr(pl.col(col_name), polars_op)().alias(
-            alias or f"{col_name}_{op.lower()}"
-        )
+        expr = getattr(pl.col(col_name), polars_op)().alias(alias or f"{col_name}_{op.lower()}")
         out_exprs.append(expr)
 
     return upstream.lazy().select(out_exprs).collect()
@@ -696,12 +690,10 @@ def _coerce_for_compare(series: pl.Series, kernel_dtype: str) -> pl.Series:
     way to materialization. Date → Int64 days-since-1970 (Polars'
     physical representation) matches the walker's literal encoding.
     """
-    if kernel_dtype == "I64":
-        if str(series.dtype) != "Int64":
-            return series.cast(pl.Int64)
-    elif kernel_dtype == "F64":
-        if str(series.dtype) != "Float64":
-            return series.cast(pl.Float64)
+    if kernel_dtype == "I64" and str(series.dtype) != "Int64":
+        return series.cast(pl.Int64)
+    if kernel_dtype == "F64" and str(series.dtype) != "Float64":
+        return series.cast(pl.Float64)
     return series
 
 

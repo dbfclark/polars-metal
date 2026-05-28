@@ -52,7 +52,7 @@ def main() -> None:
     D = 128
     K = 10
 
-    print(f"\n=== pairwise L2 / k-NN brute force ===")
+    print("\n=== pairwise L2 / k-NN brute force ===")
     print(f"  Q={Q} N={N:,} D={D} K={K}")
     print(f"  FLOPs (3*Q*N*D) = {3 * Q * N * D / 1e9:.2f} GFLOPs")
     print(f"  density (op/byte) ~ {3 * Q * N * D / ((Q + N) * D * 4):.1f}")

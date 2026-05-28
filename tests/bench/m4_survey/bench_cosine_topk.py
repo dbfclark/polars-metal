@@ -13,7 +13,7 @@ Why a candidate for Metal:
       density ~= 44 ops/byte — solidly compute-bound, not bandwidth-bound.
   - GPU FMA throughput on M2 Ultra (60-core): ~27 TFLOPS F32 peak;
     CPU NEON FMA across 16 P-cores: ~450 GFLOPS F32 peak.
-    Compute-time ratio at 50% peak efficiency: ~60×.
+    Compute-time ratio at 50% peak efficiency: ~60x.
   - Dispatch overhead is amortizable: this is one matmul plus a top-k pass.
 
 DataFrame framing: embeddings are stored as columnar F32 columns
@@ -66,7 +66,8 @@ def cosine_topk_polars_listcol(
     crossed = query_df.join(corpus_df, how="cross")
     with_sim = crossed.with_columns(
         sim=(
-            pl.col("q_emb").list.eval(pl.element() * pl.element())
+            pl.col("q_emb")
+            .list.eval(pl.element() * pl.element())
             .list.sum()  # this is wrong; need element-wise q*c. Replaced below.
         )
     )
@@ -93,11 +94,7 @@ def cosine_topk_polars_columnar(query: np.ndarray, corpus: np.ndarray, k: int) -
     # measurement with the same operation, scaled linearly.
     q0 = query[0]
     sim_expr = sum(pl.col(f"c_{i}") * float(q0[i]) for i in range(d))
-    return (
-        corpus_df.with_columns(sim=sim_expr)
-        .sort("sim", descending=True)
-        .head(k)
-    )
+    return corpus_df.with_columns(sim=sim_expr).sort("sim", descending=True).head(k)
 
 
 def main() -> None:
@@ -106,7 +103,7 @@ def main() -> None:
     D = 768
     K = 10
 
-    print(f"\n=== cosine top-k benchmark ===")
+    print("\n=== cosine top-k benchmark ===")
     print(f"  Q queries        = {Q}")
     print(f"  N corpus rows    = {N:,}")
     print(f"  D embedding dim  = {D}")

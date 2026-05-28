@@ -26,7 +26,7 @@ def make_q6_fixture(n_rows: int = 10_000_000, seed: int = 42) -> pl.DataFrame:
     """Build a `n_rows`-row lineitem-shaped DataFrame with only the four
     columns Q6 reads. Distributions match the canonical fixture so the
     selectivity of the Q6 date+discount+quantity predicate stays in the
-    realistic 1–2% range.
+    realistic 1-2% range.
     """
     rng = np.random.default_rng(seed)
     return pl.DataFrame(

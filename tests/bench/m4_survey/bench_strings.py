@@ -34,12 +34,45 @@ def make_strings(n: int, *, seed: int = 0xC0DE) -> pl.DataFrame:
     """
     rng = np.random.default_rng(seed)
     words = [
-        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
-        "iota", "kappa", "lambda", "mu", "nu", "xi", "omicron", "pi",
-        "rho", "sigma", "tau", "upsilon", "phi", "chi", "psi", "omega",
-        "apple", "banana", "cherry", "date", "elderberry", "fig", "grape",
-        "honeydew", "import", "export", "session-id-12345", "ABCDEFG",
-        "metric.cpu.user", "metric.cpu.system", "metric.mem.used",
+        "alpha",
+        "beta",
+        "gamma",
+        "delta",
+        "epsilon",
+        "zeta",
+        "eta",
+        "theta",
+        "iota",
+        "kappa",
+        "lambda",
+        "mu",
+        "nu",
+        "xi",
+        "omicron",
+        "pi",
+        "rho",
+        "sigma",
+        "tau",
+        "upsilon",
+        "phi",
+        "chi",
+        "psi",
+        "omega",
+        "apple",
+        "banana",
+        "cherry",
+        "date",
+        "elderberry",
+        "fig",
+        "grape",
+        "honeydew",
+        "import",
+        "export",
+        "session-id-12345",
+        "ABCDEFG",
+        "metric.cpu.user",
+        "metric.cpu.system",
+        "metric.mem.used",
     ]
     out = []
     for _ in range(n):
@@ -51,7 +84,7 @@ def make_strings(n: int, *, seed: int = 0xC0DE) -> pl.DataFrame:
 def main() -> None:
     N = 2_000_000
     print(f"\n=== string / regex benchmarks ===  N={N:,}")
-    print(f"  (string generation takes ~10s; one-time)")
+    print("  (string generation takes ~10s; one-time)")
     df = make_strings(N)
     total_bytes = sum(len(s) for s in df["s"].to_list())
     print(f"  total string bytes: {total_bytes / 1e6:.1f} MB")

@@ -74,7 +74,8 @@ fold (and when optimization is disabled). We support all three shapes.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date as _date, datetime as _datetime
+from datetime import date as _date
+from datetime import datetime as _datetime
 from typing import Any
 
 # Dtype tags the predicate path widens to I64 (the cmp_i64 kernel covers
@@ -268,7 +269,7 @@ def _walk_select_projection(
 ) -> WalkResult:
     """Existing M2 path: column-only Select becomes a Project plan node."""
     columns: list[str] = []
-    for e, (inner_node, _cls) in zip(exprs, classes):
+    for e, (inner_node, _cls) in zip(exprs, classes, strict=False):
         col_name = getattr(inner_node, "name", None)
         if col_name is None:
             return FallBack(reason="Column expression missing .name")

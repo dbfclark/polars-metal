@@ -14,7 +14,6 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 import polars as pl
-from datetime import datetime
 
 from tests.bench.m4_survey._timing import time_callable
 
@@ -65,7 +64,9 @@ def main() -> None:
         return h
 
     time_callable("mlx.hour_via_modulo", mlx_hour)
-    print("  (year/month/weekday require calendar math; MLX has no native gregorian; would need custom MSL)")
+    print(
+        "  (year/month/weekday require calendar math; MLX has no native gregorian; would need custom MSL)"
+    )
 
 
 if __name__ == "__main__":

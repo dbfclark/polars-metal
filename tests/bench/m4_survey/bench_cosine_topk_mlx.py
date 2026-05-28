@@ -38,7 +38,7 @@ def main() -> None:
     D = 768
     K = 10
 
-    print(f"\n=== MLX cosine top-k (GPU ceiling) ===")
+    print("\n=== MLX cosine top-k (GPU ceiling) ===")
     print(f"  Q={Q} N={N:,} D={D} K={K}")
     print(f"  FLOPs (2*Q*N*D) = {2 * Q * N * D / 1e9:.2f} GFLOPs")
     print()

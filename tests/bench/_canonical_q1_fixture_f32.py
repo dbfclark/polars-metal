@@ -7,7 +7,7 @@ The F32 variant exists because the Metal toolchain on Apple Silicon has
 ``atomic_float`` for 32-bit floats but *not* for 64-bit. The fused
 multi-aggregation kernel therefore covers F32-input aggs in a single
 dispatch, while F64 inputs fall through to the M2 per-agg path (8 separate
-dispatches × ~20–50 ms each — see ``docs/architecture.md`` § "F32 vs
+dispatches x ~20-50 ms each - see ``docs/architecture.md`` section "F32 vs
 F64 on this chip"). Comparing the F32 canonical Q1 vs CPU is the
 architectural reading: "what could be on hardware with the right
 primitives." The F64 number is a chip-limitation reading, not an engine

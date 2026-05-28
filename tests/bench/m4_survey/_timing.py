@@ -26,7 +26,7 @@ class BenchResult:
     n_iters: int
     extra: dict[str, object]
 
-    def __str__(self) -> str:  # noqa: D401
+    def __str__(self) -> str:
         return (
             f"{self.name:50s} median={self.median_ms:9.2f}ms  "
             f"min={self.min_ms:9.2f}ms  max={self.max_ms:9.2f}ms  "

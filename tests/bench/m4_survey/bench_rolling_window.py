@@ -52,9 +52,7 @@ def main() -> None:
     for w in (100, 1000):
         time_callable(
             f"rolling_quantile_p50[w={w}]",
-            lambda w=w: df.select(
-                pl.col("x").rolling_quantile(quantile=0.5, window_size=w)
-            ),
+            lambda w=w: df.select(pl.col("x").rolling_quantile(quantile=0.5, window_size=w)),
             extra={"window": w},
         )
 
