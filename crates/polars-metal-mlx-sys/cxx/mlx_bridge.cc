@@ -267,34 +267,22 @@ std::shared_ptr<MlxArray> mlx_op_where(
 
 std::shared_ptr<MlxArray> mlx_array_from_bool_data(const uint8_t* data, size_t n) {
     if (n == 0) {
-        // Empty array of bool dtype.
         auto base = std::make_shared<mlx::core::array>(
             static_cast<const bool*>(nullptr),
             std::vector<int>{0},
             mlx::core::bool_);
         return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
     }
-    // Convert each uint8 byte to bool: non-zero -> true, zero -> false.
-    // We cannot pass uint8* directly as bool* since MLX's array(ptr, shape, dtype)
-    // is typed. Instead we copy into a temporary bool vector.
-    std::vector<bool> bvec(n);
-    for (size_t i = 0; i < n; ++i) {
-        bvec[i] = (data[i] != 0);
-    }
-    // mlx::core::array has a constructor from std::vector<bool>:
-    //   array(std::initializer_list<T> data, Dtype dtype = ...)
-    // but not from std::vector<bool> directly (vector<bool> is specialised).
-    // Use the pointer+shape constructor with a temporary array of uint8 values
-    // reinterpreted as bool via a plain bool[n] allocation.
-    std::vector<uint8_t> braw(n);
-    for (size_t i = 0; i < n; ++i) {
-        braw[i] = (data[i] != 0) ? 1 : 0;
-    }
-    // MLX's array(const T* data, Shape shape, Dtype dtype) copies the data.
-    // Passing braw.data() (uint8_t*) with bool_ dtype: MLX treats each byte as
-    // a bool (non-zero = true).
+    // MLX's iterator constructor (see vendor/mlx/mlx/array.h:37-42):
+    //   template <typename It>
+    //   explicit array(It data, Shape shape, Dtype dtype = ...);
+    // reads N elements via the iterator and stores them under the requested
+    // dtype. For bool_, the underlying storage is 1 byte per element where
+    // 0 means false and non-zero means true. Rust's bool is guaranteed to be
+    // a 1-byte type with value 0 or 1, so the uint8 pointer can be passed
+    // directly with no conversion.
     auto base = std::make_shared<mlx::core::array>(
-        braw.data(),
+        data,
         std::vector<int>{static_cast<int>(n)},
         mlx::core::bool_);
     return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));

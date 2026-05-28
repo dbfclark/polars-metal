@@ -65,3 +65,34 @@ fn where_picks_per_element() {
     mlx_array_eval(&[r.clone()]).unwrap();
     assert_eq!(mlx_array_to_f32_vec(&r).unwrap(), vec![10.0, 2.0, 30.0]);
 }
+
+#[test]
+fn logical_and_or_not() {
+    // Closes the coverage gap on logical ops. Readback via where-cast since
+    // the dtype guard in mlx_array_to_f32_vec rejects Bool arrays directly.
+    let a = mlx_array_from_bool_slice(&[true, true, false, false]).unwrap();
+    let b = mlx_array_from_bool_slice(&[true, false, true, false]).unwrap();
+    let and = mlx_logical_and(&a, &b).unwrap();
+    let or = mlx_logical_or(&a, &b).unwrap();
+    let not_a = mlx_logical_not(&a).unwrap();
+
+    let one = mlx_array_from_f32_slice(&[1.0, 1.0, 1.0, 1.0]).unwrap();
+    let zero = mlx_array_from_f32_slice(&[0.0, 0.0, 0.0, 0.0]).unwrap();
+    let and_f = mlx_where(&and, &one, &zero).unwrap();
+    let or_f = mlx_where(&or, &one, &zero).unwrap();
+    let not_a_f = mlx_where(&not_a, &one, &zero).unwrap();
+    mlx_array_eval(&[and_f.clone(), or_f.clone(), not_a_f.clone()]).unwrap();
+
+    assert_eq!(
+        mlx_array_to_f32_vec(&and_f).unwrap(),
+        vec![1.0, 0.0, 0.0, 0.0]
+    );
+    assert_eq!(
+        mlx_array_to_f32_vec(&or_f).unwrap(),
+        vec![1.0, 1.0, 1.0, 0.0]
+    );
+    assert_eq!(
+        mlx_array_to_f32_vec(&not_a_f).unwrap(),
+        vec![0.0, 0.0, 1.0, 1.0]
+    );
+}
