@@ -74,7 +74,21 @@ fold (and when optimization is disabled). We support all three shapes.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date as _date, datetime as _datetime
 from typing import Any
+
+# Dtype tags the predicate path widens to I64 (the cmp_i64 kernel covers
+# all of them; the runtime evaluator casts the underlying buffer). Narrow
+# unsigned integers fit losslessly in i64; Date is stored as i32 days
+# since 1970-01-01 and widens to the literal's days-since-epoch encoding.
+_PREDICATE_I64_WIDEN: set[str] = {"I8", "I16", "I32", "U8", "U16", "U32", "Date"}
+
+# F32 columns widen to F64 for the cmp_f64 kernel — M2 only emitted F64
+# / I64 cmp shaders, and F32 → F64 casts are exact, so this is a lossless
+# detour. Without this, any F32 predicate falls back at the walker.
+_PREDICATE_F64_WIDEN: set[str] = {"F32"}
+
+_EPOCH = _date(1970, 1, 1)
 
 
 @dataclass(frozen=True)
@@ -125,6 +139,8 @@ def _walk_at_current(nt: Any) -> WalkResult:
         return _walk_group_by(nt, node)
     if cls == "Sort":
         return _walk_sort(nt, node)
+    if cls == "HStack":
+        return _walk_hstack(nt, node)
     return FallBack(reason=f"unsupported IR node: {cls}")
 
 
@@ -208,29 +224,51 @@ def _walk_simple_projection(nt: Any, node: Any) -> WalkResult:
 
 
 def _walk_select(nt: Any, node: Any) -> WalkResult:
-    """Lower a Select node iff every expression is a plain ``Column(name)``.
+    """Lower a Select node. Two recognized shapes:
 
-    Anything else — arithmetic, aliasing, casts, literals — falls back to
-    CPU in Phase 4.
+    - **Projection**: every expression is a plain ``Column(name)`` — emits a
+      ``Project`` plan node (M2 path).
+    - **Reduction** (Phase 13): every expression is an ``Agg`` or ``Len``
+      wrapping a column or expression — emits a ``GroupBy`` plan node with
+      empty keys. This is the IR shape TPC-H Q6 takes after optimization:
+      ``SELECT [(a*b).sum().alias(...)]`` over ``Filter/SimpleProjection``.
+      The kernel layer treats empty keys as a single group covering all
+      input rows.
+
+    A Select that mixes column projections and aggregations is not a valid
+    Polars shape at this level (the optimizer rewrites that into a
+    Select-over-GroupBy), so we don't try to handle the mix.
     """
     exprs = getattr(node, "expr", None)
     if exprs is None:
         return FallBack(reason="Select node missing .expr")
+    if len(exprs) == 0:
+        return FallBack(reason="Select with zero expressions")
 
-    columns: list[str] = []
+    classes: list[tuple[Any, str]] = []
     for e in exprs:
-        # PyExprIR has .node (int) and .output_name (str). To inspect the
-        # underlying shape, view_expression(node_id) returns the actual
-        # expression object (Column, BinaryExpr, etc.).
         try:
             inner_node = nt.view_expression(e.node)
         except Exception as ex:
             return FallBack(reason=f"could not view expression: {ex!r}")
-        inner_cls = type(inner_node).__name__
-        if inner_cls != "Column":
-            return FallBack(reason=f"Select expression {inner_cls} not supported in Phase 4")
-        # When the output_name differs from the column name, the projection
-        # involves an alias — also a Phase 4 fallback.
+        classes.append((inner_node, type(inner_node).__name__))
+
+    all_columns = all(cls == "Column" for _, cls in classes)
+    all_aggs = all(cls in ("Agg", "Len") for _, cls in classes)
+
+    if all_columns:
+        return _walk_select_projection(nt, exprs, classes)
+    if all_aggs:
+        return _walk_select_reduction(nt, exprs)
+    return FallBack(reason="Select mixes projections and aggregations")
+
+
+def _walk_select_projection(
+    nt: Any, exprs: list[Any], classes: list[tuple[Any, str]]
+) -> WalkResult:
+    """Existing M2 path: column-only Select becomes a Project plan node."""
+    columns: list[str] = []
+    for e, (inner_node, _cls) in zip(exprs, classes):
         col_name = getattr(inner_node, "name", None)
         if col_name is None:
             return FallBack(reason="Column expression missing .name")
@@ -238,9 +276,6 @@ def _walk_select(nt: Any, node: Any) -> WalkResult:
             return FallBack(reason="aliased Column projection")
         columns.append(str(col_name))
 
-    # Validate the output schema dtypes too — guards against e.g. struct
-    # columns sneaking through (we should fall back even on a plain Column
-    # if its dtype isn't in our closed set).
     out_schema = dict(nt.get_schema())
     for name, dtype in out_schema.items():
         if _map_dtype(dtype) is None:
@@ -255,6 +290,112 @@ def _walk_select(nt: Any, node: Any) -> WalkResult:
         return inner
 
     return Handled(plan={"kind": "Project", "input": inner.plan, "columns": columns})
+
+
+def _walk_select_reduction(nt: Any, exprs: list[Any]) -> WalkResult:
+    """Phase 13: Select(agg(...)) → empty-key GroupBy plan node.
+
+    The aggregation argument columns live in the *input* schema (not the
+    Select's output schema), so we mirror ``_walk_group_by``: navigate to
+    the input child, fetch its schema, then walk each agg expression
+    against that schema before recursing into the inner subtree.
+    """
+    inputs = nt.get_inputs()
+    if len(inputs) != 1:
+        return FallBack(reason=f"Select expected 1 input, got {len(inputs)}")
+
+    parent_id = nt.get_node()
+    nt.set_node(inputs[0])
+    try:
+        in_schema = dict(nt.get_schema())
+    finally:
+        nt.set_node(parent_id)
+
+    aggs: list[dict[str, str]] = []
+    for agg_expr in exprs:
+        agg_dict = _walk_agg_expression(nt, agg_expr, in_schema)
+        if agg_dict is None:
+            return FallBack(reason="Select reduction expression not in closed set")
+        aggs.append(agg_dict)
+
+    nt.set_node(inputs[0])
+    inner = _walk_at_current(nt)
+    if isinstance(inner, FallBack):
+        return inner
+
+    return Handled(
+        plan={
+            "kind": "GroupBy",
+            "input": inner.plan,
+            "keys": [],
+            "aggs": aggs,
+        }
+    )
+
+
+def _walk_hstack(nt: Any, node: Any) -> WalkResult:
+    """Lower an HStack (``with_columns``) IR node — appends one or more
+    derived columns to the input frame.
+
+    Polars' CSE optimizer hoists shared sub-expressions into a synthetic
+    HStack above GroupBy. The canonical example is Q1: the
+    ``(l_extendedprice * (1 - l_discount))`` sub-tree appears in two
+    aggregations, so the optimizer materializes it as
+    ``__POLARS_CSER_<hash>`` and rewrites the two aggs to reference the
+    new column.
+
+    Walker contract for HStack: every appended expression must be in the
+    M3 capability-G closed set (BinaryExpr/Column/Literal, max depth
+    ``_AGG_EXPR_MAX_DEPTH``). The dispatch path evaluates each expression
+    via Polars on the upstream DataFrame and stitches the new columns in
+    before downstream nodes consume.
+    """
+    exprs = getattr(node, "exprs", None)
+    if exprs is None:
+        return FallBack(reason="HStack node missing .exprs")
+    if len(exprs) == 0:
+        return FallBack(reason="HStack with zero expressions")
+
+    inputs = nt.get_inputs()
+    if len(inputs) != 1:
+        return FallBack(reason=f"HStack expected 1 input, got {len(inputs)}")
+
+    # Resolve expression sub-trees against the *input* schema (the
+    # appended columns aren't visible until after HStack runs).
+    parent_id = nt.get_node()
+    nt.set_node(inputs[0])
+    try:
+        in_schema = dict(nt.get_schema())
+    finally:
+        nt.set_node(parent_id)
+
+    out_exprs: list[dict] = []
+    for e in exprs:
+        node_id = getattr(e, "node", None)
+        if node_id is None:
+            return FallBack(reason="HStack expression has no .node id")
+        expr_dict = _walk_agg_expr_node(nt, node_id, in_schema, _AGG_EXPR_MAX_DEPTH)
+        if expr_dict is None:
+            return FallBack(reason="HStack expression not in closed set")
+        out_exprs.append(
+            {
+                "name": str(getattr(e, "output_name", "") or ""),
+                "expr": expr_dict,
+            }
+        )
+
+    nt.set_node(inputs[0])
+    inner = _walk_at_current(nt)
+    if isinstance(inner, FallBack):
+        return inner
+
+    return Handled(
+        plan={
+            "kind": "HStack",
+            "input": inner.plan,
+            "exprs": out_exprs,
+        }
+    )
 
 
 def _walk_sort(nt: Any, node: Any) -> WalkResult:
@@ -370,19 +511,16 @@ def _walk_filter(nt: Any, node: Any) -> WalkResult:
     # for the surviving columns (the post-Filter schema is the same as
     # the input schema — Filter doesn't drop columns).
     #
-    # Utf8 is a *key-only* dtype (M3 Phase 7 Task 34): the filter
-    # compaction kernels don't speak strings yet. Reject so Polars
-    # routes the entire filter through CPU rather than blowing up
-    # inside `compact_one_column`.
+    # Utf8 is allowed even though `compact_one_column` (M2 GPU compaction)
+    # can't materialize strings: Phase 10's `_filter_via_polars` route
+    # (used when a GroupBy sits above the Filter) handles strings fine
+    # through Polars CPU. Top-level Filter dispatch detects Utf8 and
+    # falls back to the same CPU path in `_udf._dispatch_filter`.
     out_schema = dict(nt.get_schema())
     for name, dtype in out_schema.items():
         mapped = _map_dtype(dtype)
         if mapped is None:
             return FallBack(reason=f"unsupported dtype {dtype!s} on column {name!r}")
-        if mapped == "Utf8":
-            return FallBack(
-                reason=f"Filter on frames containing Utf8 column {name!r} not yet supported"
-            )
 
     inputs = nt.get_inputs()
     if len(inputs) != 1:
@@ -746,6 +884,16 @@ def _walk_predicate(nt: Any, node_id: int) -> dict | None:
         m1_dtype = _map_dtype(dtype)
         if m1_dtype is None:
             return None
+        # Predicate-side widening: narrow integer dtypes and Date are
+        # stored internally as i8/i16/i32; the cmp_i64 kernel covers all
+        # i64 comparisons, so we widen here and the evaluator
+        # (`_udf._evaluate_compare`) casts the Polars Series to Int64
+        # before materializing the buffer. F32 columns analogously widen
+        # to F64 for the cmp_f64 kernel.
+        if m1_dtype in _PREDICATE_I64_WIDEN:
+            m1_dtype = "I64"
+        elif m1_dtype in _PREDICATE_F64_WIDEN:
+            m1_dtype = "F64"
         return {"kind": "Column", "name": str(name), "dtype": m1_dtype}
 
     if cls == "Literal":
@@ -757,6 +905,11 @@ def _walk_predicate(nt: Any, node_id: int) -> dict | None:
         # `bool` is a subclass of `int`; check bool first.
         if isinstance(value, bool):
             return {"kind": "LiteralBool", "value": bool(value)}
+        # `datetime.date` (but not `datetime.datetime`, which is a Date
+        # subclass with finer resolution). Convert to days-since-1970 so
+        # the value matches the widened Date column buffer.
+        if isinstance(value, _date) and not isinstance(value, _datetime):
+            return {"kind": "LiteralI64", "value": (value - _EPOCH).days}
         if isinstance(value, int):
             return {"kind": "LiteralI64", "value": int(value)}
         if isinstance(value, float):
@@ -905,4 +1058,12 @@ def _map_dtype(dt: Any) -> str | None:
         return "U32"
     if s in ("String", "Utf8"):
         return "Utf8"
+    if s == "Date":
+        # pl.Date is stored as Int32 days-since-1970-01-01. The predicate
+        # path widens Date comparisons to the cmp_i64 kernel via a runtime
+        # cast (see `_udf._evaluate_compare`); other paths that pass
+        # through `_map_dtype` will today reject Date downstream (no
+        # groupby-on-Date, no sum-of-Date), which is the correct behavior
+        # for M3.
+        return "Date"
     return None

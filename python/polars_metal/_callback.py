@@ -113,4 +113,7 @@ def _strip_side_channels(plan: dict) -> dict:
         out["by_columns"] = plan.get("by_columns", [])
         out["descending"] = plan.get("descending", [])
         out["nulls_last"] = plan.get("nulls_last", [])
+    elif plan["kind"] == "HStack":
+        out["input"] = _strip_side_channels(plan["input"])
+        out["exprs"] = plan.get("exprs", [])
     return out

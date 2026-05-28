@@ -83,6 +83,14 @@ impl MetalDtype {
             "U16" => Some(MetalDtype::U16),
             "U32" => Some(MetalDtype::U32),
             "Utf8" | "String" => Some(MetalDtype::Utf8),
+            // pl.Date is stored as Int32 days-since-1970 — same physical
+            // layout as I32. We alias here rather than add a Date variant
+            // because the kernels never need to distinguish at runtime:
+            // groupby/encoder/scan all consume the raw i32 buffer. The
+            // predicate path widens Date to I64 at the walker level so the
+            // existing cmp_i64 kernel handles Date comparisons (see
+            // `_walker._PREDICATE_I64_WIDEN`).
+            "Date" => Some(MetalDtype::I32),
             _ => None,
         }
     }
