@@ -7,6 +7,8 @@ pub enum FfiError {
     ShapeMismatch { lhs: usize, rhs: usize },
     #[error("MLX runtime error: {0}")]
     Runtime(String),
+    #[error("MLX array construction failed (null handle returned)")]
+    ConstructionFailed,
 }
 
 impl From<cxx::Exception> for FfiError {

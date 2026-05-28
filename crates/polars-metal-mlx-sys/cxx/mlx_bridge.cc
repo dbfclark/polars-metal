@@ -87,4 +87,51 @@ void cumsum_u8_to_u32(
                 static_cast<size_t>(n) * sizeof(uint32_t));
 }
 
+// ── M4 Phase 1: MlxArray handle ──────────────────────────────────────────────
+
+std::shared_ptr<MlxArray> mlx_array_from_f32_data(const float* data, size_t n) {
+    // Shape is std::vector<int32_t> in MLX v0.22.0 (same as add_f32 above).
+    // n == 0 produces an empty shape; MLX accepts this and creates a length-0
+    // 1-D array (shape = {0}).
+    int32_t shape_n = static_cast<int32_t>(n);
+    // When n == 0 the pointer may be dangling (Rust passes NonNull::dangling());
+    // MLX must not dereference it. We pass nullptr explicitly in that case.
+    const float* src = (n == 0) ? nullptr : data;
+    // Construct a mlx::core::array then up-cast to MlxArray via shared_ptr
+    // aliasing. MlxArray inherits from mlx::core::array so the static_cast
+    // is well-defined; we use the aliasing constructor so the control block
+    // is shared and lifetime is correct.
+    auto base = std::make_shared<mlx::core::array>(src, std::vector<int>{shape_n}, mlx::core::float32);
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
+rust::Vec<uint64_t> mlx_array_shape(const std::shared_ptr<MlxArray>& arr) {
+    rust::Vec<uint64_t> out;
+    for (auto d : arr->shape()) {
+        out.push_back(static_cast<uint64_t>(d));
+    }
+    return out;
+}
+
+bool mlx_array_is_f32(const std::shared_ptr<MlxArray>& arr) {
+    return arr->dtype() == mlx::core::float32;
+}
+
+void mlx_array_copy_to_f32(
+    const std::shared_ptr<MlxArray>& arr, float* out, size_t n) {
+    // Caller guarantees the array has been eval'd and `out` holds at least n
+    // floats. data<float>() returns a pointer into MLX-managed memory.
+    const float* src = arr->data<float>();
+    std::memcpy(out, src, n * sizeof(float));
+}
+
+void mlx_array_eval_one(const std::shared_ptr<MlxArray>& arr) {
+    // mlx::core::eval's variadic template checks is_arrays_v<T> which only
+    // matches mlx::core::array exactly. Downcast to the base type so the
+    // template constraint is satisfied. The static_cast is safe because
+    // MlxArray publicly inherits from mlx::core::array.
+    mlx::core::array& base = static_cast<mlx::core::array&>(*arr);
+    mlx::core::eval(base);
+}
+
 }  // namespace polars_metal_mlx

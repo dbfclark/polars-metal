@@ -12,6 +12,13 @@
 mod error;
 pub use error::FfiError;
 
+pub mod array;
+
+// cxx's SharedPtr<T> implementation expands a panic! macro in the generated
+// Rust glue (inside SharedPtr::is_null()'s unreachable branch). This is
+// internal to the cxx crate and cannot be suppressed at the call site.
+// Allow clippy::panic for this module only.
+#[allow(clippy::panic)]
 #[cxx::bridge(namespace = "polars_metal_mlx")]
 mod ffi {
     unsafe extern "C++" {
@@ -32,6 +39,34 @@ mod ffi {
         // into the caller's output slice — those are the only data-touching
         // passes left in this call. T30 Step 3 / `docs/open-questions.md`.
         fn cumsum_u8_to_u32(input: &[u8], output: &mut [u32]) -> Result<()>;
+
+        // M4 Phase 1: array construction + eval + readback.
+        //
+        // MlxArray is a type alias for mlx::core::array on the C++ side,
+        // exposed here as an opaque cxx type. All access is via SharedPtr
+        // so the MLX refcount manages lifetime (drop is refcount decrement).
+        type MlxArray;
+
+        // Construct a 1-D F32 array from a raw pointer + length. The MLX
+        // `array(ptr, shape, dtype)` constructor copies the input bytes into
+        // MLX-owned memory (one memcpy). Returns a null SharedPtr on failure.
+        // SAFETY: `data` must point to at least `n` valid f32 values.
+        unsafe fn mlx_array_from_f32_data(data: *const f32, n: usize) -> SharedPtr<MlxArray>;
+
+        // Return the shape of `arr` as a Vec<u64>. Wraps `arr->shape()`.
+        fn mlx_array_shape(arr: &SharedPtr<MlxArray>) -> Vec<u64>;
+
+        // Return true iff `arr`'s dtype is mlx::core::float32.
+        fn mlx_array_is_f32(arr: &SharedPtr<MlxArray>) -> bool;
+
+        // Copy `n` f32 values from the materialized array into the
+        // caller-provided buffer. Must be called after `mlx_array_eval_one`.
+        // SAFETY: `out` must point to a buffer of at least `n` f32 values.
+        unsafe fn mlx_array_copy_to_f32(arr: &SharedPtr<MlxArray>, out: *mut f32, n: usize);
+
+        // Force evaluation (materialize) of a single array. Wraps
+        // `mlx::core::eval(*arr)`. Returns Err on any MLX exception.
+        fn mlx_array_eval_one(arr: &SharedPtr<MlxArray>) -> Result<()>;
     }
 }
 
