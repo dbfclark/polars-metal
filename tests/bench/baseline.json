@@ -200,6 +200,7 @@
       "metal_ms": null,
       "ratio_metal_over_cpu": null,
       "n_rows": 200000,
+      "n_cols": 200,
       "hardware": "M2 Ultra",
       "_notes": "M4 placeholder: 200x200000 correlation matrix via MLX matmul. Target wall-clock < 22.0 ms; ratio gate set at landing.",
       "_pending": true,

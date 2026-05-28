@@ -91,7 +91,7 @@ def test_pending_entry_with_failing_ratio_is_skipped():
     baseline = _baseline_with(
         {
             "phase8_placeholder": {
-                "ratio_metal_over_cpu": 5.0,  # would fail any reasonable gate
+                "ratio_metal_over_cpu": 5.0,
                 "_gate": {"ratio_lt": 1.0},
                 "_pending": True,
             },
