@@ -57,7 +57,10 @@ mod ffi {
         // `array(ptr, shape, dtype)` constructor copies the input bytes into
         // MLX-owned memory (one memcpy). Returns a null SharedPtr on failure.
         // SAFETY: `data` must point to at least `n` valid f32 values.
-        unsafe fn mlx_array_from_f32_data(data: *const f32, n: usize) -> SharedPtr<MlxArray>;
+        unsafe fn mlx_array_from_f32_data(
+            data: *const f32,
+            n: usize,
+        ) -> Result<SharedPtr<MlxArray>>;
 
         // Return the shape of `arr` as a Vec<u64>. Wraps `arr->shape()`.
         fn mlx_array_shape(arr: &SharedPtr<MlxArray>) -> Vec<u64>;

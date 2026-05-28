@@ -93,8 +93,9 @@ impl MlxArrayHandle {
 /// constructor. Empty slices produce a valid, zero-element handle.
 ///
 /// # Errors
-/// Returns `FfiError::ConstructionFailed` if the C++ side returns a null
-/// `SharedPtr` (should not happen under normal conditions, but defensive).
+/// Returns `FfiError::Runtime` on MLX-side construction throws (e.g.
+/// allocation failure), or `FfiError::ConstructionFailed` if the C++
+/// returns a null `SharedPtr` without throwing.
 pub fn mlx_array_from_f32_slice(data: &[f32]) -> Result<MlxArrayHandle, FfiError> {
     // Empty slice: pass null so the invariant is self-contained in Rust.
     // The C++ bridge already short-circuits on `n == 0` and never dereferences
@@ -107,7 +108,8 @@ pub fn mlx_array_from_f32_slice(data: &[f32]) -> Result<MlxArrayHandle, FfiError
     // SAFETY: `ptr` is either a valid pointer to at least `data.len()` f32
     // values, or `std::ptr::null()` with `n == 0`. The C++ side never
     // dereferences a null pointer when `n == 0`.
-    let handle = unsafe { ffi::mlx_array_from_f32_data(ptr, data.len()) };
+    let handle =
+        unsafe { ffi::mlx_array_from_f32_data(ptr, data.len()) }.map_err(FfiError::from)?;
     if handle.is_null() {
         return Err(FfiError::ConstructionFailed);
     }
