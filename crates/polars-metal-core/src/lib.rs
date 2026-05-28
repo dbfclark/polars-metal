@@ -8,6 +8,7 @@
 
 mod arena;
 mod error;
+pub mod fusion;
 pub mod plan;
 pub mod router;
 mod router_udf;
