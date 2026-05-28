@@ -193,4 +193,111 @@ std::shared_ptr<MlxArray> mlx_array_view_mtl_buffer(
     return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
 }
 
+// ── M4 Phase 1 Task 6: elementwise implementations ───────────────────────────
+//
+// Pattern: call mlx::core::OP_NAME(*a, *b) (returns mlx::core::array by value),
+// then wrap into shared_ptr<MlxArray> via the aliasing constructor (same
+// pattern as mlx_array_from_f32_data above).
+//
+// The static_cast<mlx::core::array&> dereference downcast is needed because
+// MlxArray inherits from mlx::core::array but the operator* of shared_ptr
+// returns MlxArray&; MLX ops expect mlx::core::array const& which is fine
+// via implicit upcast. The aliasing constructor then upcasts the result back
+// to MlxArray*.
+
+#define MLX_WRAP_BINOP(rust_name, mlx_op)                                               \
+std::shared_ptr<MlxArray> rust_name(                                                     \
+    const std::shared_ptr<MlxArray>& a, const std::shared_ptr<MlxArray>& b) {           \
+    auto base = std::make_shared<mlx::core::array>(                                      \
+        mlx::core::mlx_op(static_cast<const mlx::core::array&>(*a),                     \
+                          static_cast<const mlx::core::array&>(*b)));                    \
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));          \
+}
+
+#define MLX_WRAP_UNOP(rust_name, mlx_op)                                                 \
+std::shared_ptr<MlxArray> rust_name(const std::shared_ptr<MlxArray>& a) {               \
+    auto base = std::make_shared<mlx::core::array>(                                      \
+        mlx::core::mlx_op(static_cast<const mlx::core::array&>(*a)));                   \
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));          \
+}
+
+// MLX function name mapping (verified against vendor/mlx/mlx/ops.h):
+//   Rust binding -> MLX function
+//   mlx_op_sub   -> subtract
+//   mlx_op_mul   -> multiply
+//   mlx_op_div   -> divide
+//   mlx_op_mod   -> remainder
+//   mlx_op_pow   -> power
+//   mlx_op_ne    -> not_equal
+//   mlx_op_neg   -> negative
+MLX_WRAP_BINOP(mlx_op_add,         add)
+MLX_WRAP_BINOP(mlx_op_sub,         subtract)
+MLX_WRAP_BINOP(mlx_op_mul,         multiply)
+MLX_WRAP_BINOP(mlx_op_div,         divide)
+MLX_WRAP_BINOP(mlx_op_mod,         remainder)
+MLX_WRAP_BINOP(mlx_op_pow,         power)
+MLX_WRAP_BINOP(mlx_op_eq,          equal)
+MLX_WRAP_BINOP(mlx_op_ne,          not_equal)
+MLX_WRAP_BINOP(mlx_op_lt,          less)
+MLX_WRAP_BINOP(mlx_op_le,          less_equal)
+MLX_WRAP_BINOP(mlx_op_gt,          greater)
+MLX_WRAP_BINOP(mlx_op_ge,          greater_equal)
+MLX_WRAP_BINOP(mlx_op_logical_and, logical_and)
+MLX_WRAP_BINOP(mlx_op_logical_or,  logical_or)
+MLX_WRAP_UNOP(mlx_op_logical_not,  logical_not)
+MLX_WRAP_UNOP(mlx_op_neg,          negative)
+MLX_WRAP_UNOP(mlx_op_abs,          abs)
+MLX_WRAP_UNOP(mlx_op_square,       square)
+
+#undef MLX_WRAP_BINOP
+#undef MLX_WRAP_UNOP
+
+std::shared_ptr<MlxArray> mlx_op_where(
+    const std::shared_ptr<MlxArray>& cond,
+    const std::shared_ptr<MlxArray>& then_v,
+    const std::shared_ptr<MlxArray>& else_v)
+{
+    auto base = std::make_shared<mlx::core::array>(
+        mlx::core::where(
+            static_cast<const mlx::core::array&>(*cond),
+            static_cast<const mlx::core::array&>(*then_v),
+            static_cast<const mlx::core::array&>(*else_v)));
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
+std::shared_ptr<MlxArray> mlx_array_from_bool_data(const uint8_t* data, size_t n) {
+    if (n == 0) {
+        // Empty array of bool dtype.
+        auto base = std::make_shared<mlx::core::array>(
+            static_cast<const bool*>(nullptr),
+            std::vector<int>{0},
+            mlx::core::bool_);
+        return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+    }
+    // Convert each uint8 byte to bool: non-zero -> true, zero -> false.
+    // We cannot pass uint8* directly as bool* since MLX's array(ptr, shape, dtype)
+    // is typed. Instead we copy into a temporary bool vector.
+    std::vector<bool> bvec(n);
+    for (size_t i = 0; i < n; ++i) {
+        bvec[i] = (data[i] != 0);
+    }
+    // mlx::core::array has a constructor from std::vector<bool>:
+    //   array(std::initializer_list<T> data, Dtype dtype = ...)
+    // but not from std::vector<bool> directly (vector<bool> is specialised).
+    // Use the pointer+shape constructor with a temporary array of uint8 values
+    // reinterpreted as bool via a plain bool[n] allocation.
+    std::vector<uint8_t> braw(n);
+    for (size_t i = 0; i < n; ++i) {
+        braw[i] = (data[i] != 0) ? 1 : 0;
+    }
+    // MLX's array(const T* data, Shape shape, Dtype dtype) copies the data.
+    // Passing braw.data() (uint8_t*) with bool_ dtype: MLX treats each byte as
+    // a bool (non-zero = true).
+    auto base = std::make_shared<mlx::core::array>(
+        braw.data(),
+        std::vector<int>{static_cast<int>(n)},
+        mlx::core::bool_);
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
 }  // namespace polars_metal_mlx

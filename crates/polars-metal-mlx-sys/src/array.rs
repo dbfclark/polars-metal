@@ -117,6 +117,44 @@ pub fn mlx_array_from_f32_slice(data: &[f32]) -> Result<MlxArrayHandle, FfiError
     })
 }
 
+/// Construct a 1-D Bool `MlxArrayHandle` from a Rust `&[bool]` slice.
+///
+/// Each `bool` value is passed to the C++ side as a `u8` byte (Rust guarantees
+/// `false == 0u8`, `true == 1u8`). The C++ implementation copies these bytes
+/// into MLX-owned memory and constructs an array with `mlx::core::bool_` dtype.
+///
+/// Empty slices produce a valid zero-element handle.
+///
+/// # Errors
+/// Returns `FfiError::ConstructionFailed` if the C++ side returns a null
+/// `SharedPtr` (should not happen under normal conditions, but defensive).
+pub fn mlx_array_from_bool_slice(data: &[bool]) -> Result<MlxArrayHandle, FfiError> {
+    // SAFETY: `bool` is exactly 1 byte with bit pattern 0 (false) or 1 (true)
+    // per the Rust reference. Reinterpreting as `&[u8]` is sound because:
+    //   - size_of::<bool>() == size_of::<u8>() == 1
+    //   - align_of::<bool>() == align_of::<u8>() == 1
+    //   - Every bool value is a valid u8 value (0 or 1)
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len()) };
+    let ptr = if data.is_empty() {
+        std::ptr::null()
+    } else {
+        bytes.as_ptr()
+    };
+    // SAFETY: `ptr` is either a valid pointer to `data.len()` u8 values (each
+    // representing a bool: 0=false, non-zero=true) or null with `n == 0`. The
+    // C++ side never dereferences a null pointer when `n == 0`.
+    let handle =
+        unsafe { ffi::mlx_array_from_bool_data(ptr, data.len()) }.map_err(FfiError::from)?;
+    if handle.is_null() {
+        return Err(FfiError::ConstructionFailed);
+    }
+    Ok(MlxArrayHandle {
+        ptr: handle,
+        _input_refs: Vec::new(),
+    })
+}
+
 /// Force evaluation (materialization) of each handle in `handles`.
 ///
 /// Iterates one at a time. See module-level doc for why batch eval is deferred.

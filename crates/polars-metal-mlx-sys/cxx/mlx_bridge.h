@@ -105,4 +105,44 @@ std::shared_ptr<MlxArray> mlx_array_view_mtl_buffer(
     rust::Slice<const int64_t> shape,
     uint32_t dtype);
 
+// ── M4 Phase 1 Task 6: elementwise op declarations ───────────────────────────
+//
+// All wrap mlx::core::* ops via the same aliasing-shared_ptr pattern as
+// Task 4/5. All throw on dtype/shape errors; cxx maps to Rust Err.
+// MLX function names verified against vendor/mlx/mlx/ops.h:
+//   subtract (not sub), multiply (not mul), divide (not div),
+//   remainder (not mod), power (not pow), negative (not neg),
+//   logical_not/logical_and/logical_or, abs, square, where (in mlx::core::).
+
+std::shared_ptr<MlxArray> mlx_op_add(const std::shared_ptr<MlxArray>& a, const std::shared_ptr<MlxArray>& b);
+std::shared_ptr<MlxArray> mlx_op_sub(const std::shared_ptr<MlxArray>& a, const std::shared_ptr<MlxArray>& b);
+std::shared_ptr<MlxArray> mlx_op_mul(const std::shared_ptr<MlxArray>& a, const std::shared_ptr<MlxArray>& b);
+std::shared_ptr<MlxArray> mlx_op_div(const std::shared_ptr<MlxArray>& a, const std::shared_ptr<MlxArray>& b);
+std::shared_ptr<MlxArray> mlx_op_mod(const std::shared_ptr<MlxArray>& a, const std::shared_ptr<MlxArray>& b);
+std::shared_ptr<MlxArray> mlx_op_pow(const std::shared_ptr<MlxArray>& a, const std::shared_ptr<MlxArray>& b);
+
+std::shared_ptr<MlxArray> mlx_op_eq(const std::shared_ptr<MlxArray>& a, const std::shared_ptr<MlxArray>& b);
+std::shared_ptr<MlxArray> mlx_op_ne(const std::shared_ptr<MlxArray>& a, const std::shared_ptr<MlxArray>& b);
+std::shared_ptr<MlxArray> mlx_op_lt(const std::shared_ptr<MlxArray>& a, const std::shared_ptr<MlxArray>& b);
+std::shared_ptr<MlxArray> mlx_op_le(const std::shared_ptr<MlxArray>& a, const std::shared_ptr<MlxArray>& b);
+std::shared_ptr<MlxArray> mlx_op_gt(const std::shared_ptr<MlxArray>& a, const std::shared_ptr<MlxArray>& b);
+std::shared_ptr<MlxArray> mlx_op_ge(const std::shared_ptr<MlxArray>& a, const std::shared_ptr<MlxArray>& b);
+
+std::shared_ptr<MlxArray> mlx_op_logical_and(const std::shared_ptr<MlxArray>& a, const std::shared_ptr<MlxArray>& b);
+std::shared_ptr<MlxArray> mlx_op_logical_or(const std::shared_ptr<MlxArray>& a, const std::shared_ptr<MlxArray>& b);
+std::shared_ptr<MlxArray> mlx_op_logical_not(const std::shared_ptr<MlxArray>& a);
+
+std::shared_ptr<MlxArray> mlx_op_neg(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_abs(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_square(const std::shared_ptr<MlxArray>& a);
+
+std::shared_ptr<MlxArray> mlx_op_where(
+    const std::shared_ptr<MlxArray>& cond,
+    const std::shared_ptr<MlxArray>& then_v,
+    const std::shared_ptr<MlxArray>& else_v);
+
+// Construct a 1-D bool MlxArray from a raw pointer + element count.
+// Each non-zero byte becomes true. `n == 0` is allowed (pass null for data).
+std::shared_ptr<MlxArray> mlx_array_from_bool_data(const uint8_t* data, size_t n);
+
 }  // namespace polars_metal_mlx

@@ -13,6 +13,7 @@ mod error;
 pub use error::FfiError;
 
 pub mod array;
+pub mod elementwise;
 
 // cxx's SharedPtr<T> implementation expands a panic! macro in the generated
 // Rust glue (inside SharedPtr::is_null()'s unreachable branch). This is
@@ -87,6 +88,88 @@ mod ffi {
             mtl_ptr: *const u8,
             shape: &[i64],
             dtype: u32,
+        ) -> Result<SharedPtr<MlxArray>>;
+
+        // M4 Phase 1 Task 6: elementwise op bindings.
+        // Each takes one or more SharedPtr<MlxArray> args and returns a fresh
+        // SharedPtr<MlxArray> representing the graph node (lazy; eval to materialize).
+        // Operations throw on dtype/shape mismatch, which propagates via Result<>.
+
+        fn mlx_op_add(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_sub(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_mul(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_div(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_mod(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_pow(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_eq(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_ne(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_lt(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_le(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_gt(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_ge(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_logical_and(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_logical_or(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_logical_not(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_neg(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_abs(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_square(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_where(
+            cond: &SharedPtr<MlxArray>,
+            then_v: &SharedPtr<MlxArray>,
+            else_v: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+
+        // SAFETY: `data` must point to at least `n` valid u8 values (each representing
+        // a bool: 0=false, non-zero=true), or be null when `n == 0`.
+        unsafe fn mlx_array_from_bool_data(
+            data: *const u8,
+            n: usize,
         ) -> Result<SharedPtr<MlxArray>>;
     }
 }
