@@ -9,6 +9,8 @@ pub enum FfiError {
     Runtime(String),
     #[error("MLX array construction failed (null handle returned)")]
     ConstructionFailed,
+    #[error("MLX array dtype mismatch: expected F32, got non-F32 (cannot read as f32)")]
+    DtypeMismatch,
 }
 
 impl From<cxx::Exception> for FfiError {

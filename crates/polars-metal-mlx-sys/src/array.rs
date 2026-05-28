@@ -10,7 +10,7 @@
 //! MTLBuffer view is added in Task 5.
 //!
 //! # Eval
-//! `mlx_eval` accepts a slice of handles and evaluates them one at a time.
+//! `mlx_array_eval` accepts a slice of handles and evaluates them one at a time.
 //! True batch eval via `mlx::core::eval(vector<array>)` is deferred: cxx's
 //! `SharedPtr<T>` cannot be placed in a `CxxVector`, so batching requires a
 //! bespoke C++ helper that takes raw pointers. One-at-a-time is correct and
@@ -53,15 +53,17 @@ impl MlxArrayHandle {
 /// Returns `FfiError::ConstructionFailed` if the C++ side returns a null
 /// `SharedPtr` (should not happen under normal conditions, but defensive).
 pub fn mlx_array_from_f32_slice(data: &[f32]) -> Result<MlxArrayHandle, FfiError> {
-    // Empty slice: use a non-null but length-zero pointer. The MLX array
-    // constructor accepts `n == 0` and produces an empty array.
+    // Empty slice: pass null so the invariant is self-contained in Rust.
+    // The C++ bridge already short-circuits on `n == 0` and never dereferences
+    // the pointer in that case (see `mlx_array_from_f32_data` in mlx_bridge.cc).
     let ptr = if data.is_empty() {
-        std::ptr::NonNull::dangling().as_ptr() as *const f32
+        std::ptr::null()
     } else {
         data.as_ptr()
     };
-    // SAFETY: `ptr` points to at least `data.len()` valid f32 values (or
-    // `n == 0`, in which case MLX does not dereference it).
+    // SAFETY: `ptr` is either a valid pointer to at least `data.len()` f32
+    // values, or `std::ptr::null()` with `n == 0`. The C++ side never
+    // dereferences a null pointer when `n == 0`.
     let handle = unsafe { ffi::mlx_array_from_f32_data(ptr, data.len()) };
     if handle.is_null() {
         return Err(FfiError::ConstructionFailed);
@@ -75,7 +77,7 @@ pub fn mlx_array_from_f32_slice(data: &[f32]) -> Result<MlxArrayHandle, FfiError
 ///
 /// # Errors
 /// Returns the first `FfiError` encountered (wrapping the MLX exception).
-pub fn mlx_eval(handles: &[MlxArrayHandle]) -> Result<(), FfiError> {
+pub fn mlx_array_eval(handles: &[MlxArrayHandle]) -> Result<(), FfiError> {
     for h in handles {
         ffi::mlx_array_eval_one(&h.0).map_err(FfiError::from)?;
     }
@@ -84,12 +86,16 @@ pub fn mlx_eval(handles: &[MlxArrayHandle]) -> Result<(), FfiError> {
 
 /// Copy the materialized values out of `handle` into a new `Vec<f32>`.
 ///
-/// Must be called after [`mlx_eval`] (or equivalent). Returns an empty `Vec`
-/// for a zero-element array without touching the C++ side.
+/// Must be called after [`mlx_array_eval`] (or equivalent). Returns an empty
+/// `Vec` for a zero-element array without touching the C++ side.
 ///
 /// # Errors
+/// Returns `FfiError::DtypeMismatch` if the array's dtype is not F32.
 /// Returns `FfiError::Runtime` if the copy fails on the C++ side.
 pub fn mlx_array_to_f32_vec(handle: &MlxArrayHandle) -> Result<Vec<f32>, FfiError> {
+    if !handle.dtype_is_f32() {
+        return Err(FfiError::DtypeMismatch);
+    }
     let n: usize = handle.shape().iter().product();
     if n == 0 {
         return Ok(Vec::new());
@@ -98,7 +104,8 @@ pub fn mlx_array_to_f32_vec(handle: &MlxArrayHandle) -> Result<Vec<f32>, FfiErro
     // SAFETY: `out.as_mut_ptr()` points to a live allocation of exactly `n`
     // f32 values. The C++ function writes exactly `n * sizeof(float)` bytes
     // into that buffer via `std::memcpy`. The array has been eval'd (caller
-    // contract), so `arr->data<float>()` is valid.
+    // contract), so `arr->data<float>()` is valid. The dtype check above
+    // guarantees the underlying buffer is correctly typed as float32.
     unsafe {
         ffi::mlx_array_copy_to_f32(&handle.0, out.as_mut_ptr(), n);
     }
