@@ -1,7 +1,37 @@
 // crates/polars-metal-mlx-sys/build.rs
 use std::path::PathBuf;
 
+const REQUIRED_MLX_VERSION: &str = "0.22.0";
+
+fn check_mlx_version() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cmake_lists = manifest_dir.join("../../vendor/mlx/CMakeLists.txt");
+    let contents = match std::fs::read_to_string(&cmake_lists) {
+        Ok(s) => s,
+        Err(_) => {
+            println!("cargo:warning=could not read vendor/mlx/CMakeLists.txt to verify MLX version");
+            return;
+        }
+    };
+    // Look for `set(MLX_VERSION X.Y.Z)`
+    for line in contents.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("set(MLX_VERSION ") {
+            let found = rest.trim_end_matches(')').trim().to_string();
+            if found != REQUIRED_MLX_VERSION {
+                println!(
+                    "cargo:warning=vendor/mlx MLX_VERSION={found} but polars-metal-mlx-sys pins {REQUIRED_MLX_VERSION}; bump deliberately"
+                );
+            }
+            return;
+        }
+    }
+    println!("cargo:warning=could not parse MLX_VERSION from vendor/mlx/CMakeLists.txt");
+}
+
 fn main() {
+    check_mlx_version();
+
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     // vendor/mlx is at <repo-root>/vendor/mlx; this crate is at
     // <repo-root>/crates/polars-metal-mlx-sys, so go up two levels.
@@ -30,6 +60,7 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=Foundation");
     println!("cargo:rustc-link-lib=framework=QuartzCore");
 
+    println!("cargo:rerun-if-changed=../../vendor/mlx/CMakeLists.txt");
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=cxx/mlx_bridge.h");
     println!("cargo:rerun-if-changed=cxx/mlx_bridge.cc");
