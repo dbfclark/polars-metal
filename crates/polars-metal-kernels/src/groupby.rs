@@ -101,7 +101,12 @@ pub struct KeyField {
 
 /// Schema for a composite-key encoding. Sufficient to decode an encoded
 /// u128 stream back to per-column values.
-#[derive(Debug, Clone)]
+///
+/// The `Default` impl yields an empty schema (no fields, 0 bits) — used
+/// by the empty-keys (single-group) reduction path in `dispatch_groupby`
+/// / `dispatch_groupby_fused`, where no encoding occurs and the schema
+/// is only passed through for shape consistency.
+#[derive(Debug, Clone, Default)]
 pub struct KeySchema {
     fields: Vec<KeyField>,
     total_bits: u32,
@@ -898,9 +903,45 @@ pub fn dispatch_max_u32(
 
 // ---- f32 GPU aggregation ----
 
+/// Hard cap on n_groups for the F32 pre-reduce kernels. Matches the
+/// `MAX_GROUPS` constant baked into `shaders/aggregate.metal` — exceeding
+/// this would overflow the per-thread register array. Callers must route
+/// queries with more groups to the M2 per-agg / CPU finalize path.
+pub(crate) const F32_AGG_MAX_GROUPS: usize = 16;
+
+/// Threadgroup width for the F32 pre-reduce kernels. The MSL side
+/// (`shaders/aggregate.metal`) hardcodes `MAX_SIMDS_PER_TG = 8` which
+/// corresponds to a 256-wide threadgroup on Apple Silicon (32-lane simd).
+/// Dispatcher MUST match.
+const F32_AGG_TG_WIDTH: usize = 256;
+
+/// Cap on the number of threadgroups dispatched for the F32 pre-reduce
+/// kernels. Each TG runs the full pre-reduce + simd reduce + final flush
+/// once, and emits up to `n_groups` atomic CAS-adds against the device
+/// output buffer. Capping at 128 TGs keeps the post-reduction atomic
+/// contention bounded (≤ 128 * n_groups device atomics, well under the
+/// GPU watchdog budget) while still saturating Apple Silicon's compute
+/// units. Each thread strides over ~`n_rows / (caps × 256)` rows.
+const F32_AGG_MAX_TGS: usize = 128;
+
 /// Shared helper for f32 aggregation kernels.
-/// The MSL kernels use `atomic_uint` as a bit-pattern container for f32;
-/// the init value is passed as the bit pattern of the f32 identity element.
+///
+/// Routes between two MSL kernels depending on `n_groups`:
+///
+/// - **`<kernel>_prereduce`** (low cardinality, ≤ [`F32_AGG_MAX_GROUPS`]):
+///   per-thread register pre-reduce → simdgroup reduce → per-TG CAS to
+///   device. Avoids the GPU watchdog at 10M rows × 4 groups where the
+///   per-row variant retries O(N²/2) times.
+/// - **`<kernel>` (per-row CAS, high cardinality > [`F32_AGG_MAX_GROUPS`]):
+///   per-row CAS-loop on the device output. At high group cardinality
+///   contention is low and CAS retries are rare; the pre-reduce variant
+///   can't run anyway (register-array cap).
+///
+/// `kernel_name` is the **base** kernel name (e.g. `"agg_sum_f32"`); the
+/// helper picks the right suffix.
+///
+/// The init value is passed as the bit pattern of the f32 identity
+/// element (the kernel reads it via `as_type<float>`).
 #[allow(clippy::too_many_arguments)]
 fn dispatch_agg_f32(
     device: &MetalDevice,
@@ -957,7 +998,6 @@ fn dispatch_agg_f32(
         unsafe { std::slice::from_raw_parts(init_buf.as_ptr() as *const u8, n_groups * 4) };
 
     let lib = shared_library(device)?;
-    let pso = lib.pipeline(kernel_name)?;
 
     let vals_buf = device.new_buffer_from_bytes(values_bytes)?;
     let valid_buf = device.new_buffer_from_bytes(&valid[..valid_bytes])?;
@@ -965,11 +1005,46 @@ fn dispatch_agg_f32(
     let out_buf = device.new_buffer_from_bytes(init_bytes)?;
     let n_rows_buf = device.new_buffer_from_bytes(&n_rows_u32.to_le_bytes())?;
 
-    queue.dispatch_1d(
-        &pso,
-        &[&vals_buf, &valid_buf, &r2g_buf, &out_buf, &n_rows_buf],
-        n_rows,
-    )?;
+    if n_groups <= F32_AGG_MAX_GROUPS {
+        // Low-cardinality: route to the pre-reduce kernel.
+        let n_groups_u32: u32 = u32::try_from(n_groups).map_err(|_| {
+            // Unreachable given the cap above, but keeps the path total.
+            GroupByError::RowCountOverflow { n_rows: n_groups }
+        })?;
+        let n_groups_buf = device.new_buffer_from_bytes(&n_groups_u32.to_le_bytes())?;
+        let pso_name = format!("{kernel_name}_prereduce");
+        let pso = lib.pipeline(&pso_name)?;
+
+        // Grid size: pre-reduce kernels stride per-thread, so we want far
+        // fewer threads than rows. Pick the smallest multiple of TG width
+        // that fits in [TG_width, MAX_TGS * TG_width].
+        let target_tgs = n_rows.div_ceil(F32_AGG_TG_WIDTH);
+        let n_tgs = target_tgs.clamp(1, F32_AGG_MAX_TGS);
+        let n_threads = n_tgs * F32_AGG_TG_WIDTH;
+
+        queue.dispatch_1d_with_tg(
+            &pso,
+            &[
+                &vals_buf,
+                &valid_buf,
+                &r2g_buf,
+                &out_buf,
+                &n_rows_buf,
+                &n_groups_buf,
+            ],
+            n_threads,
+            F32_AGG_TG_WIDTH,
+        )?;
+    } else {
+        // High-cardinality: route to per-row CAS. Contention is low
+        // enough that the CAS retries don't hit the watchdog budget.
+        let pso = lib.pipeline(kernel_name)?;
+        queue.dispatch_1d(
+            &pso,
+            &[&vals_buf, &valid_buf, &r2g_buf, &out_buf, &n_rows_buf],
+            n_rows,
+        )?;
+    }
     queue.wait_until_complete()?;
 
     let out_bytes = out_buf.as_slice();
@@ -1998,6 +2073,34 @@ pub fn dispatch_groupby(
         }
     }
 
+    // Empty-keys path: a SELECT(agg(expr)) with no group-by keys is a
+    // single-group reduction over the entire input (TPC-H Q6 shape). Skip
+    // the build phase (no hashing, no dedup) and synthesize a BuildOutput
+    // that maps every row to group 0.
+    if key_cols.is_empty() {
+        if n_rows == 0 {
+            let agg_outputs = agg_specs
+                .iter()
+                .map(|(req, _)| empty_output_for(req.kind))
+                .collect();
+            return Ok(GroupByResult {
+                decoded_keys: vec![],
+                agg_outputs,
+                n_groups: 0,
+            });
+        }
+        let row_to_group = vec![0u32; n_rows];
+        let mut agg_outputs = Vec::with_capacity(agg_specs.len());
+        for (req, vcol) in agg_specs {
+            agg_outputs.push(run_one_agg(device, queue, req, vcol, &row_to_group, 1)?);
+        }
+        return Ok(GroupByResult {
+            decoded_keys: vec![],
+            agg_outputs,
+            n_groups: 1,
+        });
+    }
+
     let (encoded, schema) = encode_keys(key_cols)?;
 
     if n_rows == 0 {
@@ -2415,7 +2518,7 @@ fn run_one_agg(
 //                            companion for every Mean.
 
 use crate::aggregate_fused::cache::{FusedCacheError, FusedLibraryCache};
-use crate::aggregate_fused::emitter::signature_supported_by_fused;
+use crate::aggregate_fused::emitter::{signature_supported_by_fused, FUSED_TG_WIDTH, MAX_GROUPS};
 use crate::aggregate_fused::signature::{
     AggOp as KAggOp, AggSignature, AggSignatureError, AggSpec as KAggSpec,
     MetalDtype as KMetalDtype,
@@ -2436,6 +2539,14 @@ pub enum FusedDispatchError {
          caller must route to the M2 per-agg path"
     )]
     SignatureNotFused,
+    /// `n_groups` exceeds the kernel's per-thread register-array cap
+    /// (`MAX_GROUPS` in `aggregate_fused/emitter.rs`). The caller must
+    /// route to the M2 per-agg path; that path uses per-row atomics
+    /// directly on device memory, which scales to arbitrary cardinality
+    /// (and isn't penalized at high cardinality the way the pre-reduce
+    /// fused kernel would be).
+    #[error("fused dispatch rejected: n_groups={n_groups} exceeds MAX_GROUPS={max_groups}; caller must route to the M2 per-agg path")]
+    NgroupsExceedsFusedCap { n_groups: usize, max_groups: usize },
     #[error("missing value column for slot {slot} ({name})")]
     MissingValueColumn { slot: usize, name: String },
     #[error("value column {name}: dtype mismatch (signature has {sig_dt:?}, caller {got:?})")]
@@ -2504,10 +2615,22 @@ pub fn dispatch_groupby_fused(
         }
     }
 
-    let (encoded, schema) = encode_keys(key_cols).map_err(GroupByError::KeyEncode)?;
+    // Empty-keys path: SELECT(agg(expr)) with no group-by keys becomes a
+    // single-group reduction over the full input. Skip encode/hash/build
+    // and synthesize a BuildOutput in which every row maps to group 0.
+    // (TPC-H Q6 takes this shape after optimization.)
+    let (encoded, schema) = if key_cols.is_empty() {
+        (Vec::<u128>::new(), KeySchema::default())
+    } else {
+        encode_keys(key_cols).map_err(GroupByError::KeyEncode)?
+    };
 
     if n_rows == 0 {
-        let decoded_keys = decode_keys(&[], &schema);
+        let decoded_keys = if key_cols.is_empty() {
+            Vec::new()
+        } else {
+            decode_keys(&[], &schema)
+        };
         let agg_outputs = aggs.iter().map(empty_output_for_kagg).collect();
         return Ok(GroupByResult {
             decoded_keys,
@@ -2542,12 +2665,33 @@ pub fn dispatch_groupby_fused(
     // Compile / look up the PSO.
     let pso = cache.get_or_compile(&sig, aggs)?;
 
-    // Build hashes / row_to_group via the existing CPU build phase.
-    let mut hashes = vec![0u32; n_rows];
-    dispatch_hash(device, queue, &encoded, n_rows, &mut hashes)?;
-    let build = dispatch_build(device, queue, &encoded, &hashes, n_rows)?;
+    // Build hashes / row_to_group via the existing CPU build phase. For
+    // empty-keys (single-group reduction) we synthesize the BuildOutput
+    // directly — every row belongs to group 0.
+    let build = if key_cols.is_empty() {
+        BuildOutput {
+            row_to_group: vec![0u32; n_rows],
+            n_groups: 1,
+            first_row_per_group: vec![0],
+        }
+    } else {
+        let mut hashes = vec![0u32; n_rows];
+        dispatch_hash(device, queue, &encoded, n_rows, &mut hashes)?;
+        dispatch_build(device, queue, &encoded, &hashes, n_rows)?
+    };
     let n_groups_u32 = build.n_groups;
     let n_groups = n_groups_u32 as usize;
+
+    // Pre-reduce fused kernel caps n_groups at MAX_GROUPS (16). Higher
+    // cardinality must route via the M2 per-agg path — that path is
+    // strictly faster at high cardinality anyway because contention is
+    // low and the register-array overhead disappears.
+    if n_groups > MAX_GROUPS {
+        return Err(FusedDispatchError::NgroupsExceedsFusedCap {
+            n_groups,
+            max_groups: MAX_GROUPS,
+        });
+    }
 
     // ---- allocate per-slot value/validity buffers in column_order -----------
     let column_order = sig.column_order().to_vec();
@@ -2619,11 +2763,17 @@ pub fn dispatch_groupby_fused(
     let n_rows_buf = device
         .new_buffer_from_bytes(&n_rows_u32.to_le_bytes())
         .map_err(GroupByError::Buffer)?;
+    let n_groups_u32_le: u32 =
+        u32::try_from(n_groups).map_err(|_| GroupByError::RowCountOverflow { n_rows: n_groups })?;
+    let n_groups_buf = device
+        .new_buffer_from_bytes(&n_groups_u32_le.to_le_bytes())
+        .map_err(GroupByError::Buffer)?;
 
     // ---- assemble bindings in emitter slot order ----------------------------
     let mut bindings: Vec<&polars_metal_buffer::MetalBuffer> = Vec::new();
     bindings.push(&r2g_buf);
     bindings.push(&n_rows_buf);
+    bindings.push(&n_groups_buf);
     for vb in &value_bufs {
         bindings.push(vb);
     }
@@ -2638,8 +2788,18 @@ pub fn dispatch_groupby_fused(
     }
 
     // ---- dispatch and wait --------------------------------------------------
+    //
+    // Pre-reduce kernel strides each thread over the row range, so we
+    // dispatch far fewer threads than rows. The cap matches the standalone
+    // F32 dispatcher (`F32_AGG_MAX_TGS`) — each TG emits at most n_groups
+    // device atomics, so the total post-reduction atomic count is
+    // <= n_threadgroups * n_groups, well under the GPU watchdog budget.
+    const FUSED_MAX_TGS: usize = 128;
+    let target_tgs = n_rows.div_ceil(FUSED_TG_WIDTH);
+    let n_tgs = target_tgs.clamp(1, FUSED_MAX_TGS);
+    let n_threads = n_tgs * FUSED_TG_WIDTH;
     queue
-        .dispatch_1d(&pso, &bindings, n_rows)
+        .dispatch_1d_with_tg(&pso, &bindings, n_threads, FUSED_TG_WIDTH)
         .map_err(GroupByError::from)?;
     queue.wait_until_complete().map_err(GroupByError::from)?;
 
@@ -2654,12 +2814,16 @@ pub fn dispatch_groupby_fused(
         )?);
     }
 
-    let representative_keys: Vec<u128> = build
-        .first_row_per_group
-        .iter()
-        .map(|&row| encoded[row as usize])
-        .collect();
-    let decoded_keys = decode_keys(&representative_keys, &schema);
+    let decoded_keys = if key_cols.is_empty() {
+        Vec::new()
+    } else {
+        let representative_keys: Vec<u128> = build
+            .first_row_per_group
+            .iter()
+            .map(|&row| encoded[row as usize])
+            .collect();
+        decode_keys(&representative_keys, &schema)
+    };
 
     Ok(GroupByResult {
         decoded_keys,
