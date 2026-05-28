@@ -1,4 +1,7 @@
-// Stub — full implementation in Task 14.
+//! Compute-density routing decision: route a FusionScope to GPU iff its
+//! estimated FLOPs and row count both exceed thresholds (5e7 and 1e5 by
+//! default). Below threshold, GPU dispatch overhead dominates the work.
+
 use super::scope::FusionScope;
 
 pub const MIN_FLOPS_THRESHOLD: u64 = 50_000_000; // 5e7

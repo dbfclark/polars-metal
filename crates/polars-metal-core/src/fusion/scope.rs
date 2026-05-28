@@ -1,4 +1,7 @@
-// Stub — full implementation in Task 13.
+//! FusionScope: a DAG of expression nodes (inputs + ops) plus output refs.
+//! The analyzer (Phase 3) builds these by walking Polars expression IR;
+//! the subgraph builder (Phase 4) consumes them and emits MLX calls.
+
 use super::supported_ops::{op_spec, OpId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

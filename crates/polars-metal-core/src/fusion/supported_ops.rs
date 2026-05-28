@@ -245,12 +245,23 @@ pub fn op_spec(op: OpId) -> OpSpec {
             dynamic_flops: false,
             allows_null: false,
         },
-        // Cast
-        CastF32 | CastF64 | CastI32 | CastBool => OpSpec {
+        // Cast — output_dtype is the target dtype, not SameAsInput. CastF32/
+        // CastF64/CastI32 all produce numeric output (we use F32 as the tag
+        // here since DtypeOut has no F64/I32 variants today; Phase 3's analyzer
+        // dispatches the actual concrete dtype from the OpId itself).
+        CastF32 | CastF64 | CastI32 => OpSpec {
             n_args: 1,
             flops_per_row: 1,
             input_dtype: I::Numeric,
-            output_dtype: O::SameAsInput,
+            output_dtype: O::F32,
+            dynamic_flops: false,
+            allows_null: false,
+        },
+        CastBool => OpSpec {
+            n_args: 1,
+            flops_per_row: 1,
+            input_dtype: I::Numeric,
+            output_dtype: O::Bool,
             dynamic_flops: false,
             allows_null: false,
         },
