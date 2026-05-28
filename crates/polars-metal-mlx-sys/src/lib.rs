@@ -171,6 +171,36 @@ mod ffi {
             data: *const u8,
             n: usize,
         ) -> Result<SharedPtr<MlxArray>>;
+
+        // M4 Phase 1 Task 7: transcendentals + roots + rounding + atan2 + cast.
+
+        fn mlx_op_sin(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_cos(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_tan(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_sinh(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_cosh(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_tanh(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_asin(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_acos(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_atan(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_log(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_log2(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_log10(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_log1p(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_exp(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_exp2(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_sqrt(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_cbrt(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_floor(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_ceil(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_round(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_atan2(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_cast(a: &SharedPtr<MlxArray>, dtype: u32) -> Result<SharedPtr<MlxArray>>;
     }
 }
 

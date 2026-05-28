@@ -145,4 +145,40 @@ std::shared_ptr<MlxArray> mlx_op_where(
 // Each non-zero byte becomes true. `n == 0` is allowed (pass null for data).
 std::shared_ptr<MlxArray> mlx_array_from_bool_data(const uint8_t* data, size_t n);
 
+// ── M4 Phase 1 Task 7: transcendentals + roots + rounding + atan2 + cast ───
+//
+// MLX 0.22.0 function name divergences from our Rust naming:
+//   asin/acos/atan/atan2 -> arcsin/arccos/arctan/arctan2
+//   cast -> astype
+//
+// MLX 0.22.0 does NOT have cbrt or exp2; we compose them:
+//   cbrt(x)  = power(x, 1/3)
+//   exp2(x)  = exp(x * ln(2))
+
+std::shared_ptr<MlxArray> mlx_op_sin(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_cos(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_tan(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_sinh(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_cosh(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_tanh(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_asin(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_acos(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_atan(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_log(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_log2(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_log10(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_log1p(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_exp(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_exp2(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_sqrt(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_cbrt(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_floor(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_ceil(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_round(const std::shared_ptr<MlxArray>& a);
+
+std::shared_ptr<MlxArray> mlx_op_atan2(
+    const std::shared_ptr<MlxArray>& a, const std::shared_ptr<MlxArray>& b);
+
+std::shared_ptr<MlxArray> mlx_op_cast(const std::shared_ptr<MlxArray>& a, uint32_t dtype);
+
 }  // namespace polars_metal_mlx

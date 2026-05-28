@@ -249,9 +249,6 @@ MLX_WRAP_UNOP(mlx_op_neg,          negative)
 MLX_WRAP_UNOP(mlx_op_abs,          abs)
 MLX_WRAP_UNOP(mlx_op_square,       square)
 
-#undef MLX_WRAP_BINOP
-#undef MLX_WRAP_UNOP
-
 std::shared_ptr<MlxArray> mlx_op_where(
     const std::shared_ptr<MlxArray>& cond,
     const std::shared_ptr<MlxArray>& then_v,
@@ -287,5 +284,68 @@ std::shared_ptr<MlxArray> mlx_array_from_bool_data(const uint8_t* data, size_t n
         mlx::core::bool_);
     return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
 }
+
+// ── M4 Phase 1 Task 7: transcendentals + roots + rounding + atan2 + cast ─────
+
+MLX_WRAP_UNOP(mlx_op_sin, sin)
+MLX_WRAP_UNOP(mlx_op_cos, cos)
+MLX_WRAP_UNOP(mlx_op_tan, tan)
+MLX_WRAP_UNOP(mlx_op_sinh, sinh)
+MLX_WRAP_UNOP(mlx_op_cosh, cosh)
+MLX_WRAP_UNOP(mlx_op_tanh, tanh)
+MLX_WRAP_UNOP(mlx_op_asin, arcsin)
+MLX_WRAP_UNOP(mlx_op_acos, arccos)
+MLX_WRAP_UNOP(mlx_op_atan, arctan)
+MLX_WRAP_UNOP(mlx_op_log, log)
+MLX_WRAP_UNOP(mlx_op_log2, log2)
+MLX_WRAP_UNOP(mlx_op_log10, log10)
+MLX_WRAP_UNOP(mlx_op_log1p, log1p)
+MLX_WRAP_UNOP(mlx_op_exp, exp)
+MLX_WRAP_UNOP(mlx_op_sqrt, sqrt)
+MLX_WRAP_UNOP(mlx_op_floor, floor)
+MLX_WRAP_UNOP(mlx_op_ceil, ceil)
+MLX_WRAP_UNOP(mlx_op_round, round)
+
+MLX_WRAP_BINOP(mlx_op_atan2, arctan2)
+
+// cbrt(x) = power(x, 1/3). MLX 0.22.0 has no native cbrt; compose via power.
+std::shared_ptr<MlxArray> mlx_op_cbrt(const std::shared_ptr<MlxArray>& a) {
+    auto one_third = mlx::core::array(1.0f / 3.0f);
+    auto base = std::make_shared<mlx::core::array>(mlx::core::power(*a, one_third));
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
+// exp2(x) = exp(x * ln(2)). MLX 0.22.0 has no native exp2; compose via exp.
+std::shared_ptr<MlxArray> mlx_op_exp2(const std::shared_ptr<MlxArray>& a) {
+    auto ln2 = mlx::core::array(std::log(2.0f));
+    auto scaled = mlx::core::multiply(*a, ln2);
+    auto base = std::make_shared<mlx::core::array>(mlx::core::exp(scaled));
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
+// cast(a, dtype) = mlx::core::astype(a, mlx_dtype_for(dtype))
+std::shared_ptr<MlxArray> mlx_op_cast(const std::shared_ptr<MlxArray>& a, uint32_t dtype) {
+    mlx::core::Dtype dt = mlx::core::float32;
+    switch (dtype) {
+        case 0:
+            dt = mlx::core::float32;
+            break;
+        case 1:
+            throw std::invalid_argument("F64 not supported in MLX 0.22.0");
+        case 2:
+            dt = mlx::core::int32;
+            break;
+        case 3:
+            dt = mlx::core::bool_;
+            break;
+        default:
+            throw std::invalid_argument("unknown dtype tag in mlx_op_cast");
+    }
+    auto base = std::make_shared<mlx::core::array>(mlx::core::astype(*a, dt));
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
+#undef MLX_WRAP_BINOP
+#undef MLX_WRAP_UNOP
 
 }  // namespace polars_metal_mlx

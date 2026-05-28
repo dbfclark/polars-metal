@@ -98,3 +98,44 @@ pub fn mlx_where(
         _input_refs: refs,
     })
 }
+
+// ── M4 Phase 1 Task 7: transcendentals + roots + rounding + atan2 + cast ─────
+
+unop!(mlx_sin, mlx_op_sin);
+unop!(mlx_cos, mlx_op_cos);
+unop!(mlx_tan, mlx_op_tan);
+unop!(mlx_sinh, mlx_op_sinh);
+unop!(mlx_cosh, mlx_op_cosh);
+unop!(mlx_tanh, mlx_op_tanh);
+unop!(mlx_asin, mlx_op_asin);
+unop!(mlx_acos, mlx_op_acos);
+unop!(mlx_atan, mlx_op_atan);
+unop!(mlx_log, mlx_op_log);
+unop!(mlx_log2, mlx_op_log2);
+unop!(mlx_log10, mlx_op_log10);
+unop!(mlx_log1p, mlx_op_log1p);
+unop!(mlx_exp, mlx_op_exp);
+unop!(mlx_exp2, mlx_op_exp2);
+unop!(mlx_sqrt, mlx_op_sqrt);
+unop!(mlx_cbrt, mlx_op_cbrt);
+unop!(mlx_floor, mlx_op_floor);
+unop!(mlx_ceil, mlx_op_ceil);
+unop!(mlx_round, mlx_op_round);
+
+binop!(mlx_atan2, mlx_op_atan2);
+
+/// Cast an array to a different dtype via `mlx::core::astype`.
+///
+/// # Errors
+/// Returns `FfiError::Runtime` if `dtype == MlxDtype::F64` (unsupported in
+/// MLX 0.22.0) or if the cast itself fails on the MLX side.
+pub fn mlx_cast(
+    a: &MlxArrayHandle,
+    dtype: crate::array::MlxDtype,
+) -> Result<MlxArrayHandle, FfiError> {
+    let ptr = crate::ffi::mlx_op_cast(&a.ptr, dtype as u32).map_err(FfiError::from)?;
+    Ok(MlxArrayHandle {
+        ptr,
+        _input_refs: a._input_refs.clone(),
+    })
+}
