@@ -181,4 +181,24 @@ std::shared_ptr<MlxArray> mlx_op_atan2(
 
 std::shared_ptr<MlxArray> mlx_op_cast(const std::shared_ptr<MlxArray>& a, uint32_t dtype);
 
+// ── M4 Phase 1 Task 8: reduction op declarations ─────────────────────────────
+//
+// Global reductions collapse the whole array to a 0-d scalar. std/var use
+// MLX's default `ddof=0` (population variance); Polars' default sample
+// variance (ddof=1) is handled by the engine analyzer layer.
+// argmin/argmax return I32 arrays of indices (readback as F32 will fail
+// the dtype guard; callers must cast).
+
+std::shared_ptr<MlxArray> mlx_op_sum_all(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_mean_all(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_min_all(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_max_all(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_std_all(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_var_all(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_argmin_all(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_argmax_all(const std::shared_ptr<MlxArray>& a);
+
+std::shared_ptr<MlxArray> mlx_op_sum_axis(const std::shared_ptr<MlxArray>& a, int32_t axis);
+std::shared_ptr<MlxArray> mlx_op_mean_axis(const std::shared_ptr<MlxArray>& a, int32_t axis);
+
 }  // namespace polars_metal_mlx

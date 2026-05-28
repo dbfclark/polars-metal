@@ -345,6 +345,29 @@ std::shared_ptr<MlxArray> mlx_op_cast(const std::shared_ptr<MlxArray>& a, uint32
     return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
 }
 
+// ── M4 Phase 1 Task 8: reductions ────────────────────────────────────────────
+
+MLX_WRAP_UNOP(mlx_op_sum_all, sum)
+MLX_WRAP_UNOP(mlx_op_mean_all, mean)
+MLX_WRAP_UNOP(mlx_op_min_all, min)
+MLX_WRAP_UNOP(mlx_op_max_all, max)
+MLX_WRAP_UNOP(mlx_op_std_all, std)
+MLX_WRAP_UNOP(mlx_op_var_all, var)
+MLX_WRAP_UNOP(mlx_op_argmin_all, argmin)
+MLX_WRAP_UNOP(mlx_op_argmax_all, argmax)
+
+std::shared_ptr<MlxArray> mlx_op_sum_axis(const std::shared_ptr<MlxArray>& a, int32_t axis) {
+    auto base = std::make_shared<mlx::core::array>(
+        mlx::core::sum(*a, std::vector<int>{axis}, /*keepdims=*/false));
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
+std::shared_ptr<MlxArray> mlx_op_mean_axis(const std::shared_ptr<MlxArray>& a, int32_t axis) {
+    auto base = std::make_shared<mlx::core::array>(
+        mlx::core::mean(*a, std::vector<int>{axis}, /*keepdims=*/false));
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
 #undef MLX_WRAP_BINOP
 #undef MLX_WRAP_UNOP
 

@@ -14,6 +14,7 @@ pub use error::FfiError;
 
 pub mod array;
 pub mod elementwise;
+pub mod reduce;
 
 // cxx's SharedPtr<T> implementation expands a panic! macro in the generated
 // Rust glue (inside SharedPtr::is_null()'s unreachable branch). This is
@@ -201,6 +202,20 @@ mod ffi {
         ) -> Result<SharedPtr<MlxArray>>;
 
         fn mlx_op_cast(a: &SharedPtr<MlxArray>, dtype: u32) -> Result<SharedPtr<MlxArray>>;
+
+        // M4 Phase 1 Task 8: reduction bindings.
+
+        fn mlx_op_sum_all(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_mean_all(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_min_all(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_max_all(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_std_all(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_var_all(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_argmin_all(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_argmax_all(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_sum_axis(a: &SharedPtr<MlxArray>, axis: i32) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_mean_axis(a: &SharedPtr<MlxArray>, axis: i32) -> Result<SharedPtr<MlxArray>>;
     }
 }
 
