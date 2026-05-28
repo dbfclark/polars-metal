@@ -191,6 +191,13 @@ def _dispatch_filter(df_pydf: Any, filter_plan: dict) -> pl.DataFrame:
         upstream_pydf = _native.execute_plan(df_pydf, upstream_plan)
         upstream = pl.DataFrame._from_pydf(upstream_pydf)
 
+    # GPU column compaction doesn't speak Utf8 yet; fall back to the
+    # Polars CPU filter path which compacts all dtypes in one pass.
+    # (This mirrors the route used when a GroupBy sits above the Filter
+    # — see `_filter_via_polars`.)
+    if any(str(dt) in ("String", "Utf8") for dt in upstream.schema.values()):
+        return _filter_via_polars(df_pydf, filter_plan)
+
     n_rows = upstream.height
     pred_data, pred_valid = _evaluate_predicate(upstream, filter_plan["predicate"], n_rows)
 
@@ -323,6 +330,12 @@ def _dispatch_groupby(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
     # bit-packed result, and let Polars' SIMD-tuned filter compact all
     # columns in one pass (~20-25ms regardless of n_cols).
     upstream_plan = wire_plan["input"]
+    # HStack hoisted above the upstream (Polars CSE optimization) — peel it
+    # off, dispatch the inner subtree, then evaluate the appended columns.
+    hstack_exprs: list[dict] = []
+    if upstream_plan["kind"] == "HStack":
+        hstack_exprs = list(upstream_plan.get("exprs", []))
+        upstream_plan = upstream_plan["input"]
     if upstream_plan["kind"] == "Scan":
         upstream = pl.DataFrame._from_pydf(df_pydf)
     elif upstream_plan["kind"] == "Filter":
@@ -337,7 +350,38 @@ def _dispatch_groupby(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
         upstream_pydf = _native.execute_plan(df_pydf, upstream_plan)
         upstream = pl.DataFrame._from_pydf(upstream_pydf)
 
+    if hstack_exprs:
+        new_cols = [
+            _agg_expr_dict_to_polars(e["expr"]).alias(e["name"]) for e in hstack_exprs
+        ]
+        upstream = upstream.lazy().with_columns(new_cols).collect()
+
     n_rows = upstream.height
+
+    # M3 Phase 13b: F64-Expression aggs need pre-materialization.
+    #
+    # The Rust dispatcher has no path that accepts Expression specs over F64
+    # inputs (fused kernel rejects F64; PerAgg rejects Expression). For any
+    # Expression agg, evaluate the expression once on the upstream DataFrame
+    # via Polars, then rewrite the agg as Simple-<op> referencing the tmp
+    # column. The grouping + reduction still happens on Metal — only the
+    # per-row arithmetic moves to CPU. Works for both empty-keys (Q6) and
+    # multi-key (Q1 with CSE'd Expressions) GroupBy.
+    if any(a.get("kind") == "Expression" for a in wire_plan["aggs"]):
+        upstream, wire_plan = _materialize_expression_aggs(upstream, wire_plan)
+        n_rows = upstream.height
+
+    # Empty-keys short-circuit: a single-group reduction over the full
+    # upstream is faster on CPU than on GPU on this hardware. The
+    # per-agg kernels use atomic CAS-loops on a single output slot, which
+    # collapses to fully-serialized execution when every thread targets
+    # the same slot (n_groups == 1). At 1M+ rows that hits the Metal
+    # watchdog (kIOGPUCommandBufferCallbackErrorImpactingInteractivity).
+    # Polars CPU reductions are SIMD-tuned and finish in microseconds —
+    # use them. Multi-group GroupBy still routes through the kernel
+    # layer (low-cardinality contention is a separate M4 perf concern).
+    if not wire_plan["keys"]:
+        return _empty_keys_via_polars(upstream, wire_plan["aggs"])
 
     # Collect the column names we'll send to Rust (keys + agg inputs).
     # Simple aggs reference one column via `input_col`; Expression aggs
@@ -441,6 +485,130 @@ def _dispatch_groupby(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
     return pl.DataFrame(series_list)
 
 
+def _agg_expr_dict_to_polars(expr_dict: dict) -> pl.Expr:
+    """Recursively map a wire-form AggExpr sub-tree to a `pl.Expr`.
+
+    Mirrors the shape produced by `_walker._walk_agg_expr_node`:
+
+    - ``{"kind": "Column", "name": str}`` → ``pl.col(name)``
+    - ``{"kind": "LiteralF64", "value": float}`` → ``pl.lit(float)``
+    - ``{"kind": "LiteralI64", "value": int}`` → ``pl.lit(int)``
+    - ``{"kind": "Binary", "op": "Add|Sub|Mul|Div", "lhs": ..., "rhs": ...}``
+      → ``lhs +-*/ rhs``
+    """
+    kind = expr_dict.get("kind")
+    if kind == "Column":
+        return pl.col(str(expr_dict["name"]))
+    if kind == "LiteralF64":
+        return pl.lit(float(expr_dict["value"]))
+    if kind == "LiteralI64":
+        return pl.lit(int(expr_dict["value"]))
+    if kind == "Binary":
+        lhs = _agg_expr_dict_to_polars(expr_dict["lhs"])
+        rhs = _agg_expr_dict_to_polars(expr_dict["rhs"])
+        op = expr_dict.get("op")
+        if op == "Add":
+            return lhs + rhs
+        if op == "Sub":
+            return lhs - rhs
+        if op == "Mul":
+            return lhs * rhs
+        if op == "Div":
+            return lhs / rhs
+        raise RuntimeError(f"polars_metal: unknown Binary op {op!r}")
+    raise RuntimeError(f"polars_metal: unknown agg-expr kind {kind!r}")
+
+
+def _materialize_expression_aggs(
+    upstream: pl.DataFrame, wire_plan: dict
+) -> tuple[pl.DataFrame, dict]:
+    """Evaluate each Expression agg's expression via Polars into a tmp
+    column, then rewrite the agg as Simple referencing that column.
+    Returns the augmented DataFrame and a new wire_plan.
+
+    Why this lives in Python:
+        The Rust dispatch layer routes F64-Expression aggs nowhere — the
+        fused kernel doesn't support F64 inputs (toolchain lacks 64-bit
+        atomics) and the PerAgg loop has no Expression handler. Pre-
+        materializing the expression on CPU lets the existing per-group
+        Sum/Mean/Min/Max kernels consume the result. Per-row arithmetic
+        runs on CPU; the (more expensive) grouping + reduction still
+        runs on Metal. Works for empty-keys (Q6) and multi-key (Q1's
+        CSE-residual Expression) shapes alike.
+    """
+    new_aggs: list[dict] = []
+    new_columns: list[pl.Series] = []
+    next_tmp_idx = 0
+    for agg in wire_plan["aggs"]:
+        if agg.get("kind") != "Expression":
+            new_aggs.append(agg)
+            continue
+        expr = _agg_expr_dict_to_polars(agg["expr"])
+        tmp_name = f"__pm_expr_agg_{next_tmp_idx}__"
+        next_tmp_idx += 1
+        # Evaluate the expression in isolation so we don't trigger a full
+        # column re-materialization on `upstream` (which can be 10M+ rows).
+        ser = upstream.lazy().select(expr.alias(tmp_name)).collect().to_series()
+        new_columns.append(ser)
+        new_aggs.append(
+            {
+                "kind": "Simple",
+                "input_col": tmp_name,
+                "op": agg["op"],
+                "output_alias": agg.get("output_alias", tmp_name),
+            }
+        )
+
+    if new_columns:
+        upstream = upstream.with_columns(new_columns)
+
+    new_wire_plan = dict(wire_plan)
+    new_wire_plan["aggs"] = new_aggs
+    return upstream, new_wire_plan
+
+
+_AGG_OP_TO_POLARS: dict[str, str] = {
+    "Sum": "sum",
+    "Mean": "mean",
+    "Min": "min",
+    "Max": "max",
+    "Count": "count",
+}
+
+
+def _empty_keys_via_polars(
+    upstream: pl.DataFrame, aggs: list[dict]
+) -> pl.DataFrame:
+    """Evaluate empty-keys aggs via Polars CPU. See call site for rationale.
+
+    All Expression aggs are already materialized to Simple-<op> referencing
+    a tmp column by `_materialize_expression_aggs` before we get here.
+    """
+    out_exprs: list[pl.Expr] = []
+    for agg in aggs:
+        kind = agg.get("kind")
+        alias = agg.get("output_alias") or ""
+        if kind == "Length":
+            out_exprs.append(pl.len().alias(alias or "len"))
+            continue
+        if kind != "Simple":
+            raise RuntimeError(
+                f"polars_metal: empty-keys agg expected Simple/Length after "
+                f"materialization, got kind={kind!r}"
+            )
+        col_name = agg.get("input_col") or ""
+        op = agg.get("op") or ""
+        polars_op = _AGG_OP_TO_POLARS.get(op)
+        if polars_op is None:
+            raise RuntimeError(f"polars_metal: unknown empty-keys agg op {op!r}")
+        expr = getattr(pl.col(col_name), polars_op)().alias(
+            alias or f"{col_name}_{op.lower()}"
+        )
+        out_exprs.append(expr)
+
+    return upstream.lazy().select(out_exprs).collect()
+
+
 def _evaluate_predicate(upstream: pl.DataFrame, pred: dict, n_rows: int) -> tuple[bytes, bytes]:
     """Evaluate a serialized predicate AST into a bit-packed ``(data, valid)`` pair.
 
@@ -518,6 +686,25 @@ def _pad_to(buf: bytes, min_bytes: int) -> bytes:
     return buf + b"\x00" * (min_bytes - len(buf))
 
 
+def _coerce_for_compare(series: pl.Series, kernel_dtype: str) -> pl.Series:
+    """Cast `series` to the dtype the compare kernel expects.
+
+    The walker widens narrow integer types and Date to I64 for the
+    cmp_i64 kernel (see `_walker._PREDICATE_I64_WIDEN`); F32 widens to
+    F64 for cmp_f64 (`_walker._PREDICATE_F64_WIDEN`). The underlying
+    Polars Series is still in its narrow form here, so we cast on the
+    way to materialization. Date → Int64 days-since-1970 (Polars'
+    physical representation) matches the walker's literal encoding.
+    """
+    if kernel_dtype == "I64":
+        if str(series.dtype) != "Int64":
+            return series.cast(pl.Int64)
+    elif kernel_dtype == "F64":
+        if str(series.dtype) != "Float64":
+            return series.cast(pl.Float64)
+    return series
+
+
 def _evaluate_compare(upstream: pl.DataFrame, pred: dict, n_rows: int) -> tuple[bytes, bytes]:
     """Dispatch one of the four ``cmp_*`` pyfunctions based on the
     operand dtype and which side is a literal vs a column.
@@ -546,11 +733,13 @@ def _evaluate_compare(upstream: pl.DataFrame, pred: dict, n_rows: int) -> tuple[
         # input contract (LHS is always a column).
         raise RuntimeError(f"polars_metal: cmp predicate LHS must be Column, got {lhs['kind']!r}")
 
-    lhs_arr = _materialize_arrow(upstream.get_column(lhs["name"]))
+    lhs_series = _coerce_for_compare(upstream.get_column(lhs["name"]), dtype)
+    lhs_arr = _materialize_arrow(lhs_series)
     lhs_data, lhs_valid = _data_and_valid_for_dtype(lhs_arr, n_rows, dtype)
 
     if rhs["kind"] == "Column":
-        rhs_arr = _materialize_arrow(upstream.get_column(rhs["name"]))
+        rhs_series = _coerce_for_compare(upstream.get_column(rhs["name"]), dtype)
+        rhs_arr = _materialize_arrow(rhs_series)
         rhs_data, rhs_valid = _data_and_valid_for_dtype(rhs_arr, n_rows, dtype)
         if dtype == "I64":
             return _native.cmp_i64_col_col(lhs_data, lhs_valid, rhs_data, rhs_valid, op, n_rows)
@@ -903,6 +1092,12 @@ def _extract_scan_df_and_wire_plan(plan: dict) -> tuple[Any, dict]:
                 "input": rewrite(node["input"]),
                 "keys": [list(k) for k in node["keys"]],
                 "aggs": [dict(a) for a in node["aggs"]],
+            }
+        if kind == "HStack":
+            return {
+                "kind": "HStack",
+                "input": rewrite(node["input"]),
+                "exprs": [dict(e) for e in node["exprs"]],
             }
         raise ValueError(f"unknown plan kind: {kind!r}")
 
