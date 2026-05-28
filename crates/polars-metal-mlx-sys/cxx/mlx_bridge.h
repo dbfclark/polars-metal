@@ -207,4 +207,26 @@ std::shared_ptr<MlxArray> mlx_op_sort(const std::shared_ptr<MlxArray>& a);
 std::shared_ptr<MlxArray> mlx_op_argpartition(
     const std::shared_ptr<MlxArray>& a, int32_t kth);
 
+// ── M4 Phase 1 Task 10: cumulative scans + matmul + fft + real/imag ─────────
+//
+// MLX 0.22.0 cumulative ops require an `axis` argument (no default). For
+// 1-D arrays, pass `axis = 0`. Defaults: reverse=false, inclusive=true.
+//
+// FFT output is complex64 (interleaved real / imag F32 pairs). Use real/imag
+// to extract F32 streams for readback.
+
+std::shared_ptr<MlxArray> mlx_op_cumsum(const std::shared_ptr<MlxArray>& a, int32_t axis);
+std::shared_ptr<MlxArray> mlx_op_cumprod(const std::shared_ptr<MlxArray>& a, int32_t axis);
+std::shared_ptr<MlxArray> mlx_op_cummax(const std::shared_ptr<MlxArray>& a, int32_t axis);
+std::shared_ptr<MlxArray> mlx_op_cummin(const std::shared_ptr<MlxArray>& a, int32_t axis);
+
+std::shared_ptr<MlxArray> mlx_op_matmul(
+    const std::shared_ptr<MlxArray>& a, const std::shared_ptr<MlxArray>& b);
+
+std::shared_ptr<MlxArray> mlx_op_fft_1d(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_ifft_1d(const std::shared_ptr<MlxArray>& a);
+
+std::shared_ptr<MlxArray> mlx_op_real(const std::shared_ptr<MlxArray>& a);
+std::shared_ptr<MlxArray> mlx_op_imag(const std::shared_ptr<MlxArray>& a);
+
 }  // namespace polars_metal_mlx

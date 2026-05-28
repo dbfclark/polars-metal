@@ -14,7 +14,10 @@ pub use error::FfiError;
 
 pub mod array;
 pub mod elementwise;
+pub mod fft;
+pub mod matmul;
 pub mod reduce;
+pub mod scan;
 pub mod sort;
 
 // cxx's SharedPtr<T> implementation expands a panic! macro in the generated
@@ -222,6 +225,24 @@ mod ffi {
 
         fn mlx_op_sort(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
         fn mlx_op_argpartition(a: &SharedPtr<MlxArray>, kth: i32) -> Result<SharedPtr<MlxArray>>;
+
+        // M4 Phase 1 Task 10: cumulative scans + matmul + fft.
+
+        fn mlx_op_cumsum(a: &SharedPtr<MlxArray>, axis: i32) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_cumprod(a: &SharedPtr<MlxArray>, axis: i32) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_cummax(a: &SharedPtr<MlxArray>, axis: i32) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_cummin(a: &SharedPtr<MlxArray>, axis: i32) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_matmul(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_fft_1d(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_ifft_1d(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_real(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_imag(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
     }
 }
 

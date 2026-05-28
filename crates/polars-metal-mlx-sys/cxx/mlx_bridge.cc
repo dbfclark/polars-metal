@@ -3,6 +3,7 @@
 #include "mlx/allocator.h"
 #include "mlx/array.h"
 #include "mlx/device.h"
+#include "mlx/fft.h"
 #include "mlx/ops.h"
 #include "mlx/transforms.h"
 #include "mlx/utils.h"
@@ -377,6 +378,36 @@ std::shared_ptr<MlxArray> mlx_op_argpartition(
     auto base = std::make_shared<mlx::core::array>(mlx::core::argpartition(*a, kth));
     return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
 }
+
+// ── M4 Phase 1 Task 10: cumulative scans + matmul + fft + real/imag ─────────
+
+#define MLX_WRAP_SCAN(rust_name, mlx_op)                                                   \
+    std::shared_ptr<MlxArray> rust_name(const std::shared_ptr<MlxArray>& a, int32_t axis) { \
+        auto base = std::make_shared<mlx::core::array>(mlx::core::mlx_op(*a, axis));      \
+        return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));        \
+    }
+
+MLX_WRAP_SCAN(mlx_op_cumsum, cumsum)
+MLX_WRAP_SCAN(mlx_op_cumprod, cumprod)
+MLX_WRAP_SCAN(mlx_op_cummax, cummax)
+MLX_WRAP_SCAN(mlx_op_cummin, cummin)
+
+#undef MLX_WRAP_SCAN
+
+MLX_WRAP_BINOP(mlx_op_matmul, matmul)
+
+std::shared_ptr<MlxArray> mlx_op_fft_1d(const std::shared_ptr<MlxArray>& a) {
+    auto base = std::make_shared<mlx::core::array>(mlx::core::fft::fft(*a));
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
+std::shared_ptr<MlxArray> mlx_op_ifft_1d(const std::shared_ptr<MlxArray>& a) {
+    auto base = std::make_shared<mlx::core::array>(mlx::core::fft::ifft(*a));
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
+MLX_WRAP_UNOP(mlx_op_real, real)
+MLX_WRAP_UNOP(mlx_op_imag, imag)
 
 #undef MLX_WRAP_BINOP
 #undef MLX_WRAP_UNOP
