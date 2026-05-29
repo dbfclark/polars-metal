@@ -2,5 +2,6 @@
 //! expression subtrees that route to MLX.
 
 pub mod density;
+pub mod py;
 pub mod scope;
 pub mod supported_ops;
