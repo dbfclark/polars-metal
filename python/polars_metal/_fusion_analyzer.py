@@ -323,3 +323,168 @@ def _extract_array_dim(s: str) -> int:
     if m:
         return int(m.group(1))
     raise _Aborted
+
+
+# ── IR-arena analyzer (for walker integration) ─────────────────────────────
+#
+# When the walker is invoked, the Polars expression has already been lowered
+# from `pl.Expr` to IR-arena nodes accessed via `nt.view_expression(node_id)`.
+# These don't expose `.meta.serialize()` — we walk the arena directly.
+#
+# The IR-arena vocabulary maps onto the same OpId set, with slight encoding
+# differences from the JSON form:
+#   - Function.function_data is a flat tuple like ('sin',) - no namespacing.
+#   - Cast.dtype is a Polars dtype object directly.
+#   - BinaryExpr.op is a pl.Operator enum member.
+
+# Function-name string (from function_data[0]) -> OpId string.
+# Polars flattens namespaced fns into bare names at the IR layer.
+_IR_FUNCTION_MAP: dict[str, str] = {
+    "sin": "Sin",
+    "cos": "Cos",
+    "tan": "Tan",
+    "sinh": "Sinh",
+    "cosh": "Cosh",
+    "tanh": "Tanh",
+    "arcsin": "Asin",
+    "arccos": "Acos",
+    "arctan": "Atan",
+    "arctan2": "Atan2",
+    "exp": "Exp",
+    "sqrt": "Sqrt",
+    "cbrt": "Cbrt",
+    "abs": "Abs",
+    "negate": "Neg",
+    "floor": "Floor",
+    "ceil": "Ceil",
+    "round": "Round",
+}
+
+
+def analyze_ir_expression(nt: Any, node_id: int, schema: dict[str, Any]) -> PyFusionScope | None:
+    """Walk a Polars IR expression by arena ID and build a PyFusionScope.
+
+    Used by the walker after Polars has optimized the LazyFrame into arena
+    form. `nt` is a NodeTraverser; `node_id` is the int arena ID of the
+    expression root (typically from `binding.node` in an HStack/Select).
+
+    Returns None on the first unsupported node.
+    """
+    try:
+        scope = PyFusionScope()
+        idx = _visit_ir(nt, node_id, schema, scope)
+        scope.mark_output(idx)
+        return scope
+    except _Aborted:
+        return None
+
+
+def _visit_ir(nt: Any, node_id: int, schema: dict[str, Any], scope: PyFusionScope) -> int:
+    try:
+        node = nt.view_expression(node_id)
+    except Exception as e:
+        raise _Aborted from e
+    cls = type(node).__name__
+
+    if cls == "Column":
+        name = getattr(node, "name", None)
+        if name is None:
+            raise _Aborted
+        dtype = schema.get(str(name))
+        if dtype is None:
+            raise _Aborted
+        return scope.add_input(str(name), _dtype_to_input_str(dtype))
+
+    if cls == "Literal":
+        val = getattr(node, "value", None)
+        if val is None:
+            raise _Aborted
+        return scope.add_input(f"__lit_{val}", "F32")
+
+    if cls == "BinaryExpr":
+        op = getattr(node, "op", None)
+        op_name = getattr(op, "name", None) or str(op).rsplit(".", 1)[-1]
+        op_id = _BINOP_MAP.get(op_name)
+        if op_id is None:
+            raise _Aborted
+        left = _visit_ir(nt, node.left, schema, scope)
+        right = _visit_ir(nt, node.right, schema, scope)
+        return scope.push_op(op_id, [left, right])
+
+    if cls == "Cast":
+        target = getattr(node, "dtype", None)
+        op_id = None
+        if target == pl.Float32:
+            op_id = "CastF32"
+        elif target == pl.Float64:
+            op_id = "CastF64"
+        elif target == pl.Int32:
+            op_id = "CastI32"
+        elif target == pl.Boolean:
+            op_id = "CastBool"
+        if op_id is None:
+            raise _Aborted
+        child = _visit_ir(nt, node.expr, schema, scope)
+        return scope.push_op(op_id, [child])
+
+    if cls == "Function":
+        fd = getattr(node, "function_data", ())
+        if not fd:
+            raise _Aborted
+        fn_name = str(fd[0]).lower()
+        inputs = list(getattr(node, "input", []))
+        if fn_name == "log":
+            return _visit_ir_log(nt, inputs, schema, scope)
+        if fn_name == "pow":
+            # `square` desugars to pow(x, 2); we emit Pow.
+            if len(inputs) != 2:
+                raise _Aborted
+            left = _visit_ir(nt, inputs[0], schema, scope)
+            right = _visit_ir(nt, inputs[1], schema, scope)
+            return scope.push_op("Pow", [left, right])
+        op_id = _IR_FUNCTION_MAP.get(fn_name)
+        if op_id is None:
+            raise _Aborted
+        child_idxs = [_visit_ir(nt, cid, schema, scope) for cid in inputs]
+        return scope.push_op(op_id, child_idxs)
+
+    if cls == "Agg":
+        agg_name = getattr(node, "name", None)
+        op_id = _AGG_MAP.get(str(agg_name))
+        if op_id is None:
+            raise _Aborted
+        args = list(getattr(node, "arguments", []))
+        if not args:
+            raise _Aborted
+        child = _visit_ir(nt, args[0], schema, scope)
+        return scope.push_op(op_id, [child])
+
+    if cls == "Ternary":
+        cond = _visit_ir(nt, node.predicate, schema, scope)
+        then_v = _visit_ir(nt, node.truthy, schema, scope)
+        else_v = _visit_ir(nt, node.falsy, schema, scope)
+        return scope.push_op("Where", [cond, then_v, else_v])
+
+    raise _Aborted
+
+
+def _visit_ir_log(nt: Any, inputs: list, schema: dict[str, Any], scope: PyFusionScope) -> int:
+    """log() is 2-arg (x, base) in the IR too; map base to Log/Log2/Log10."""
+    if len(inputs) != 2:
+        raise _Aborted
+    base_node = nt.view_expression(inputs[1])
+    if type(base_node).__name__ != "Literal":
+        raise _Aborted
+    base_val = getattr(base_node, "value", None)
+    if base_val is None:
+        raise _Aborted
+    if abs(base_val - 2.718281828459045) < 1e-9:
+        op_id = "Log"
+    elif base_val == 2 or base_val == 2.0:
+        op_id = "Log2"
+    elif base_val == 10 or base_val == 10.0:
+        op_id = "Log10"
+    else:
+        raise _Aborted
+    child = _visit_ir(nt, inputs[0], schema, scope)
+    return scope.push_op(op_id, [child])

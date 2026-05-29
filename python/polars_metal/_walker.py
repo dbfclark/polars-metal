@@ -73,10 +73,15 @@ fold (and when optimization is disabled). We support all three shapes.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date as _date
 from datetime import datetime as _datetime
 from typing import Any
+
+from polars_metal._fusion_analyzer import analyze_ir_expression
+
+_fusion_log = logging.getLogger("polars_metal.fusion")
 
 # Dtype tags the predicate path widens to I64 (the cmp_i64 kernel covers
 # all of them; the runtime evaluator casts the underlying buffer). Narrow
@@ -334,6 +339,37 @@ def _walk_select_reduction(nt: Any, exprs: list[Any]) -> WalkResult:
     )
 
 
+def _probe_fusion_analyzer(
+    nt: Any, node_id: int, in_schema: dict[str, Any], output_name: str
+) -> None:
+    """Run the M4 fusion analyzer on an HStack binding and log the decision.
+
+    Diagnostic only; the actual `FusedExprGraph` plan-node emission lives in
+    Phase 5 (Task 21+). The log line lets Task 17's integration test confirm
+    the analyzer is wired into the walker without requiring the still-to-build
+    plan-node machinery.
+    """
+    try:
+        scope = analyze_ir_expression(nt, node_id, in_schema)
+    except Exception as e:
+        _fusion_log.debug("analyzer raised for %r: %r", output_name, e)
+        return
+    if scope is None:
+        _fusion_log.debug("analyzer rejected expr for column %r (unsupported op)", output_name)
+        return
+    # n_rows is unknown at walker time; use the smallest meaningful threshold
+    # so density_routes_gpu gives the routing it would pick at scale. The real
+    # row-count comes through at execute time in Phase 5.
+    decision = scope.route_decision(10_000_000)
+    _fusion_log.info(
+        "FusedExprGraph candidate column=%r n_inputs=%d n_ops=%d decision=%s",
+        output_name,
+        scope.n_inputs(),
+        scope.n_ops(),
+        decision,
+    )
+
+
 def _walk_hstack(nt: Any, node: Any) -> WalkResult:
     """Lower an HStack (``with_columns``) IR node — appends one or more
     derived columns to the input frame.
@@ -375,6 +411,12 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
         node_id = getattr(e, "node", None)
         if node_id is None:
             return FallBack(reason="HStack expression has no .node id")
+
+        # M4 Phase 3: probe the fusion analyzer. The actual MetalPlanNode::
+        # FusedExprGraph emission is Phase 5 work (Task 21+); for now we just
+        # log what the analyzer would decide so the Task 17 contract is met.
+        _probe_fusion_analyzer(nt, node_id, in_schema, str(getattr(e, "output_name", "")))
+
         expr_dict = _walk_agg_expr_node(nt, node_id, in_schema, _AGG_EXPR_MAX_DEPTH)
         if expr_dict is None:
             return FallBack(reason="HStack expression not in closed set")
