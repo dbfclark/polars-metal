@@ -2477,3 +2477,81 @@ fn dispatch_logical_py<'py>(
         PyBytes::new_bound(py, &out_valid),
     ))
 }
+
+// ── M4 Phase 5 Task 21+22: execute_fused_expr ───────────────────────────────
+//
+// PyO3 entry point that takes a PyFusionScope plus a list of input column
+// byte buffers (each F32-typed) and returns the output as a PyBytes byte
+// buffer. The Python wrapper in `_udf.py` converts Polars Series ↔ bytes
+// since we don't carry a `pyo3-polars` dep.
+//
+// Deviation from the plan: the plan called for a `PyMetalPlanNode::FusedExprGraph`
+// wrapper sitting on top of the Rust `MetalPlanNode` enum. We don't have a
+// PyO3 wrapper for that enum - the Python side talks to Rust via wire-plan
+// dicts. We expose the executor directly; the walker stashes the
+// PyFusionScope as a side-channel on the binding and the UDF dispatch
+// (Task 23) invokes this entry point.
+
+#[pyfunction]
+pub fn execute_fused_expr<'py>(
+    py: Python<'py>,
+    scope: &crate::fusion::py::PyFusionScope,
+    input_buffers: Vec<Bound<'py, PyBytes>>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    use std::sync::Arc;
+    let device = MetalDevice::system_default().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "polars_metal: metal device unavailable: {e}"
+        ))
+    })?;
+
+    // Stage each input PyBytes (F32 column data) into a MetalBuffer.
+    let metal_buffers: Vec<Arc<polars_metal_buffer::MetalBuffer>> = input_buffers
+        .iter()
+        .map(|bytes| {
+            let raw = bytes.as_bytes();
+            // SAFETY: caller-provided F32 column bytes. Length is a multiple
+            // of 4; alignment is unconstrained for u8 → f32 reinterpret on
+            // ARM macOS (no SIGBUS) and we only read.
+            let f32_slice =
+                unsafe { std::slice::from_raw_parts(raw.as_ptr().cast::<f32>(), raw.len() / 4) };
+            polars_metal_buffer::MetalBuffer::from_f32_slice(&device, f32_slice)
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "polars_metal: input buffer staging failed: {e}"
+                    ))
+                })
+                .map(Arc::new)
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+
+    // Build the subgraph over zero-copy views, evaluate, read back as F32.
+    let subgraph = crate::fusion::subgraph::MlxSubgraph::from_fusion_scope_buffers(
+        &scope.inner,
+        &metal_buffers,
+    )
+    .map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("polars_metal: subgraph build: {e}"))
+    })?;
+    let outputs = subgraph.eval().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: subgraph eval: {e}"))
+    })?;
+    let out_data = outputs.into_iter().next().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(
+            "polars_metal: fused subgraph produced no outputs",
+        )
+    })?;
+    let out_f32 = out_data.to_f32_vec().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: output readback: {e}"))
+    })?;
+    // SAFETY: out_f32 is a Vec<f32>; bytes view is valid for the duration of
+    // the slice borrow (PyBytes::new_bound copies the bytes into a new
+    // Python object).
+    let out_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            out_f32.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(out_f32.as_slice()),
+        )
+    };
+    Ok(PyBytes::new_bound(py, out_bytes))
+}
