@@ -333,6 +333,25 @@ impl MetalBuffer {
         proto_ref as *const ProtocolObject<dyn MTLBuffer> as *const std::ffi::c_void
     }
 
+    /// Copy the buffer's contents out as an `f32` Vec.
+    ///
+    /// Assumes the buffer is laid out as F32 values (length must be a
+    /// multiple of 4 bytes). Use after evaluating an MLX subgraph whose
+    /// output was written into this buffer.
+    pub fn to_f32_vec(&self) -> Vec<f32> {
+        let bytes = self.as_slice();
+        let n = bytes.len() / 4;
+        let mut out = Vec::with_capacity(n);
+        // SAFETY: bytes is valid for n*4 bytes; we read n f32 values from it.
+        // Reading misaligned f32 from a u8 buffer is allowed via copy.
+        unsafe {
+            let src = bytes.as_ptr().cast::<f32>();
+            out.set_len(n);
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), n);
+        }
+        out
+    }
+
     /// View the buffer's contents as a byte slice.
     ///
     /// Valid as long as `self` is alive and no GPU writes are in-flight.

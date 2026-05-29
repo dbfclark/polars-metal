@@ -11,8 +11,10 @@
 //! fusion module; `polars-metal-kernels` continues to own the custom-MSL
 //! kernel work.
 
+use polars_metal_buffer::{MetalBuffer, MetalDevice};
 use polars_metal_mlx_sys::array::{
-    mlx_array_eval, mlx_array_from_f32_slice, mlx_array_to_f32_vec, MlxArrayHandle,
+    mlx_array_eval, mlx_array_from_f32_slice, mlx_array_to_f32_vec, mlx_array_view_metal_buffer,
+    MlxArrayHandle, MlxDtype,
 };
 use polars_metal_mlx_sys::elementwise::{
     mlx_abs, mlx_acos, mlx_add, mlx_asin, mlx_atan, mlx_atan2, mlx_cbrt, mlx_ceil, mlx_cos,
@@ -125,6 +127,76 @@ impl MlxSubgraph {
             let data =
                 mlx_array_to_f32_vec(h).map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
             outs.push(ColumnBuffer { data });
+        }
+        Ok(outs)
+    }
+
+    /// Production-path constructor: build the subgraph over zero-copy views
+    /// of existing `MetalBuffer`s. Input arrays are constructed via
+    /// `mlx_array_view_metal_buffer` so MLX reads directly from the caller's
+    /// memory without an additional copy. Lifetime safety is enforced by
+    /// `_input_refs` in the MlxArrayHandle.
+    pub fn from_fusion_scope_buffers(
+        scope: &FusionScope,
+        inputs: &[std::sync::Arc<MetalBuffer>],
+    ) -> Result<Self, BuildError> {
+        if inputs.len() != scope.inputs.len() {
+            return Err(BuildError::InputCountMismatch {
+                expected: scope.inputs.len(),
+                actual: inputs.len(),
+            });
+        }
+        let mut handles: Vec<MlxArrayHandle> = inputs
+            .iter()
+            .map(|buf| {
+                // Derive 1-D shape from buffer byte length (F32 = 4 bytes each).
+                let n_elements = (buf.len() / 4) as i64;
+                let shape = [n_elements];
+                mlx_array_view_metal_buffer(buf.clone(), &shape, MlxDtype::F32)
+                    .map_err(|e| BuildError::MlxError(format!("{e:?}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for op_node in &scope.ops {
+            let handle = build_op(op_node, &handles)?;
+            handles.push(handle);
+        }
+        let outputs: Vec<MlxArrayHandle> = scope
+            .outputs
+            .iter()
+            .map(|idx| {
+                handles
+                    .get(idx.0 as usize)
+                    .cloned()
+                    .ok_or(BuildError::UndefinedNode(idx.0))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { handles, outputs })
+    }
+
+    /// Eval the subgraph and copy each output back into a freshly allocated
+    /// `MetalBuffer`.
+    ///
+    /// Phase 4 implementation note: MLX-side allocations live behind the
+    /// allocator API; extracting the underlying MTL::Buffer\* and wrapping
+    /// it as a `MetalBuffer` without copying requires exposing the MLX
+    /// allocator surface through the FFI bridge. For Phase 4 we take the
+    /// pragmatic path - read the output as Vec<f32> and stage a fresh
+    /// `MetalBuffer`. This adds one F32 copy at the output, which doesn't
+    /// affect the input zero-copy path (the dominant cost for large
+    /// transcendental chains). Full output-zero-copy is a future
+    /// optimization tracked alongside the MLX allocator-surface work.
+    pub fn eval_to_metal_buffers(
+        &self,
+        device: &MetalDevice,
+    ) -> Result<Vec<MetalBuffer>, BuildError> {
+        mlx_array_eval(&self.outputs).map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+        let mut outs = Vec::with_capacity(self.outputs.len());
+        for h in &self.outputs {
+            let data =
+                mlx_array_to_f32_vec(h).map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+            let buf = MetalBuffer::from_f32_slice(device, &data)
+                .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+            outs.push(buf);
         }
         Ok(outs)
     }
