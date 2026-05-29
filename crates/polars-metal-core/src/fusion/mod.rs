@@ -4,4 +4,5 @@
 pub mod density;
 pub mod py;
 pub mod scope;
+pub mod subgraph;
 pub mod supported_ops;
