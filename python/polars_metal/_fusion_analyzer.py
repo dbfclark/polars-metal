@@ -370,16 +370,39 @@ def analyze_ir_expression(nt: Any, node_id: int, schema: dict[str, Any]) -> PyFu
 
     Returns None on the first unsupported node.
     """
+    result = analyze_ir_with_columns(nt, node_id, schema)
+    return None if result is None else result[0]
+
+
+def analyze_ir_with_columns(
+    nt: Any, node_id: int, schema: dict[str, Any]
+) -> tuple[PyFusionScope, list[str]] | None:
+    """Like `analyze_ir_expression`, but also returns the ordered list of
+    real input column names (excluding synthetic literal inputs) so the
+    executor knows which Polars Series to pass to `execute_fused_expr`."""
     try:
         scope = PyFusionScope()
-        idx = _visit_ir(nt, node_id, schema, scope)
+        columns: list[str] = []
+        idx = _visit_ir(nt, node_id, schema, scope, columns)
         scope.mark_output(idx)
-        return scope
+        return scope, columns
     except _Aborted:
         return None
 
 
-def _visit_ir(nt: Any, node_id: int, schema: dict[str, Any], scope: PyFusionScope) -> int:
+def _visit_ir(
+    nt: Any,
+    node_id: int,
+    schema: dict[str, Any],
+    scope: PyFusionScope,
+    columns: list[str] | None = None,
+) -> int:
+    """Recursive descent over the Polars IR arena.
+
+    `columns`, when given, is appended with each real input column name (in
+    scope-add order) so the caller can pass only the user-facing series to
+    `execute_fused_expr`. Synthetic literal inputs (`__lit_*`) are excluded.
+    """
     try:
         node = nt.view_expression(node_id)
     except Exception as e:
@@ -393,6 +416,8 @@ def _visit_ir(nt: Any, node_id: int, schema: dict[str, Any], scope: PyFusionScop
         dtype = schema.get(str(name))
         if dtype is None:
             raise _Aborted
+        if columns is not None:
+            columns.append(str(name))
         return scope.add_input(str(name), _dtype_to_input_str(dtype))
 
     if cls == "Literal":
@@ -407,8 +432,8 @@ def _visit_ir(nt: Any, node_id: int, schema: dict[str, Any], scope: PyFusionScop
         op_id = _BINOP_MAP.get(op_name)
         if op_id is None:
             raise _Aborted
-        left = _visit_ir(nt, node.left, schema, scope)
-        right = _visit_ir(nt, node.right, schema, scope)
+        left = _visit_ir(nt, node.left, schema, scope, columns)
+        right = _visit_ir(nt, node.right, schema, scope, columns)
         return scope.push_op(op_id, [left, right])
 
     if cls == "Cast":
@@ -424,7 +449,7 @@ def _visit_ir(nt: Any, node_id: int, schema: dict[str, Any], scope: PyFusionScop
             op_id = "CastBool"
         if op_id is None:
             raise _Aborted
-        child = _visit_ir(nt, node.expr, schema, scope)
+        child = _visit_ir(nt, node.expr, schema, scope, columns)
         return scope.push_op(op_id, [child])
 
     if cls == "Function":
@@ -434,18 +459,18 @@ def _visit_ir(nt: Any, node_id: int, schema: dict[str, Any], scope: PyFusionScop
         fn_name = str(fd[0]).lower()
         inputs = list(getattr(node, "input", []))
         if fn_name == "log":
-            return _visit_ir_log(nt, inputs, schema, scope)
+            return _visit_ir_log(nt, inputs, schema, scope, columns)
         if fn_name == "pow":
             # `square` desugars to pow(x, 2); we emit Pow.
             if len(inputs) != 2:
                 raise _Aborted
-            left = _visit_ir(nt, inputs[0], schema, scope)
-            right = _visit_ir(nt, inputs[1], schema, scope)
+            left = _visit_ir(nt, inputs[0], schema, scope, columns)
+            right = _visit_ir(nt, inputs[1], schema, scope, columns)
             return scope.push_op("Pow", [left, right])
         op_id = _IR_FUNCTION_MAP.get(fn_name)
         if op_id is None:
             raise _Aborted
-        child_idxs = [_visit_ir(nt, cid, schema, scope) for cid in inputs]
+        child_idxs = [_visit_ir(nt, cid, schema, scope, columns) for cid in inputs]
         return scope.push_op(op_id, child_idxs)
 
     if cls == "Agg":
@@ -456,19 +481,25 @@ def _visit_ir(nt: Any, node_id: int, schema: dict[str, Any], scope: PyFusionScop
         args = list(getattr(node, "arguments", []))
         if not args:
             raise _Aborted
-        child = _visit_ir(nt, args[0], schema, scope)
+        child = _visit_ir(nt, args[0], schema, scope, columns)
         return scope.push_op(op_id, [child])
 
     if cls == "Ternary":
-        cond = _visit_ir(nt, node.predicate, schema, scope)
-        then_v = _visit_ir(nt, node.truthy, schema, scope)
-        else_v = _visit_ir(nt, node.falsy, schema, scope)
+        cond = _visit_ir(nt, node.predicate, schema, scope, columns)
+        then_v = _visit_ir(nt, node.truthy, schema, scope, columns)
+        else_v = _visit_ir(nt, node.falsy, schema, scope, columns)
         return scope.push_op("Where", [cond, then_v, else_v])
 
     raise _Aborted
 
 
-def _visit_ir_log(nt: Any, inputs: list, schema: dict[str, Any], scope: PyFusionScope) -> int:
+def _visit_ir_log(
+    nt: Any,
+    inputs: list,
+    schema: dict[str, Any],
+    scope: PyFusionScope,
+    columns: list[str] | None = None,
+) -> int:
     """log() is 2-arg (x, base) in the IR too; map base to Log/Log2/Log10."""
     if len(inputs) != 2:
         raise _Aborted
@@ -486,5 +517,5 @@ def _visit_ir_log(nt: Any, inputs: list, schema: dict[str, Any], scope: PyFusion
         op_id = "Log10"
     else:
         raise _Aborted
-    child = _visit_ir(nt, inputs[0], schema, scope)
+    child = _visit_ir(nt, inputs[0], schema, scope, columns)
     return scope.push_op(op_id, [child])

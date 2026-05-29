@@ -79,7 +79,7 @@ from datetime import date as _date
 from datetime import datetime as _datetime
 from typing import Any
 
-from polars_metal._fusion_analyzer import analyze_ir_expression
+from polars_metal._fusion_analyzer import analyze_ir_with_columns
 
 _fusion_log = logging.getLogger("polars_metal.fusion")
 
@@ -341,25 +341,23 @@ def _walk_select_reduction(nt: Any, exprs: list[Any]) -> WalkResult:
 
 def _probe_fusion_analyzer(
     nt: Any, node_id: int, in_schema: dict[str, Any], output_name: str
-) -> None:
-    """Run the M4 fusion analyzer on an HStack binding and log the decision.
+) -> tuple[Any, list[str]] | None:
+    """Run the M4 fusion analyzer on an HStack binding, log the decision,
+    and return ``(scope, input_column_names)`` when the analyzer accepts
+    the expression. Returns ``None`` on rejection.
 
-    Diagnostic only; the actual `FusedExprGraph` plan-node emission lives in
-    Phase 5 (Task 21+). The log line lets Task 17's integration test confirm
-    the analyzer is wired into the walker without requiring the still-to-build
-    plan-node machinery.
+    The returned scope is stashed on the binding's wire-plan dict as a
+    side-channel for Phase 5 dispatch.
     """
     try:
-        scope = analyze_ir_expression(nt, node_id, in_schema)
+        result = analyze_ir_with_columns(nt, node_id, in_schema)
     except Exception as e:
         _fusion_log.debug("analyzer raised for %r: %r", output_name, e)
-        return
-    if scope is None:
+        return None
+    if result is None:
         _fusion_log.debug("analyzer rejected expr for column %r (unsupported op)", output_name)
-        return
-    # n_rows is unknown at walker time; use the smallest meaningful threshold
-    # so density_routes_gpu gives the routing it would pick at scale. The real
-    # row-count comes through at execute time in Phase 5.
+        return None
+    scope, columns = result
     decision = scope.route_decision(10_000_000)
     _fusion_log.info(
         "FusedExprGraph candidate column=%r n_inputs=%d n_ops=%d decision=%s",
@@ -368,6 +366,7 @@ def _probe_fusion_analyzer(
         scope.n_ops(),
         decision,
     )
+    return scope, columns
 
 
 def _walk_hstack(nt: Any, node: Any) -> WalkResult:
@@ -412,20 +411,24 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
         if node_id is None:
             return FallBack(reason="HStack expression has no .node id")
 
-        # M4 Phase 3: probe the fusion analyzer. The actual MetalPlanNode::
-        # FusedExprGraph emission is Phase 5 work (Task 21+); for now we just
-        # log what the analyzer would decide so the Task 17 contract is met.
-        _probe_fusion_analyzer(nt, node_id, in_schema, str(getattr(e, "output_name", "")))
+        # M4 Phase 3+5: probe the fusion analyzer; if it accepts, stash the
+        # scope on the binding as a side-channel so the UDF dispatch (Phase 5)
+        # can execute it via the fused MLX subgraph path.
+        output_name = str(getattr(e, "output_name", "") or "")
+        fused = _probe_fusion_analyzer(nt, node_id, in_schema, output_name)
 
         expr_dict = _walk_agg_expr_node(nt, node_id, in_schema, _AGG_EXPR_MAX_DEPTH)
         if expr_dict is None:
             return FallBack(reason="HStack expression not in closed set")
-        out_exprs.append(
-            {
-                "name": str(getattr(e, "output_name", "") or ""),
-                "expr": expr_dict,
-            }
-        )
+        binding: dict = {
+            "name": output_name,
+            "expr": expr_dict,
+        }
+        if fused is not None:
+            scope, columns = fused
+            binding["_fused_scope"] = scope
+            binding["_fused_columns"] = columns
+        out_exprs.append(binding)
 
     nt.set_node(inputs[0])
     inner = _walk_at_current(nt)

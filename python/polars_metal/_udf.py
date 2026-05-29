@@ -111,8 +111,51 @@ def _dispatch(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
         # PyDataFrame.select is the sync escape hatch (see
         # docs/open-questions.md, Walker / UDF integration #1).
         return pl.DataFrame._from_pydf(filtered._df.select(list(wire_plan["columns"])))
+    if wire_plan["kind"] == "HStack":
+        # M4 Phase 5: if every appended column has a fused MLX subgraph from
+        # the Phase 3 analyzer, dispatch the whole HStack via the fused path.
+        # Bindings without `_fused_scope` (analyzer rejected them, or they
+        # came from the M3 conformance path) cause the HStack to fall through
+        # to the existing _native.execute_plan path. This is the all-or-
+        # nothing MVP; partial-fusion mixed dispatch can land in a follow-up.
+        exprs = wire_plan.get("exprs", [])
+        if exprs and all("_fused_scope" in e for e in exprs):
+            return _dispatch_hstack_fused(df_pydf, wire_plan)
     result_pydf = _native.execute_plan(df_pydf, wire_plan)
     return pl.DataFrame._from_pydf(result_pydf)
+
+
+def _dispatch_hstack_fused(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
+    """Execute an HStack whose every binding carries a `_fused_scope`
+    side-channel. Recurses on the upstream input, then runs each binding
+    through `execute_fused_expr` and stitches the results onto the frame.
+    """
+    upstream = _dispatch(df_pydf, wire_plan["input"])
+    new_columns: list[pl.Series] = []
+    for binding in wire_plan["exprs"]:
+        scope = binding["_fused_scope"]
+        input_columns: list[str] = binding["_fused_columns"]
+        name = binding["name"]
+        # Collect the F32 byte buffer for each input column. The walker only
+        # accepts the analyzer when input dtypes pass `_dtype_to_input_str`,
+        # so each column is F32 / F64 / I32 / Bool by construction; for the
+        # MVP we widen everything to F32 via to_numpy(dtype=np.float32).
+        import numpy as np
+
+        input_buffers: list[bytes] = []
+        for col_name in input_columns:
+            series = upstream.get_column(col_name)
+            arr = series.to_numpy().astype(np.float32, copy=False)
+            input_buffers.append(arr.tobytes())
+
+        out_bytes = _native.execute_fused_expr(
+            scope=scope,
+            input_buffers=input_buffers,
+        )
+        out_arr = np.frombuffer(out_bytes, dtype=np.float32).copy()
+        new_columns.append(pl.Series(name, out_arr))
+
+    return upstream.with_columns(new_columns)
 
 
 def _filter_via_polars(df_pydf: Any, filter_plan: dict) -> pl.DataFrame:
