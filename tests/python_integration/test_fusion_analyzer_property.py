@@ -313,24 +313,13 @@ def test_engine_metal_matches_polars_cpu_on_random_f32_expressions(
     df = pl.DataFrame({"a": a, "b": b, "c": c})
 
     cpu_y = df.lazy().with_columns(y=expr).collect()["y"].to_numpy().astype(np.float32, copy=False)
-    try:
-        metal_y = (
-            df.lazy()
-            .with_columns(y=expr)
-            .collect(engine=polars_metal.MetalEngine())["y"]
-            .to_numpy()
-            .astype(np.float32, copy=False)
-        )
-    except ValueError as e:
-        # The dispatcher doesn't yet peel Project / nested HStack chains
-        # (see `test_engine_metal_handles_haversine_e2e`). When Polars's
-        # optimizer produces that shape, the UDF raises a ValueError
-        # mentioning "HStack" — skip this hypothesis example. Once the
-        # dispatcher fix lands, this branch becomes dead code and the
-        # haversine xfail can be cleared in the same change.
-        if "HStack" in str(e):
-            assume(False)
-        raise
+    metal_y = (
+        df.lazy()
+        .with_columns(y=expr)
+        .collect(engine=polars_metal.MetalEngine())["y"]
+        .to_numpy()
+        .astype(np.float32, copy=False)
+    )
 
     finite = np.isfinite(cpu_y) & np.isfinite(metal_y)
     assume(finite.sum() >= 8)
@@ -348,22 +337,14 @@ def test_engine_metal_matches_polars_cpu_on_random_f32_expressions(
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Dispatcher doesn't peel Project wrapping a chain of HStacks "
-        "(CSE intermediates). The walker accepts the fused d=haversine "
-        "binding but `_udf._dispatch` falls through to `_native.execute_plan` "
-        "which rejects HStack. Fix pending."
-    ),
-    strict=True,
-)
 def test_engine_metal_handles_haversine_e2e() -> None:
     """End-to-end regression: the haversine expression triggers CSE which
     introduces a `Project(HStack(HStack(...)))` plan shape. The dispatcher
-    needs to peel the Project root and recurse through chained HStacks.
+    must peel the Project root and recurse through chained HStacks.
 
-    Caught while running the headline M4 haversine benchmark (10M F32
-    rows) at the engine='metal' path."""
+    Originally caught while running the headline M4 haversine benchmark
+    (10M F32 rows) at the engine='metal' path; left in as a regression
+    against `_udf._dispatch` losing the Project(HStack(...)) peel."""
     import polars_metal
 
     N = 1024

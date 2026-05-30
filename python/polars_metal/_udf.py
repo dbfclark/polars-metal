@@ -111,6 +111,15 @@ def _dispatch(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
         # PyDataFrame.select is the sync escape hatch (see
         # docs/open-questions.md, Walker / UDF integration #1).
         return pl.DataFrame._from_pydf(filtered._df.select(list(wire_plan["columns"])))
+    if wire_plan["kind"] == "Project" and wire_plan["input"]["kind"] == "HStack":
+        # Project wrapping an HStack chain — common when the optimizer
+        # adds an output-column reorder above CSE-introduced HStacks
+        # (haversine, Black-Scholes, any with_columns over a multi-col
+        # frame). Dispatch the HStack input, then select on the result.
+        # Same select-via-PyDataFrame trick as Project(Filter) — see
+        # the comment above for why we can't use pl.DataFrame.select.
+        inner = _dispatch(df_pydf, wire_plan["input"])
+        return pl.DataFrame._from_pydf(inner._df.select(list(wire_plan["columns"])))
     if wire_plan["kind"] == "HStack":
         # M4 Phase 5: if every appended column has a fused MLX subgraph from
         # the Phase 3 analyzer, dispatch the whole HStack via the fused path.
