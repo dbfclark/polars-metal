@@ -411,23 +411,39 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
         if node_id is None:
             return FallBack(reason="HStack expression has no .node id")
 
-        # M4 Phase 3+5: probe the fusion analyzer; if it accepts, stash the
-        # scope on the binding as a side-channel so the UDF dispatch (Phase 5)
-        # can execute it via the fused MLX subgraph path.
+        # M4 Phase 3+5: probe the fusion analyzer; if it accepts the binding
+        # we route it via the fused MLX subgraph path and DO NOT require the
+        # M3 closed-set check (it's a superset of what M3 supports). We emit
+        # a placeholder expr_dict pointing at the first input column so the
+        # Rust router still sees a valid HStack wire-plan; the Python
+        # _dispatch path intercepts all-fused HStacks before any Rust
+        # expression eval happens.
         output_name = str(getattr(e, "output_name", "") or "")
         fused = _probe_fusion_analyzer(nt, node_id, in_schema, output_name)
 
-        expr_dict = _walk_agg_expr_node(nt, node_id, in_schema, _AGG_EXPR_MAX_DEPTH)
-        if expr_dict is None:
-            return FallBack(reason="HStack expression not in closed set")
-        binding: dict = {
-            "name": output_name,
-            "expr": expr_dict,
-        }
         if fused is not None:
-            scope, columns = fused
-            binding["_fused_scope"] = scope
-            binding["_fused_columns"] = columns
+            scope, descriptors = fused
+            # Find the first real column descriptor for the placeholder; if the
+            # expression is all literals (rare but possible), grab any column
+            # name from the input schema.
+            real_col = next(
+                (name for kind, name in descriptors if kind == "col"),
+                next(iter(in_schema), ""),
+            )
+            binding: dict = {
+                "name": output_name,
+                "expr": {"kind": "Column", "name": real_col},
+                "_fused_scope": scope,
+                "_fused_columns": descriptors,
+            }
+        else:
+            expr_dict = _walk_agg_expr_node(nt, node_id, in_schema, _AGG_EXPR_MAX_DEPTH)
+            if expr_dict is None:
+                return FallBack(reason="HStack expression not in closed set")
+            binding = {
+                "name": output_name,
+                "expr": expr_dict,
+            }
         out_exprs.append(binding)
 
     nt.set_node(inputs[0])

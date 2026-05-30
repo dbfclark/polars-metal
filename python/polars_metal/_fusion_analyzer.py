@@ -376,33 +376,41 @@ def analyze_ir_expression(nt: Any, node_id: int, schema: dict[str, Any]) -> PyFu
 
 def analyze_ir_with_columns(
     nt: Any, node_id: int, schema: dict[str, Any]
-) -> tuple[PyFusionScope, list[str]] | None:
+) -> tuple[PyFusionScope, list[tuple[str, str | float]]] | None:
     """Like `analyze_ir_expression`, but also returns the ordered list of
-    real input column names (excluding synthetic literal inputs) so the
-    executor knows which Polars Series to pass to `execute_fused_expr`."""
+    input descriptors. Each descriptor is `("col", column_name)` for real
+    columns or `("lit", value)` for literal scalars. Order matches the
+    scope's input order, so the executor can construct input buffers in the
+    correct sequence.
+
+    Two-pass: pass 1 collects every leaf (Column/Literal) into the scope in
+    DFS order so input NodeIdxs are contiguous from 0. Pass 2 walks the tree
+    again and pushes ops; on a leaf it returns the precomputed input idx.
+    Single-pass interleaving doesn't work because the executor assumes a
+    flat `[inputs..., ops...]` layout (see fusion/subgraph.rs build_op)."""
     try:
         scope = PyFusionScope()
-        columns: list[str] = []
-        idx = _visit_ir(nt, node_id, schema, scope, columns)
+        descriptors: list[tuple[str, str | float]] = []
+        leaf_idx: dict[int, int] = {}
+        _gather_leaves_ir(nt, node_id, schema, scope, descriptors, leaf_idx)
+        idx = _visit_ir_ops(nt, node_id, schema, scope, leaf_idx)
         scope.mark_output(idx)
-        return scope, columns
+        return scope, descriptors
     except _Aborted:
         return None
 
 
-def _visit_ir(
+def _gather_leaves_ir(
     nt: Any,
     node_id: int,
     schema: dict[str, Any],
     scope: PyFusionScope,
-    columns: list[str] | None = None,
-) -> int:
-    """Recursive descent over the Polars IR arena.
-
-    `columns`, when given, is appended with each real input column name (in
-    scope-add order) so the caller can pass only the user-facing series to
-    `execute_fused_expr`. Synthetic literal inputs (`__lit_*`) are excluded.
-    """
+    descriptors: list[tuple[str, str | float]],
+    leaf_idx: dict[int, int],
+) -> None:
+    """Pass 1: DFS-walk the IR tree and `add_input` every Column/Literal,
+    recording arena-id -> input-NodeIdx in `leaf_idx`. Aborts on the same
+    unsupported-node set as `_visit_ir_ops` so failures surface here too."""
     try:
         node = nt.view_expression(node_id)
     except Exception as e:
@@ -416,15 +424,85 @@ def _visit_ir(
         dtype = schema.get(str(name))
         if dtype is None:
             raise _Aborted
-        if columns is not None:
-            columns.append(str(name))
-        return scope.add_input(str(name), _dtype_to_input_str(dtype))
+        idx = scope.add_input(str(name), _dtype_to_input_str(dtype))
+        descriptors.append(("col", str(name)))
+        leaf_idx[node_id] = idx
+        return
 
     if cls == "Literal":
         val = getattr(node, "value", None)
         if val is None:
             raise _Aborted
-        return scope.add_input(f"__lit_{val}", "F32")
+        idx = scope.add_input(f"__lit_{val}", "F32")
+        descriptors.append(("lit", float(val)))
+        leaf_idx[node_id] = idx
+        return
+
+    if cls == "BinaryExpr":
+        _gather_leaves_ir(nt, node.left, schema, scope, descriptors, leaf_idx)
+        _gather_leaves_ir(nt, node.right, schema, scope, descriptors, leaf_idx)
+        return
+
+    if cls == "Cast":
+        # Mirror the pass-2 restriction: only CastF32 is honored downstream
+        # (see `_visit_ir_ops` Cast branch). Abort here so we don't add
+        # leaves for a tree that pass 2 will reject.
+        if getattr(node, "dtype", None) != pl.Float32:
+            raise _Aborted
+        _gather_leaves_ir(nt, node.expr, schema, scope, descriptors, leaf_idx)
+        return
+
+    if cls == "Function":
+        fd = getattr(node, "function_data", ())
+        if not fd:
+            raise _Aborted
+        fn_name = str(fd[0]).lower()
+        fn_inputs = list(getattr(node, "input", []))
+        # log/pow handled the same as any other function for the leaf-gather
+        # phase: just recurse into all inputs. Special-case dispatching to
+        # the right OpId happens in pass 2.
+        if fn_name != "log" and fn_name != "pow" and fn_name not in _IR_FUNCTION_MAP:
+            raise _Aborted
+        for cid in fn_inputs:
+            _gather_leaves_ir(nt, cid, schema, scope, descriptors, leaf_idx)
+        return
+
+    if cls == "Agg":
+        agg_name = getattr(node, "name", None)
+        if _AGG_MAP.get(str(agg_name)) is None:
+            raise _Aborted
+        args = list(getattr(node, "arguments", []))
+        if not args:
+            raise _Aborted
+        _gather_leaves_ir(nt, args[0], schema, scope, descriptors, leaf_idx)
+        return
+
+    if cls == "Ternary":
+        _gather_leaves_ir(nt, node.predicate, schema, scope, descriptors, leaf_idx)
+        _gather_leaves_ir(nt, node.truthy, schema, scope, descriptors, leaf_idx)
+        _gather_leaves_ir(nt, node.falsy, schema, scope, descriptors, leaf_idx)
+        return
+
+    raise _Aborted
+
+
+def _visit_ir_ops(
+    nt: Any,
+    node_id: int,
+    schema: dict[str, Any],
+    scope: PyFusionScope,
+    leaf_idx: dict[int, int],
+) -> int:
+    """Pass 2: DFS-walk the IR and push ops. Leaves return their precomputed
+    input NodeIdx from `leaf_idx`."""
+    try:
+        node = nt.view_expression(node_id)
+    except Exception as e:
+        raise _Aborted from e
+    cls = type(node).__name__
+
+    if cls in ("Column", "Literal"):
+        return leaf_idx[node_id]
 
     if cls == "BinaryExpr":
         op = getattr(node, "op", None)
@@ -432,45 +510,40 @@ def _visit_ir(
         op_id = _BINOP_MAP.get(op_name)
         if op_id is None:
             raise _Aborted
-        left = _visit_ir(nt, node.left, schema, scope, columns)
-        right = _visit_ir(nt, node.right, schema, scope, columns)
+        left = _visit_ir_ops(nt, node.left, schema, scope, leaf_idx)
+        right = _visit_ir_ops(nt, node.right, schema, scope, leaf_idx)
         return scope.push_op(op_id, [left, right])
 
     if cls == "Cast":
         target = getattr(node, "dtype", None)
-        op_id = None
-        if target == pl.Float32:
-            op_id = "CastF32"
-        elif target == pl.Float64:
-            op_id = "CastF64"
-        elif target == pl.Int32:
-            op_id = "CastI32"
-        elif target == pl.Boolean:
-            op_id = "CastBool"
-        if op_id is None:
+        # MLX 0.22.0 has no F64 (Apple Silicon ignores it at runtime). Our
+        # executor only round-trips F32 buffers — accept CastF32 only and
+        # reject everything else. A Cast we can't honor poisons the whole
+        # expression, which is correct: we cannot faithfully emulate F64
+        # or Bool semantics through an F32-only kernel chain.
+        if target != pl.Float32:
             raise _Aborted
-        child = _visit_ir(nt, node.expr, schema, scope, columns)
-        return scope.push_op(op_id, [child])
+        child = _visit_ir_ops(nt, node.expr, schema, scope, leaf_idx)
+        return scope.push_op("CastF32", [child])
 
     if cls == "Function":
         fd = getattr(node, "function_data", ())
         if not fd:
             raise _Aborted
         fn_name = str(fd[0]).lower()
-        inputs = list(getattr(node, "input", []))
+        fn_inputs = list(getattr(node, "input", []))
         if fn_name == "log":
-            return _visit_ir_log(nt, inputs, schema, scope, columns)
+            return _visit_ir_log_ops(nt, fn_inputs, schema, scope, leaf_idx)
         if fn_name == "pow":
-            # `square` desugars to pow(x, 2); we emit Pow.
-            if len(inputs) != 2:
+            if len(fn_inputs) != 2:
                 raise _Aborted
-            left = _visit_ir(nt, inputs[0], schema, scope, columns)
-            right = _visit_ir(nt, inputs[1], schema, scope, columns)
+            left = _visit_ir_ops(nt, fn_inputs[0], schema, scope, leaf_idx)
+            right = _visit_ir_ops(nt, fn_inputs[1], schema, scope, leaf_idx)
             return scope.push_op("Pow", [left, right])
         op_id = _IR_FUNCTION_MAP.get(fn_name)
         if op_id is None:
             raise _Aborted
-        child_idxs = [_visit_ir(nt, cid, schema, scope, columns) for cid in inputs]
+        child_idxs = [_visit_ir_ops(nt, cid, schema, scope, leaf_idx) for cid in fn_inputs]
         return scope.push_op(op_id, child_idxs)
 
     if cls == "Agg":
@@ -481,29 +554,29 @@ def _visit_ir(
         args = list(getattr(node, "arguments", []))
         if not args:
             raise _Aborted
-        child = _visit_ir(nt, args[0], schema, scope, columns)
+        child = _visit_ir_ops(nt, args[0], schema, scope, leaf_idx)
         return scope.push_op(op_id, [child])
 
     if cls == "Ternary":
-        cond = _visit_ir(nt, node.predicate, schema, scope, columns)
-        then_v = _visit_ir(nt, node.truthy, schema, scope, columns)
-        else_v = _visit_ir(nt, node.falsy, schema, scope, columns)
+        cond = _visit_ir_ops(nt, node.predicate, schema, scope, leaf_idx)
+        then_v = _visit_ir_ops(nt, node.truthy, schema, scope, leaf_idx)
+        else_v = _visit_ir_ops(nt, node.falsy, schema, scope, leaf_idx)
         return scope.push_op("Where", [cond, then_v, else_v])
 
     raise _Aborted
 
 
-def _visit_ir_log(
+def _visit_ir_log_ops(
     nt: Any,
-    inputs: list,
+    fn_inputs: list,
     schema: dict[str, Any],
     scope: PyFusionScope,
-    columns: list[str] | None = None,
+    leaf_idx: dict[int, int],
 ) -> int:
     """log() is 2-arg (x, base) in the IR too; map base to Log/Log2/Log10."""
-    if len(inputs) != 2:
+    if len(fn_inputs) != 2:
         raise _Aborted
-    base_node = nt.view_expression(inputs[1])
+    base_node = nt.view_expression(fn_inputs[1])
     if type(base_node).__name__ != "Literal":
         raise _Aborted
     base_val = getattr(base_node, "value", None)
@@ -517,5 +590,5 @@ def _visit_ir_log(
         op_id = "Log10"
     else:
         raise _Aborted
-    child = _visit_ir(nt, inputs[0], schema, scope, columns)
+    child = _visit_ir_ops(nt, fn_inputs[0], schema, scope, leaf_idx)
     return scope.push_op(op_id, [child])

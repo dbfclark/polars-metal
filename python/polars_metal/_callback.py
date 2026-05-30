@@ -61,7 +61,15 @@ def execute_with_metal(nt: Any, duration_since_start: int | None, *, config: Met
         if config.debug:
             log.debug("polars_metal: router fallback: %s", lifting)
         return
-    if not any(v == "gpu_lift" for v in lifting.values()):
+
+    # M4 Phase 5: the Rust router doesn't yet know about FusedExprGraph
+    # bindings; it leaves HStacks on CPU by default. If the walker has
+    # attached a fused scope to an HStack binding, we override the router
+    # and install the UDF (the Python `_dispatch_hstack_fused` path
+    # intercepts before any Rust expression eval).
+    has_fused_binding = _plan_has_fused_binding(plan)
+
+    if not has_fused_binding and not any(v == "gpu_lift" for v in lifting.values()):
         if config.debug:
             log.debug("polars_metal: router routes entire query to CPU")
         return
@@ -83,6 +91,19 @@ def execute_with_metal(nt: Any, duration_since_start: int | None, *, config: Met
             plan["kind"],
             lifting,
         )
+
+
+def _plan_has_fused_binding(plan: dict) -> bool:
+    """Recurse into the plan tree looking for any HStack binding that the M4
+    fusion analyzer accepted (carries a `_fused_scope` side-channel)."""
+    if plan.get("kind") == "HStack":
+        for binding in plan.get("exprs", []):
+            if "_fused_scope" in binding:
+                return True
+    inner = plan.get("input")
+    if isinstance(inner, dict):
+        return _plan_has_fused_binding(inner)
+    return False
 
 
 def _strip_side_channels(plan: dict) -> dict:

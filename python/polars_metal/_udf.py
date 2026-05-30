@@ -129,24 +129,34 @@ def _dispatch_hstack_fused(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
     """Execute an HStack whose every binding carries a `_fused_scope`
     side-channel. Recurses on the upstream input, then runs each binding
     through `execute_fused_expr` and stitches the results onto the frame.
+
+    For each binding, the analyzer returned a `_fused_columns` list of
+    descriptors: ``("col", name)`` for real columns or ``("lit", value)``
+    for literal scalars. We construct one byte buffer per descriptor in
+    matching order: F32-cast NumPy bytes for columns; broadcast
+    ``np.full(n_rows, value, F32)`` bytes for literals.
     """
+    import numpy as np
+
     upstream = _dispatch(df_pydf, wire_plan["input"])
+    n_rows = upstream.height
     new_columns: list[pl.Series] = []
     for binding in wire_plan["exprs"]:
         scope = binding["_fused_scope"]
-        input_columns: list[str] = binding["_fused_columns"]
+        descriptors: list[tuple[str, str | float]] = binding["_fused_columns"]
         name = binding["name"]
-        # Collect the F32 byte buffer for each input column. The walker only
-        # accepts the analyzer when input dtypes pass `_dtype_to_input_str`,
-        # so each column is F32 / F64 / I32 / Bool by construction; for the
-        # MVP we widen everything to F32 via to_numpy(dtype=np.float32).
-        import numpy as np
 
         input_buffers: list[bytes] = []
-        for col_name in input_columns:
-            series = upstream.get_column(col_name)
-            arr = series.to_numpy().astype(np.float32, copy=False)
-            input_buffers.append(arr.tobytes())
+        for kind, payload in descriptors:
+            if kind == "col":
+                series = upstream.get_column(payload)
+                arr = series.to_numpy().astype(np.float32, copy=False)
+                input_buffers.append(arr.tobytes())
+            elif kind == "lit":
+                lit_arr = np.full(n_rows, payload, dtype=np.float32)
+                input_buffers.append(lit_arr.tobytes())
+            else:
+                raise RuntimeError(f"polars_metal: unknown input descriptor {kind!r}")
 
         out_bytes = _native.execute_fused_expr(
             scope=scope,
