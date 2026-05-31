@@ -43,14 +43,18 @@ _UNARY_OPS: list[
     ("neg", lambda e: -e, np.negative, lambda _x: True),
     ("sin", lambda e: e.sin(), np.sin, lambda _x: True),
     ("cos", lambda e: e.cos(), np.cos, lambda _x: True),
-    ("tan", lambda e: e.tan(), np.tan, lambda x: abs(math.cos(x)) > 1e-2),
+    # tan(x) restricted to |tan(x)| <= 5: bigger values feed downstream sin/cos
+    # with large arguments, where libm vs MLX modular-reduction differs in F32.
+    ("tan", lambda e: e.tan(), np.tan, lambda x: abs(math.cos(x)) > 0.2),
     ("sinh", lambda e: e.sinh(), np.sinh, lambda x: abs(x) < 5.0),
     ("cosh", lambda e: e.cosh(), np.cosh, lambda x: abs(x) < 5.0),
     ("tanh", lambda e: e.tanh(), np.tanh, lambda _x: True),
     ("arcsin", lambda e: e.arcsin(), np.arcsin, lambda x: -0.99 <= x <= 0.99),
     ("arccos", lambda e: e.arccos(), np.arccos, lambda x: -0.99 <= x <= 0.99),
     ("arctan", lambda e: e.arctan(), np.arctan, lambda _x: True),
-    ("exp", lambda e: e.exp(), np.exp, lambda x: x < 10.0),
+    # exp restricted so feeding into cos/sin keeps arguments small enough
+    # that F32 modular reduction agrees between libm and MLX.
+    ("exp", lambda e: e.exp(), np.exp, lambda x: x < 3.0),
     ("log", lambda e: e.log(), np.log, lambda x: x > 1e-3),
     ("log2", lambda e: e.log(2.0), np.log2, lambda x: x > 1e-3),
     ("log10", lambda e: e.log10(), np.log10, lambda x: x > 1e-3),

@@ -141,9 +141,10 @@ def _dispatch_hstack_fused(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
 
     For each binding, the analyzer returned a `_fused_columns` list of
     descriptors: ``("col", name)`` for real columns or ``("lit", value)``
-    for literal scalars. We construct one byte buffer per descriptor in
-    matching order: F32-cast NumPy bytes for columns; broadcast
-    ``np.full(n_rows, value, F32)`` bytes for literals.
+    for literal scalars. Column inputs are passed as F32-cast NumPy bytes
+    (n_rows-wide). Literal inputs are passed as a single F32 (4 bytes);
+    the executor builds a shape=[1] MLX array and MLX broadcasts in any
+    elementwise op — no need to materialize n_rows*4 bytes per literal.
     """
     import numpy as np
 
@@ -162,8 +163,10 @@ def _dispatch_hstack_fused(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
                 arr = series.to_numpy().astype(np.float32, copy=False)
                 input_buffers.append(arr.tobytes())
             elif kind == "lit":
-                lit_arr = np.full(n_rows, payload, dtype=np.float32)
-                input_buffers.append(lit_arr.tobytes())
+                # Single scalar — executor builds shape=[1] MLX array, which
+                # broadcasts in elementwise ops. Saves an n_rows*4-byte
+                # allocation + tobytes + MetalBuffer copy per literal.
+                input_buffers.append(np.float32(payload).tobytes())
             else:
                 raise RuntimeError(f"polars_metal: unknown input descriptor {kind!r}")
 
@@ -172,6 +175,12 @@ def _dispatch_hstack_fused(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
             input_buffers=input_buffers,
         )
         out_arr = np.frombuffer(out_bytes, dtype=np.float32).copy()
+        # Literal-only expressions produce a length-1 output (scalar
+        # broadcast never widened by an n_rows-shaped column). Polars
+        # requires the new column's length to match the frame height, so
+        # broadcast it ourselves before stitching.
+        if out_arr.size == 1 and n_rows != 1:
+            out_arr = np.broadcast_to(out_arr, n_rows).copy()
         new_columns.append(pl.Series(name, out_arr))
 
     return upstream.with_columns(new_columns)
