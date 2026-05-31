@@ -2541,9 +2541,7 @@ pub fn execute_fused_expr<'py>(
             "polars_metal: fused subgraph produced no outputs",
         )
     })?;
-    let out_f32 = out_data.to_f32_vec().map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: output readback: {e}"))
-    })?;
+    let out_f32 = out_data.into_f32_vec();
     // SAFETY: out_f32 is a Vec<f32>; bytes view is valid for the duration of
     // the slice borrow (PyBytes::new_bound copies the bytes into a new
     // Python object).

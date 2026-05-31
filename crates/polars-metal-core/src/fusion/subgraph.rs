@@ -69,6 +69,13 @@ impl ColumnBuffer {
         Ok(self.data.clone())
     }
 
+    /// Consume self and return the underlying `Vec<f32>`. Use this from the
+    /// PyO3 dispatch path where the ColumnBuffer is dropped right after
+    /// readback — saves a 40MB+ clone on each call.
+    pub fn into_f32_vec(self) -> Vec<f32> {
+        self.data
+    }
+
     pub fn as_handle(&self) -> Result<MlxArrayHandle, BuildError> {
         mlx_array_from_f32_slice(&self.data).map_err(|e| BuildError::MlxError(format!("{e:?}")))
     }
