@@ -392,7 +392,14 @@ def analyze_ir_with_columns(
         scope = PyFusionScope()
         descriptors: list[tuple[str, str | float]] = []
         leaf_idx: dict[int, int] = {}
-        _gather_leaves_ir(nt, node_id, schema, scope, descriptors, leaf_idx)
+        # Dedup tables — semantically equal leaves share a scope input slot.
+        # Without this, a repeated literal like `d2r` in haversine (used 3x)
+        # would produce three separate F32 inputs, each materialized as an
+        # n_rows-wide broadcast buffer. Same column referenced N times
+        # would similarly stage N copies through the FFI boundary.
+        col_dedup: dict[str, int] = {}
+        lit_dedup: dict[float, int] = {}
+        _gather_leaves_ir(nt, node_id, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup)
         idx = _visit_ir_ops(nt, node_id, schema, scope, leaf_idx)
         scope.mark_output(idx)
         return scope, descriptors
@@ -407,10 +414,20 @@ def _gather_leaves_ir(
     scope: PyFusionScope,
     descriptors: list[tuple[str, str | float]],
     leaf_idx: dict[int, int],
+    col_dedup: dict[str, int],
+    lit_dedup: dict[float, int],
 ) -> None:
     """Pass 1: DFS-walk the IR tree and `add_input` every Column/Literal,
-    recording arena-id -> input-NodeIdx in `leaf_idx`. Aborts on the same
-    unsupported-node set as `_visit_ir_ops` so failures surface here too."""
+    recording arena-id -> input-NodeIdx in `leaf_idx`.
+
+    Dedups by value: repeat references to the same column name or the same
+    literal value share a single scope input slot. This is critical for
+    perf — a literal like `d2r` appearing 3x in haversine would otherwise
+    stage three independent F32 broadcast buffers (3 * n_rows * 4 bytes)
+    through the FFI for each call. `leaf_idx[node_id]` still maps every
+    arena id to its (possibly shared) input idx so pass 2 can resolve.
+
+    Aborts on the same unsupported-node set as `_visit_ir_ops`."""
     try:
         node = nt.view_expression(node_id)
     except Exception as e:
@@ -424,8 +441,14 @@ def _gather_leaves_ir(
         dtype = schema.get(str(name))
         if dtype is None:
             raise _Aborted
-        idx = scope.add_input(str(name), _dtype_to_input_str(dtype))
-        descriptors.append(("col", str(name)))
+        name_s = str(name)
+        existing = col_dedup.get(name_s)
+        if existing is None:
+            idx = scope.add_input(name_s, _dtype_to_input_str(dtype))
+            descriptors.append(("col", name_s))
+            col_dedup[name_s] = idx
+        else:
+            idx = existing
         leaf_idx[node_id] = idx
         return
 
@@ -433,14 +456,22 @@ def _gather_leaves_ir(
         val = getattr(node, "value", None)
         if val is None:
             raise _Aborted
-        idx = scope.add_input(f"__lit_{val}", "F32")
-        descriptors.append(("lit", float(val)))
+        val_f = float(val)
+        existing = lit_dedup.get(val_f)
+        if existing is None:
+            idx = scope.add_input(f"__lit_{val_f}", "F32")
+            descriptors.append(("lit", val_f))
+            lit_dedup[val_f] = idx
+        else:
+            idx = existing
         leaf_idx[node_id] = idx
         return
 
     if cls == "BinaryExpr":
-        _gather_leaves_ir(nt, node.left, schema, scope, descriptors, leaf_idx)
-        _gather_leaves_ir(nt, node.right, schema, scope, descriptors, leaf_idx)
+        _gather_leaves_ir(nt, node.left, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup)
+        _gather_leaves_ir(
+            nt, node.right, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup
+        )
         return
 
     if cls == "Cast":
@@ -449,7 +480,7 @@ def _gather_leaves_ir(
         # leaves for a tree that pass 2 will reject.
         if getattr(node, "dtype", None) != pl.Float32:
             raise _Aborted
-        _gather_leaves_ir(nt, node.expr, schema, scope, descriptors, leaf_idx)
+        _gather_leaves_ir(nt, node.expr, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup)
         return
 
     if cls == "Function":
@@ -458,13 +489,10 @@ def _gather_leaves_ir(
             raise _Aborted
         fn_name = str(fd[0]).lower()
         fn_inputs = list(getattr(node, "input", []))
-        # log/pow handled the same as any other function for the leaf-gather
-        # phase: just recurse into all inputs. Special-case dispatching to
-        # the right OpId happens in pass 2.
         if fn_name != "log" and fn_name != "pow" and fn_name not in _IR_FUNCTION_MAP:
             raise _Aborted
         for cid in fn_inputs:
-            _gather_leaves_ir(nt, cid, schema, scope, descriptors, leaf_idx)
+            _gather_leaves_ir(nt, cid, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup)
         return
 
     if cls == "Agg":
@@ -474,13 +502,19 @@ def _gather_leaves_ir(
         args = list(getattr(node, "arguments", []))
         if not args:
             raise _Aborted
-        _gather_leaves_ir(nt, args[0], schema, scope, descriptors, leaf_idx)
+        _gather_leaves_ir(nt, args[0], schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup)
         return
 
     if cls == "Ternary":
-        _gather_leaves_ir(nt, node.predicate, schema, scope, descriptors, leaf_idx)
-        _gather_leaves_ir(nt, node.truthy, schema, scope, descriptors, leaf_idx)
-        _gather_leaves_ir(nt, node.falsy, schema, scope, descriptors, leaf_idx)
+        _gather_leaves_ir(
+            nt, node.predicate, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup
+        )
+        _gather_leaves_ir(
+            nt, node.truthy, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup
+        )
+        _gather_leaves_ir(
+            nt, node.falsy, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup
+        )
         return
 
     raise _Aborted
