@@ -87,6 +87,9 @@ from polars_metal._fusion_analyzer import (
     analyze_ir_with_columns,
     null_mode_ir,
 )
+from polars_metal._fusion_analyzer import (
+    build_sort_scope as _build_sort_scope,
+)
 
 _fusion_log = logging.getLogger("polars_metal.fusion")
 
@@ -610,21 +613,28 @@ def _fused_inputs_null_free(inner_plan: dict, cols: set[str]) -> bool:
 
 
 def _walk_sort(nt: Any, node: Any) -> WalkResult:
-    """Lower a Sort node iff every `by_column` is a bare Column reference
-    and no slice is set. The Sort runs CPU via Polars in the UDF;
-    lifting it lets the walker include this node in the lifted subtree
-    so the inner GroupBy/Filter can route to Metal.
+    """Lower a Sort node. Two shapes are handled:
+
+    - **CPU conformance path** (M3): every ``by_column`` is a bare Column and
+      no slice is set — the Sort runs CPU via Polars in the UDF, so lifting it
+      lets the inner GroupBy/Filter route to Metal (TPC-H Sort-over-GroupBy).
+    - **Fused single-column path** (M4 Task 27): a single F32 by-column over a
+      single-column input — the sort routes to one MLX ``Sort`` op (the
+      dispatch reverses for descending and slices for top_k). ``df.top_k`` /
+      ``bottom_k`` lower to a Sort with ``slice=(0, k)``, handled here too.
+
+    ``sort_options`` is ``(maintain_order, nulls_last, descending)`` (each of
+    the latter a per-key list).
     """
     by_column = getattr(node, "by_column", None)
     if by_column is None:
         return FallBack(reason="Sort node missing .by_column")
-    if getattr(node, "slice", None) is not None:
-        return FallBack(reason="Sort with slice not supported")
+    sort_slice = getattr(node, "slice", None)
     sort_options = getattr(node, "sort_options", None)
     if sort_options is None:
         return FallBack(reason="Sort missing .sort_options")
     try:
-        _multithreaded, descending, nulls_last = sort_options
+        _maintain_order, nulls_last, descending = sort_options
     except (TypeError, ValueError):
         return FallBack(reason="Sort .sort_options has unexpected shape")
 
@@ -649,20 +659,95 @@ def _walk_sort(nt: Any, node: Any) -> WalkResult:
     inputs = nt.get_inputs()
     if len(inputs) != 1:
         return FallBack(reason=f"Sort expected 1 input, got {len(inputs)}")
+
+    # Resolve the input schema (the Sort's child) to test fused eligibility.
+    parent_id = nt.get_node()
+    nt.set_node(inputs[0])
+    try:
+        in_schema = dict(nt.get_schema())
+    finally:
+        nt.set_node(parent_id)
+
+    # Fused single-column F32 sort: one MLX Sort op. Eligible iff there's a
+    # single F32 by-column and the input frame has only that column (so the
+    # sorted column IS the whole result — no other columns to gather, which
+    # would be a bandwidth-bound permutation we deliberately leave to CPU).
+    fused_sort: dict | None = None
+    if (
+        len(by_columns) == 1
+        and len(in_schema) == 1
+        and by_columns[0] in in_schema
+        and _map_dtype(in_schema[by_columns[0]]) == "F32"
+    ):
+        col = by_columns[0]
+        fused_sort = {
+            "scope": _build_sort_scope(col),
+            "column": col,
+            "descending": bool(descending[0]) if descending else False,
+            "nulls_last": bool(nulls_last[0]) if nulls_last else False,
+            "slice": (int(sort_slice[0]), int(sort_slice[1])) if sort_slice is not None else None,
+        }
+    elif sort_slice is not None:
+        # The CPU conformance path doesn't apply a slice (top_k/head shapes);
+        # only the fused path does. Fall back so Polars produces them.
+        return FallBack(reason="Sort with slice not supported on the CPU path")
+
     nt.set_node(inputs[0])
     inner = _walk_at_current(nt)
+    if isinstance(inner, FallBack) and fused_sort is not None and fused_sort["slice"] is not None:
+        # top_k / bottom_k lower to Sort(slice=(0,k)) over a *dynamic-predicate*
+        # Filter that drops nulls — the predicate can't be viewed as a normal
+        # expression (NodeTraverser raises), so the inner walk above fell back.
+        # Bypass that one filter: source from its input and drop nulls in the
+        # dispatch (matching top_k's null semantics). A real user filter has a
+        # viewable predicate, so this never skips genuine row selection.
+        bypassed = _bypass_dynamic_null_filter(nt, inputs[0])
+        if bypassed is not None:
+            inner = bypassed
+            fused_sort["drop_nulls"] = True
     if isinstance(inner, FallBack):
         return inner
 
-    return Handled(
-        plan={
-            "kind": "Sort",
-            "input": inner.plan,
-            "by_columns": by_columns,
-            "descending": list(descending),
-            "nulls_last": list(nulls_last),
-        }
-    )
+    if fused_sort is not None:
+        fused_sort.setdefault("drop_nulls", False)
+
+    plan = {
+        "kind": "Sort",
+        "input": inner.plan,
+        "by_columns": by_columns,
+        "descending": list(descending),
+        "nulls_last": list(nulls_last),
+    }
+    if fused_sort is not None:
+        plan["_fused_sort"] = fused_sort
+    return Handled(plan=plan)
+
+
+def _bypass_dynamic_null_filter(nt: Any, filter_node_id: int) -> Handled | None:
+    """If ``filter_node_id`` is a Filter whose predicate is a *dynamic* one the
+    NodeTraverser can't view (top_k/bottom_k's internal null-drop), walk and
+    return its single input instead. Returns ``None`` if the node isn't such a
+    filter or its input doesn't lift — the caller then keeps its FallBack."""
+    nt.set_node(filter_node_id)
+    node = nt.view_current_node()
+    if type(node).__name__ != "Filter":
+        return None
+    pred = getattr(node, "predicate", None)
+    pred_node = getattr(pred, "node", None)
+    if pred_node is None:
+        return None
+    try:
+        nt.view_expression(pred_node)
+    except Exception:
+        # Unviewable (dynamic) predicate — the top_k/bottom_k null-drop. Bypass.
+        finputs = nt.get_inputs()
+        if len(finputs) != 1:
+            return None
+        nt.set_node(finputs[0])
+        inner = _walk_at_current(nt)
+        return inner if isinstance(inner, Handled) else None
+    # Viewable predicate => a genuine user filter; do not bypass it.
+    return None
 
 
 def _walk_filter(nt: Any, node: Any) -> WalkResult:

@@ -103,6 +103,9 @@ def _plan_has_fused_binding(plan: dict) -> bool:
     # M4 Phase 7: empty-key GroupBy carrying fused reduction bindings.
     if plan.get("kind") == "GroupBy" and plan.get("_fused_aggs"):
         return True
+    # M4 Phase 7 (Task 27): single-column F32 Sort routed to MLX.
+    if plan.get("kind") == "Sort" and plan.get("_fused_sort"):
+        return True
     inner = plan.get("input")
     if isinstance(inner, dict):
         return _plan_has_fused_binding(inner)

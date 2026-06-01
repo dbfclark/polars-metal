@@ -408,6 +408,11 @@ def _build_sort(plan: dict) -> Any:
     else:
         inner_udf = build_udf(inner_plan)
 
+    # M4 Phase 7 (Task 27): single-column F32 sort routed to MLX.
+    fused_sort = plan.get("_fused_sort")
+    if fused_sort is not None:
+        return _build_sort_fused(inner_udf, fused_sort, by_columns)
+
     def udf(
         with_columns: list[str] | None,
         predicate: Any,
@@ -422,6 +427,75 @@ def _build_sort(plan: dict) -> Any:
                 descending=descending if any(descending) else False,
                 nulls_last=nulls_last if any(nulls_last) else False,
             )
+        if n_rows is not None:
+            df = df.slice(0, n_rows)
+        if should_time:
+            return df, []
+        return df
+
+    return udf
+
+
+def _build_sort_fused(inner_udf: Any, fused_sort: dict, by_columns: list[str]) -> Any:
+    """UDF for a single-column F32 Sort routed to MLX (Task 27).
+
+    Runs the inner pipeline, sorts the one F32 column via the MLX ``Sort`` op
+    (ascending), then reverses for descending and slices for top_k/bottom_k on
+    the host. Falls back to a Polars CPU sort when the column has nulls (MLX
+    sorts NaN-filled nulls; Polars' null placement differs) or is empty.
+    """
+    import numpy as np
+
+    scope = fused_sort["scope"]
+    col: str = fused_sort["column"]
+    descending: bool = fused_sort["descending"]
+    nulls_last: bool = fused_sort["nulls_last"]
+    sort_slice = fused_sort["slice"]
+    drop_nulls: bool = fused_sort.get("drop_nulls", False)
+
+    def udf(
+        with_columns: list[str] | None,
+        predicate: Any,
+        n_rows: int | None,
+        should_time: bool,
+    ) -> Any:
+        inner_result = inner_udf(None, None, None, False)
+        df = inner_result if isinstance(inner_result, pl.DataFrame) else inner_result[0]
+        series = df.get_column(col)
+        if drop_nulls and series.null_count() > 0:
+            # top_k / bottom_k drop nulls before ranking (we bypassed the
+            # dynamic null-drop Filter in the walker). `null_count` is O(1)
+            # (Arrow-tracked), so the common no-null case skips the O(n) copy.
+            df = df.drop_nulls(col)
+            series = df.get_column(col)
+
+        if series.len() == 0 or series.null_count() > 0 or str(series.dtype) != "Float32":
+            # CPU fallback preserves Polars null/empty semantics exactly.
+            df = df.sort(by_columns, descending=descending, nulls_last=nulls_last)
+            if sort_slice is not None:
+                df = df.slice(sort_slice[0], sort_slice[1])
+        else:
+            arr = np.ascontiguousarray(series.to_numpy(), dtype=np.float32)
+            out_arr = np.empty(arr.size, dtype=np.float32)
+            _native.execute_fused_expr(
+                scope=scope,
+                inputs=[(int(arr.__array_interface__["data"][0]), int(arr.size))],
+                out=(int(out_arr.__array_interface__["data"][0]), int(out_arr.size)),
+            )
+            # `out_arr` is ascending. Apply descending + slice at the array
+            # level so a top_k (descending + slice=(0,k)) reverses only k
+            # elements, not the whole 10M-row sort. MLX has no descending sort
+            # binding, so a full descending sort still reverses all of out_arr.
+            m = out_arr.size
+            off, length = sort_slice if sort_slice is not None else (0, m)
+            if descending:
+                hi = m - off
+                lo = max(0, hi - length)
+                out_arr = np.ascontiguousarray(out_arr[lo:hi][::-1])
+            else:
+                out_arr = out_arr[off : off + length]
+            df = pl.DataFrame([pl.Series(col, out_arr)])
+
         if n_rows is not None:
             df = df.slice(0, n_rows)
         if should_time:

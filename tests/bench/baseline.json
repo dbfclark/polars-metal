@@ -172,24 +172,26 @@
       }
     },
     "phase8_sort_f32_10m": {
-      "cpu_ms": null,
-      "metal_ms": null,
-      "ratio_metal_over_cpu": null,
+      "cpu_ms": 30.2,
+      "metal_ms": 7.1,
+      "ratio_metal_over_cpu": 0.235,
       "n_rows": 10000000,
       "hardware": "M2 Ultra",
-      "_notes": "M4 placeholder: Sort F32 column via MLX radix. Target wall-clock < 10.0 ms; ratio gate set at landing.",
-      "_pending": true,
-      "_target_ms": 10.0
+      "_notes": "Single-column F32 df.sort via MLX Sort (Task 27). 4.3x vs Polars CPU at 10M.",
+      "_gate": {
+        "ratio_lt": 0.45
+      }
     },
     "phase8_topk_f32_10m": {
-      "cpu_ms": null,
-      "metal_ms": null,
-      "ratio_metal_over_cpu": null,
+      "cpu_ms": 93.1,
+      "metal_ms": 7.2,
+      "ratio_metal_over_cpu": 0.077,
       "n_rows": 10000000,
       "hardware": "M2 Ultra",
-      "_notes": "M4 placeholder: Top-K=100 on F32 column via MLX argpartition. Target wall-clock < 10.0 ms; ratio gate set at landing.",
-      "_pending": true,
-      "_target_ms": 10.0
+      "_notes": "df.top_k(100, by=F32) via MLX Sort + host slice (Task 27). 13x vs Polars CPU at 10M.",
+      "_gate": {
+        "ratio_lt": 0.2
+      }
     },
     "phase8_cumsum_f32_10m": {
       "cpu_ms": 38.0,

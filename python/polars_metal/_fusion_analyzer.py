@@ -496,6 +496,18 @@ def analyze_ir_reduction(
         return None
 
 
+def build_sort_scope(col_name: str) -> PyFusionScope:
+    """Build a one-op fused scope that sorts an F32 column ascending via MLX.
+
+    The dispatch reverses (for descending) and slices (for top_k) on the host;
+    MLX `Sort` is the only GPU op. Used by the walker's Sort path (Task 27).
+    """
+    scope = PyFusionScope()
+    leaf = scope.add_input(col_name, "F32")
+    scope.mark_output(scope.push_op("Sort", [leaf]))
+    return scope
+
+
 def null_mode_ir(nt: Any, node_id: int, schema: dict[str, Any]) -> str | None:
     """Classify how nulls propagate through a fused HStack expression, so the
     walker can keep null-bearing inputs on the GPU instead of falling back.
