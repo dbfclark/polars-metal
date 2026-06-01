@@ -371,3 +371,34 @@ be productionized.
 
 *Owner:* M4 (revisit when Apple ships better atomics) or earlier if a
 fundamentally different algorithm avoids the memory-ordering trap.
+
+---
+
+## Correlation matrix has no engine hook (M4 Task 29) — RESOLVED: defer to Phase 10 (2026-06-01)
+
+**Question:** How do we expose the matmul-shaped correlation-matrix win
+(survey: 7.8×) through the engine, given the engine's only opt-in is
+`collect(engine=MetalEngine())`?
+
+**Findings:**
+- `df.corr()` is **eager** — returns a `DataFrame` with no `collect` and no
+  `engine=` parameter. Nothing to intercept the way we intercept `collect`.
+- `pl.corr(a, b)` is **invisible to the NodeTraverser**: `view_expression` on
+  a `corr` node raises `NotImplementedError: corr` (py-1.40.1). So even
+  `df.lazy().select(pl.corr(...)).collect(engine="metal")` can't be walked.
+- The corr **matrix** (standardize → X^T X) is a DataFrame→NxN-matrix op, not
+  expressible as a Polars expression at all.
+
+**Options weighed:** (1) monkey-patch eager `df.corr()` behind an explicit
+`enable_corr()`/context-manager; (2) new public `polars_metal.corr_matrix(df)`
+function; (3) defer, capture the matmul win via Phase 10; (4) upstream a
+Polars change exposing `corr` to the visitor.
+
+**Decision (dbfclark):** **(3) Defer Task 29.** #2 violates CLAUDE.md's
+"engine plugin is the only user-facing surface / no new public API"; #1 adds
+always-on/context magic to a core eager method (a real departure from the
+per-call `engine=` model); #4 depends on upstream. The matmul lever moves to
+**Phase 10** (`Array[F32, D].dot(lit)` → MLX matmul), a walkable expression
+that fits the plugin — so the matmul FFI/kernel work is not wasted. Revisit
+only if a headline `df.corr()` number is later required (then prefer #1 with
+explicit activation) or upstream makes `corr` walkable (#4).

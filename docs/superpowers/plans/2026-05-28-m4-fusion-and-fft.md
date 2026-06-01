@@ -3712,7 +3712,20 @@ def test_cumsum_perf_10m(benchmark):
 git commit -m "M4 Phase 7: cumsum engine bench - green at < 8ms"
 ```
 
-### Task 29: Correlation matrix engine bench
+### Task 29: Correlation matrix engine bench — **DEFERRED (2026-06-01)**
+
+> **Decision:** deferred indefinitely; the matmul win moves to **Phase 10**
+> (`Array[F32, D].dot(lit)` → MLX matmul), which is a walkable expression that
+> fits the engine plugin. Rationale: the corr matrix has no engine hook —
+> `df.corr()` is eager (no `collect(engine=)`), and `pl.corr(a, b)` isn't even
+> visible to the NodeTraverser (`view_expression` raises `NotImplementedError:
+> corr`). The matrix (X^T X) isn't expressible as a Polars expression at all.
+> The remaining ways in — monkey-patching the eager `df.corr()` or adding a
+> public `polars_metal.corr()` — conflict with CLAUDE.md's "engine plugin is
+> the only user-facing surface / no new public API." Deferring keeps that
+> discipline and wastes no work (the matmul FFI/kernel lands in Phase 10). The
+> note below is preserved as the original plan; do not start it without
+> revisiting this decision. See `docs/open-questions.md`.
 
 **Files:**
 - Create: `tests/bench/m4_engine/test_phase8_corr.py`
