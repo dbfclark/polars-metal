@@ -92,11 +92,11 @@ def test_std_and_var_together(monkeypatch):
     )
 
 
-def test_compute_chain_reduction_falls_back(monkeypatch):
-    # Compute-chain reductions ((x*2).std()) are NOT fused (a chain's null
-    # propagation can't be replayed for the null fallback) — they stay on the
-    # CPU/GroupBy path. Still correct, just not routed.
-    _check(monkeypatch, lambda: ((pl.col("x") * 2.0) + 1.0).std().alias("s"), expected_dispatches=0)
+def test_compute_chain_reduction_fuses(monkeypatch):
+    # Compute-chain reductions ((x*2+1).std()) DO fuse: the chain amortizes the
+    # dispatch floor, so any reduction over a (null-free) chain routes to MLX as
+    # one dispatch. (Null-bearing chains fall back — see test_reduction_chain_fused.)
+    _check(monkeypatch, lambda: ((pl.col("x") * 2.0) + 1.0).std().alias("s"), expected_dispatches=1)
 
 
 def test_column_with_nulls_falls_back_to_polars(monkeypatch):

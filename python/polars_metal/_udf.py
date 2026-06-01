@@ -571,24 +571,48 @@ def _build_select_reduction_fused(plan: dict) -> Any:
             descriptors: list[tuple[str, str | float]] = agg["_fused_columns"]
             name = agg["name"]
             kind = agg["_agg_kind"]
-            # Bare single Float32 column (enforced by `analyze_ir_reduction`).
-            col_name = descriptors[0][1]
-            series = upstream.get_column(col_name)
+            is_chain = agg.get("_is_chain", False)
 
-            # MLX over `to_numpy()` turns nulls into NaN (Polars skips nulls),
-            # and population std/var of <2 rows can't be Bessel-corrected. In
-            # those cases compute the reduction with Polars on the source column
-            # — exact (same null skipping, same n=0/1 semantics, same dtype).
-            if n < 2 or series.null_count() > 0:
-                value = getattr(series, kind)()
-                out_series.append(pl.Series(name, [value], dtype=series.dtype))
-                continue
+            if not is_chain:
+                # Bare single Float32 column (enforced by `analyze_ir_reduction`).
+                col_name = descriptors[0][1]
+                series = upstream.get_column(col_name)
+                # MLX over `to_numpy()` turns nulls into NaN (Polars skips
+                # nulls), and population std/var of <2 rows can't be Bessel-
+                # corrected. In those cases compute the reduction with Polars on
+                # the source column — exact (same null skipping, n=0/1, dtype).
+                if n < 2 or series.null_count() > 0:
+                    value = getattr(series, kind)()
+                    out_series.append(pl.Series(name, [value], dtype=series.dtype))
+                    continue
+                input_arrays = [np.ascontiguousarray(series.to_numpy(), dtype=np.float32)]
+            else:
+                # Chain reduction: input columns are null-free (the walker
+                # guarded). Degenerate-n semantics can't be replayed on a chain,
+                # so handle them directly: empty -> sum is 0.0, else null;
+                # std/var of <2 rows -> null (sample variance undefined).
+                if n == 0:
+                    val0 = 0.0 if kind == "sum" else None
+                    out_series.append(pl.Series(name, [val0], dtype=pl.Float32))
+                    continue
+                if kind in ("std", "var") and n < 2:
+                    out_series.append(pl.Series(name, [None], dtype=pl.Float32))
+                    continue
+                input_arrays = []
+                for d_kind, payload in descriptors:
+                    if d_kind == "col":
+                        col = upstream.get_column(payload)
+                        input_arrays.append(np.ascontiguousarray(col.to_numpy(), dtype=np.float32))
+                    elif d_kind == "lit":
+                        input_arrays.append(np.asarray([payload], dtype=np.float32))
+                    else:
+                        raise RuntimeError(f"polars_metal: unknown reduction descriptor {d_kind!r}")
 
-            arr = np.ascontiguousarray(series.to_numpy(), dtype=np.float32)
             out_arr = np.empty(1, dtype=np.float32)
+            inputs = [(int(a.__array_interface__["data"][0]), int(a.size)) for a in input_arrays]
             _native.execute_fused_expr(
                 scope=scope,
-                inputs=[(int(arr.__array_interface__["data"][0]), int(arr.size))],
+                inputs=inputs,
                 out=(int(out_arr.__array_interface__["data"][0]), int(out_arr.size)),
             )
             val = float(out_arr[0])

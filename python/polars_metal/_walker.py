@@ -336,7 +336,7 @@ def _walk_select_reduction(nt: Any, exprs: list[Any]) -> WalkResult:
     if fused_aggs is not None:
         nt.set_node(inputs[0])
         inner = _walk_at_current(nt)
-        if not isinstance(inner, FallBack):
+        if not isinstance(inner, FallBack) and _fused_reduction_nulls_ok(fused_aggs, inner.plan):
             return Handled(
                 plan={
                     "kind": "GroupBy",
@@ -350,8 +350,9 @@ def _walk_select_reduction(nt: Any, exprs: list[Any]) -> WalkResult:
                     "_fused_aggs": fused_aggs,
                 }
             )
-        # inner fell back — fall through to the GroupBy path, which will
-        # likely also fall back, but keep the single decision point below.
+        # inner fell back, or a chain reduction reads a possibly-null column
+        # (its null-skip can't be replayed) — fall through to the GroupBy/CPU
+        # path below, which preserves Polars semantics exactly.
 
     aggs: list[dict[str, str]] = []
     for agg_expr in exprs:
@@ -405,13 +406,14 @@ def _try_fused_select_reduction(
         result = analyze_ir_reduction(nt, node_id, in_schema)
         if result is None:
             return None
-        scope, columns, agg_kind = result
+        scope, columns, agg_kind, is_chain = result
         _fusion_log.info(
-            "FusedReduction candidate column=%r kind=%s n_inputs=%d n_ops=%d",
+            "FusedReduction candidate column=%r kind=%s n_inputs=%d n_ops=%d chain=%s",
             output_name,
             agg_kind,
             scope.n_inputs(),
             scope.n_ops(),
+            is_chain,
         )
         bindings.append(
             {
@@ -419,18 +421,33 @@ def _try_fused_select_reduction(
                 "_fused_scope": scope,
                 "_fused_columns": columns,
                 "_agg_kind": agg_kind,
+                "_is_chain": is_chain,
             }
         )
     if not bindings:
         return None
-    # Compute-intensity gate: only route the select to MLX if at least one
-    # reduction is worth the dispatch floor on its own. Otherwise (a select of
-    # only bandwidth-bound bare sum/min/max/mean) leave it to CPU, which is
-    # ~3x faster. `analyze_ir_reduction` is bare-column-only today, so a chain
-    # never reaches here yet; the follow-up increment adds chains as worthy.
-    if not any(b["_agg_kind"] in _BARE_GPU_WORTHY_REDUCTIONS for b in bindings):
+    # Compute-intensity gate: route to MLX only if at least one reduction clears
+    # the dispatch floor — a compute-bound bare op (std/var) or any reduction
+    # over a compute chain (the chain amortizes the floor). A select of only
+    # bandwidth-bound bare sum/min/max/mean stays on CPU (~3x faster there).
+    if not any(b["_agg_kind"] in _BARE_GPU_WORTHY_REDUCTIONS or b["_is_chain"] for b in bindings):
         return None
     return bindings
+
+
+def _fused_reduction_nulls_ok(fused_aggs: list[dict], inner_plan: dict) -> bool:
+    """True iff every chain reduction's input columns are confirmed null-free.
+
+    A bare reduction handles nulls in the dispatch (replaying the reduction on
+    the source column). A *chain* reduction can't — Polars propagates nulls
+    through the chain then the reduction skips them, and we can't replay that
+    from the wire plan — so a chain over a possibly-null column must fall back
+    to CPU. Reuses the Scan-leaf null check from the HStack path."""
+    chain_cols: set[str] = set()
+    for b in fused_aggs:
+        if b.get("_is_chain"):
+            chain_cols.update(name for kind, name in b["_fused_columns"] if kind == "col")
+    return not chain_cols or _fused_inputs_null_free(inner_plan, chain_cols)
 
 
 def _probe_fusion_analyzer(
