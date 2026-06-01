@@ -96,6 +96,93 @@ def test_reduction_with_null_input_falls_back(monkeypatch):
     assert_frame_equal(cpu_result, metal_result, check_exact=False, abs_tol=1e-4)
 
 
+def test_where_null_input_matches_cpu():
+    """`when/then/otherwise` over null-bearing inputs: the null mask is
+    data-dependent (`cond_null or (cond ? then_null : else_null)`), NOT the
+    union of all input nulls. Row 3 below (cond true, `then` valid, `else`
+    null) must stay non-null — a union rule would wrongly null it."""
+    df = pl.DataFrame(
+        {
+            "a": pl.Series([1.0, None, 3.0, 4.0, None], dtype=pl.Float32),
+            "b": pl.Series([None, 2.0, 30.0, None, 5.0], dtype=pl.Float32),
+        }
+    )
+    expr = pl.when(pl.col("a") > 2.0).then(pl.col("a").sqrt()).otherwise(pl.col("b"))
+    cpu_result = df.lazy().with_columns(y=expr).collect()
+    metal_result = df.lazy().with_columns(y=expr).collect(engine=polars_metal.MetalEngine())
+    assert_frame_equal(cpu_result, metal_result, check_exact=False, abs_tol=1e-4)
+
+
+def test_where_null_input_uses_mlx(monkeypatch):
+    """A null-bearing `where` stays on the GPU: one dispatch for the value
+    graph + one for the validity (null-mask) graph = 2 fused dispatches."""
+    df = pl.DataFrame(
+        {
+            "a": pl.Series([1.0, None, 3.0, 4.0, None], dtype=pl.Float32),
+            "b": pl.Series([None, 2.0, 30.0, None, 5.0], dtype=pl.Float32),
+        }
+    )
+    expr = pl.when(pl.col("a") > 2.0).then(pl.col("a").sqrt()).otherwise(pl.col("b"))
+    n_dispatches = _count_fused_dispatches(monkeypatch)
+    df.lazy().with_columns(y=expr).collect(engine=polars_metal.MetalEngine())
+    assert n_dispatches() == 2, f"expected value + validity dispatch (2), got {n_dispatches()}"
+
+
+def test_where_null_free_still_single_dispatch(monkeypatch):
+    """A null-free `where` builds no validity graph — just the value dispatch."""
+    df = pl.DataFrame(
+        {
+            "a": pl.Series([1.0, 2.0, 3.0, 4.0], dtype=pl.Float32),
+            "b": pl.Series([10.0, 20.0, 30.0, 40.0], dtype=pl.Float32),
+        }
+    )
+    expr = pl.when(pl.col("a") > 2.0).then(pl.col("a").sqrt()).otherwise(pl.col("b"))
+    n_dispatches = _count_fused_dispatches(monkeypatch)
+    cpu_result = df.lazy().with_columns(y=expr).collect()
+    metal_result = df.lazy().with_columns(y=expr).collect(engine=polars_metal.MetalEngine())
+    assert n_dispatches() == 1, f"expected a single value dispatch, got {n_dispatches()}"
+    assert_frame_equal(cpu_result, metal_result, check_exact=False, abs_tol=1e-4)
+
+
+def test_nested_where_null_input_matches_cpu():
+    """Nested conditional cascade with nulls — validity composes recursively."""
+    df = pl.DataFrame(
+        {
+            "x": pl.Series([0.5, None, 2.5, 5.0, None, 9.0], dtype=pl.Float32),
+            "lo": pl.Series([None, 1.0, 2.0, 3.0, 4.0, 5.0], dtype=pl.Float32),
+            "hi": pl.Series([10.0, 20.0, None, 40.0, 50.0, None], dtype=pl.Float32),
+        }
+    )
+    expr = (
+        pl.when(pl.col("x") > 4.0)
+        .then(pl.col("hi").sqrt())
+        .when(pl.col("x") > 1.0)
+        .then(pl.col("x").sin())
+        .otherwise(pl.col("lo"))
+    )
+    cpu_result = df.lazy().with_columns(y=expr).collect()
+    metal_result = df.lazy().with_columns(y=expr).collect(engine=polars_metal.MetalEngine())
+    assert_frame_equal(cpu_result, metal_result, check_exact=False, abs_tol=1e-4)
+
+
+def test_where_ne_cond_null_input_falls_back(monkeypatch):
+    """A `when(a != k)` cond is NaN-unsafe (`NaN != k` is true, but Polars
+    treats a null cond as false → else). With nulls present the value graph
+    would select the wrong branch, so the subtree must fall back to CPU."""
+    df = pl.DataFrame(
+        {
+            "a": pl.Series([1.0, None, 3.0, 2.0], dtype=pl.Float32),
+            "b": pl.Series([10.0, 20.0, None, 40.0], dtype=pl.Float32),
+        }
+    )
+    expr = pl.when(pl.col("a") != 2.0).then(pl.col("a").sqrt()).otherwise(pl.col("b"))
+    n_dispatches = _count_fused_dispatches(monkeypatch)
+    cpu_result = df.lazy().with_columns(y=expr).collect()
+    metal_result = df.lazy().with_columns(y=expr).collect(engine=polars_metal.MetalEngine())
+    assert n_dispatches() == 0, f"expected CPU fallback (0 dispatches), got {n_dispatches()}"
+    assert_frame_equal(cpu_result, metal_result, check_exact=False, abs_tol=1e-4)
+
+
 def test_fused_hstack_null_free_still_uses_mlx(monkeypatch):
     """Regression guard: a null-free F32 column still routes through the fused
     MLX path with no per-row null-mask overhead."""

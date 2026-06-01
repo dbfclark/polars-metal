@@ -155,7 +155,6 @@ def _dispatch_hstack_fused(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
         scope = binding["_fused_scope"]
         descriptors: list[tuple[str, str | float]] = binding["_fused_columns"]
         name = binding["name"]
-        null_mode = binding.get("_fused_null_mode")
 
         input_arrays: list[np.ndarray] = []
         for kind, payload in descriptors:
@@ -199,21 +198,72 @@ def _dispatch_hstack_fused(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
 
         # Null handling (walker stamped `_fused_null_mode` only when an input
         # column may have nulls). MLX computed over NaN-filled nulls; Polars
-        # propagates nulls instead. For an "elementwise" chain the output is
-        # null iff any input column is null at that row, so OR the input null
-        # masks and mark those positions null (the NaN data underneath is
-        # ignored by Arrow). The transcendental compute already ran on the GPU.
-        if null_mode == "elementwise":
-            col_names = [payload for kind, payload in descriptors if kind == "col"]
-            null_mask = np.zeros(n_rows, dtype=bool)
-            for col_name in col_names:
-                null_mask |= upstream.get_column(col_name).is_null().to_numpy()
-            if null_mask.any():
-                new_columns.append(pl.Series(name, pa.array(out_arr, mask=null_mask)))
-                continue
-        new_columns.append(pl.Series(name, out_arr))
+        # propagates nulls instead. We compute the output null mask and mark
+        # those rows null — the NaN data underneath is ignored by Arrow, and
+        # the value compute already ran on the GPU.
+        null_mask = _fused_null_mask(binding, descriptors, upstream, out_arr, n_rows)
+        if null_mask is not None and null_mask.any():
+            new_columns.append(pl.Series(name, pa.array(out_arr, mask=null_mask)))
+        else:
+            new_columns.append(pl.Series(name, out_arr))
 
     return upstream.with_columns(new_columns)
+
+
+def _fused_null_mask(
+    binding: dict,
+    descriptors: list[tuple[str, str | float]],
+    upstream: pl.DataFrame,
+    out_arr: Any,
+    n_rows: int,
+) -> Any:
+    """Return the boolean output null mask (True = null) for a fused binding,
+    or ``None`` when the walker stamped no `_fused_null_mode` (inputs confirmed
+    null-free → fast path).
+
+    - ``elementwise``: output null iff any input column is null at that row →
+      OR the input columns' null masks.
+    - ``where``: data-dependent — evaluate the walker's validity subgraph (one
+      extra MLX dispatch) producing an F32 1.0/0.0 mask; null where < 0.5.
+    """
+    import numpy as np
+
+    null_mode = binding.get("_fused_null_mode")
+    if null_mode is None:
+        return None
+
+    if null_mode == "elementwise":
+        null_mask = np.zeros(n_rows, dtype=bool)
+        for kind, payload in descriptors:
+            if kind == "col":
+                null_mask |= upstream.get_column(payload).is_null().to_numpy()
+        return null_mask
+
+    if null_mode == "where":
+        v_scope = binding["_fused_validity_scope"]
+        v_descriptors: list[tuple[str, str | float]] = binding["_fused_validity_columns"]
+        v_arrays: list[np.ndarray] = []
+        for kind, payload in v_descriptors:
+            if kind == "valid":
+                is_valid = ~upstream.get_column(payload).is_null().to_numpy()
+                v_arrays.append(np.ascontiguousarray(is_valid, dtype=np.float32))
+            elif kind == "col":
+                series = upstream.get_column(payload)
+                v_arrays.append(np.ascontiguousarray(series.to_numpy(), dtype=np.float32))
+            elif kind == "lit":
+                v_arrays.append(np.asarray([payload], dtype=np.float32))
+            else:
+                raise RuntimeError(f"polars_metal: unknown validity descriptor {kind!r}")
+        mask_out = np.empty(n_rows, dtype=np.float32)
+        v_inputs = [(int(a.__array_interface__["data"][0]), int(a.size)) for a in v_arrays]
+        _native.execute_fused_expr(
+            scope=v_scope,
+            inputs=v_inputs,
+            out=(int(mask_out.__array_interface__["data"][0]), int(mask_out.size)),
+        )
+        return mask_out < 0.5
+
+    raise RuntimeError(f"polars_metal: unknown fused null mode {null_mode!r}")
 
 
 def _filter_via_polars(df_pydf: Any, filter_plan: dict) -> pl.DataFrame:

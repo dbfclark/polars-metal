@@ -576,12 +576,264 @@ def _classify_null_ir(nt: Any, node_id: int, schema: dict[str, Any], state: dict
 
     if cls == "Ternary":
         state["where"] = True
-        _classify_null_ir(nt, node.predicate, schema, state)
+        # The fused Where reproduces Polars' "null cond -> else" only when the
+        # cond is a comparison whose NaN-collapse is `false` (Eq/Lt/Le/Gt/Ge).
+        # A top-level `Ne` (NaN != k -> true), bare bool column, or logical cond
+        # would select the wrong branch on a null row — refuse those.
+        if not _is_nan_safe_predicate(nt, node.predicate):
+            raise _Aborted
         _classify_null_ir(nt, node.truthy, schema, state)
         _classify_null_ir(nt, node.falsy, schema, state)
         return
 
     raise _Aborted
+
+
+# Comparison ops whose result is `false` when any operand is NaN — so an MLX
+# value graph collapses a null `when` cond to the else branch, matching Polars.
+# `Ne` is excluded: `NaN != k` is `true`, which would select the wrong branch.
+_NAN_FALSE_COMPARISONS: frozenset[str] = frozenset({"Eq", "Lt", "Le", "Gt", "Ge"})
+
+
+def _is_nan_safe_predicate(nt: Any, pred_id: int) -> bool:
+    """True iff the Where predicate's top op is a NaN-collapses-to-false
+    comparison, so a null operand drives the cond false (== Polars null cond)."""
+    try:
+        node = nt.view_expression(pred_id)
+    except Exception:
+        return False
+    if type(node).__name__ != "BinaryExpr":
+        return False
+    op = getattr(node, "op", None)
+    op_name = getattr(op, "name", None) or str(op).rsplit(".", 1)[-1]
+    return _BINOP_MAP.get(op_name) in _NAN_FALSE_COMPARISONS
+
+
+def analyze_ir_validity(
+    nt: Any, node_id: int, schema: dict[str, Any]
+) -> tuple[PyFusionScope, list[tuple[str, str | float]]] | None:
+    """Build a PyFusionScope whose single output is the row null mask (F32:
+    1.0 = valid, 0.0 = null) for a fused HStack expression whose null
+    propagation is data-dependent (contains a ``Where``).
+
+    The validity transform ``V(node)`` (1.0 valid / 0.0 null):
+      - ``V(col)``            = the column's is-valid (a per-row F32 input)
+      - ``V(lit)``            = 1.0 (the shared constant)
+      - ``V(f(args...))``     = AND of the args' validity (= product; a unary
+                                op is the identity on validity)
+      - ``V(a <op> b)``       = ``V(a) * V(b)``  (arithmetic / comparison)
+      - ``V(when c then t else e)`` = ``V(c) * where(value(c), V(t), V(e))``
+
+    ``value(c)`` reuses the value-graph builder (`_visit_ir_ops`) so branch
+    selection is computed with the SAME ops as the output graph — the null
+    mask agrees with which branch the value dispatch actually took.
+
+    Returns ``(scope, descriptors)`` or ``None`` if the expression is not
+    validity-computable (matches `null_mode_ir`'s ``None`` set). Descriptor
+    kinds: ``("valid", col)`` (pass the column's is-valid as F32),
+    ``("col", col)`` / ``("lit", v)`` (pass column values / a scalar, for the
+    ``value(c)`` sub-graphs). Inputs are added in two passes BEFORE any op, per
+    the PyFusionScope synthesis invariant.
+    """
+    try:
+        scope = PyFusionScope()
+        descriptors: list[tuple[str, str | float]] = []
+        valid_idx: dict[str, int] = {}
+        val_leaf_idx: dict[int, int] = {}
+        col_dedup: dict[str, int] = {}
+        lit_dedup: dict[float, int] = {}
+        # Shared constant 1.0 — used for V(lit) and as the validity-AND identity.
+        one_idx = scope.add_input("__lit_1.0", "F32")
+        descriptors.append(("lit", 1.0))
+        lit_dedup[1.0] = one_idx
+        # Pass 1a: a validity input per column leaf (output null if any leaf null).
+        _gather_valid_leaves(nt, node_id, schema, scope, descriptors, valid_idx)
+        # Pass 1b: value inputs for the columns/literals inside Where predicates.
+        _gather_cond_value_leaves(
+            nt, node_id, schema, scope, descriptors, val_leaf_idx, col_dedup, lit_dedup
+        )
+        # Pass 2: build the validity op graph.
+        out_idx = _visit_validity(nt, node_id, schema, scope, valid_idx, val_leaf_idx, one_idx)
+        scope.mark_output(out_idx)
+        return scope, descriptors
+    except _Aborted:
+        return None
+
+
+def _gather_valid_leaves(
+    nt: Any,
+    node_id: int,
+    schema: dict[str, Any],
+    scope: PyFusionScope,
+    descriptors: list[tuple[str, str | float]],
+    valid_idx: dict[str, int],
+) -> None:
+    """Pass 1a: add one ``("valid", col)`` input per distinct column leaf."""
+    try:
+        node = nt.view_expression(node_id)
+    except Exception as e:
+        raise _Aborted from e
+    cls = type(node).__name__
+
+    if cls == "Column":
+        name = getattr(node, "name", None)
+        if name is None:
+            raise _Aborted
+        name_s = str(name)
+        if name_s not in valid_idx:
+            idx = scope.add_input(f"__valid_{name_s}", "F32")
+            descriptors.append(("valid", name_s))
+            valid_idx[name_s] = idx
+        return
+    if cls == "Literal":
+        return
+    if cls == "BinaryExpr":
+        _gather_valid_leaves(nt, node.left, schema, scope, descriptors, valid_idx)
+        _gather_valid_leaves(nt, node.right, schema, scope, descriptors, valid_idx)
+        return
+    if cls == "Cast":
+        _gather_valid_leaves(nt, node.expr, schema, scope, descriptors, valid_idx)
+        return
+    if cls == "Function":
+        for cid in list(getattr(node, "input", [])):
+            _gather_valid_leaves(nt, cid, schema, scope, descriptors, valid_idx)
+        return
+    if cls == "Ternary":
+        _gather_valid_leaves(nt, node.predicate, schema, scope, descriptors, valid_idx)
+        _gather_valid_leaves(nt, node.truthy, schema, scope, descriptors, valid_idx)
+        _gather_valid_leaves(nt, node.falsy, schema, scope, descriptors, valid_idx)
+        return
+    raise _Aborted
+
+
+def _gather_cond_value_leaves(
+    nt: Any,
+    node_id: int,
+    schema: dict[str, Any],
+    scope: PyFusionScope,
+    descriptors: list[tuple[str, str | float]],
+    val_leaf_idx: dict[int, int],
+    col_dedup: dict[str, int],
+    lit_dedup: dict[float, int],
+) -> None:
+    """Pass 1b: add value inputs for leaves reachable inside a Where predicate
+    (needed to recompute ``value(c)`` for branch selection). Non-predicate
+    leaves contribute no value input."""
+    try:
+        node = nt.view_expression(node_id)
+    except Exception as e:
+        raise _Aborted from e
+    cls = type(node).__name__
+
+    if cls in ("Column", "Literal"):
+        return
+    if cls == "BinaryExpr":
+        _gather_cond_value_leaves(
+            nt, node.left, schema, scope, descriptors, val_leaf_idx, col_dedup, lit_dedup
+        )
+        _gather_cond_value_leaves(
+            nt, node.right, schema, scope, descriptors, val_leaf_idx, col_dedup, lit_dedup
+        )
+        return
+    if cls == "Cast":
+        _gather_cond_value_leaves(
+            nt, node.expr, schema, scope, descriptors, val_leaf_idx, col_dedup, lit_dedup
+        )
+        return
+    if cls == "Function":
+        for cid in list(getattr(node, "input", [])):
+            _gather_cond_value_leaves(
+                nt, cid, schema, scope, descriptors, val_leaf_idx, col_dedup, lit_dedup
+            )
+        return
+    if cls == "Ternary":
+        # The predicate's values drive branch selection — gather its leaves.
+        _gather_leaves_ir(
+            nt, node.predicate, schema, scope, descriptors, val_leaf_idx, col_dedup, lit_dedup
+        )
+        _gather_cond_value_leaves(
+            nt, node.truthy, schema, scope, descriptors, val_leaf_idx, col_dedup, lit_dedup
+        )
+        _gather_cond_value_leaves(
+            nt, node.falsy, schema, scope, descriptors, val_leaf_idx, col_dedup, lit_dedup
+        )
+        return
+    raise _Aborted
+
+
+def _visit_validity(
+    nt: Any,
+    node_id: int,
+    schema: dict[str, Any],
+    scope: PyFusionScope,
+    valid_idx: dict[str, int],
+    val_leaf_idx: dict[int, int],
+    one_idx: int,
+) -> int:
+    """Pass 2: push the validity (null-mask) op graph; return its NodeIdx."""
+    try:
+        node = nt.view_expression(node_id)
+    except Exception as e:
+        raise _Aborted from e
+    cls = type(node).__name__
+
+    if cls == "Column":
+        return valid_idx[str(node.name)]
+    if cls == "Literal":
+        return one_idx
+    if cls == "BinaryExpr":
+        op = getattr(node, "op", None)
+        op_name = getattr(op, "name", None) or str(op).rsplit(".", 1)[-1]
+        op_id = _BINOP_MAP.get(op_name)
+        if op_id is None or op_id in ("LogicalAnd", "LogicalOr"):
+            raise _Aborted
+        left = _visit_validity(nt, node.left, schema, scope, valid_idx, val_leaf_idx, one_idx)
+        right = _visit_validity(nt, node.right, schema, scope, valid_idx, val_leaf_idx, one_idx)
+        return _validity_and(scope, [left, right], one_idx)
+    if cls == "Cast":
+        if getattr(node, "dtype", None) != pl.Float32:
+            raise _Aborted
+        return _visit_validity(nt, node.expr, schema, scope, valid_idx, val_leaf_idx, one_idx)
+    if cls == "Function":
+        fd = getattr(node, "function_data", ())
+        if not fd:
+            raise _Aborted
+        fn_name = str(fd[0]).lower()
+        if _is_reverse_cumulative(fn_name, fd) or _IR_FUNCTION_MAP.get(fn_name) == "CumSum":
+            raise _Aborted
+        if fn_name not in ("log", "pow") and fn_name not in _IR_FUNCTION_MAP:
+            raise _Aborted
+        child_vs = [
+            _visit_validity(nt, cid, schema, scope, valid_idx, val_leaf_idx, one_idx)
+            for cid in list(getattr(node, "input", []))
+        ]
+        return _validity_and(scope, child_vs, one_idx)
+    if cls == "Agg":
+        raise _Aborted
+    if cls == "Ternary":
+        # Polars treats a null `when` condition as FALSE (the row takes the
+        # else / next branch), so the result is null iff the *selected* branch
+        # is null: V = where(value(cond), V(then), V(else)). No cond-validity
+        # factor — `null_mode_ir` only admits NaN-safe comparison conds
+        # (Eq/Lt/Le/Gt/Ge), where MLX's `NaN <op> k -> false` collapses a null
+        # cond to the else branch exactly like Polars.
+        cond_val = _visit_ir_ops(nt, node.predicate, schema, scope, val_leaf_idx)
+        then_v = _visit_validity(nt, node.truthy, schema, scope, valid_idx, val_leaf_idx, one_idx)
+        else_v = _visit_validity(nt, node.falsy, schema, scope, valid_idx, val_leaf_idx, one_idx)
+        return scope.push_op("Where", [cond_val, then_v, else_v])
+    raise _Aborted
+
+
+def _validity_and(scope: PyFusionScope, idxs: list[int], one_idx: int) -> int:
+    """AND together validity NodeIdxs via ``Mul`` (operands are 0.0/1.0). The
+    identity input (``one_idx``) is dropped; an empty product is the identity."""
+    operands = [i for i in idxs if i != one_idx]
+    if not operands:
+        return one_idx
+    acc = operands[0]
+    for nxt in operands[1:]:
+        acc = scope.push_op("Mul", [acc, nxt])
+    return acc
 
 
 def _gather_leaves_ir(

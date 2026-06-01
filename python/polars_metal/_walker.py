@@ -83,14 +83,10 @@ import polars as pl
 
 from polars_metal._fusion_analyzer import (
     analyze_ir_reduction,
+    analyze_ir_validity,
     analyze_ir_with_columns,
     null_mode_ir,
 )
-
-# Null-propagation modes (from `null_mode_ir`) the fused HStack dispatch can
-# reproduce when an input column has nulls. Modes outside this set fall back to
-# CPU. Grows as the dispatch side learns to handle more null semantics.
-_SUPPORTED_FUSED_NULL_MODES: frozenset[str] = frozenset({"elementwise"})
 
 _fusion_log = logging.getLogger("polars_metal.fusion")
 
@@ -488,7 +484,7 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
     # have nulls; if so the dispatch reproduces Polars' null semantics for the
     # binding's `null_mode` (e.g. "elementwise" = union of input null masks),
     # or — for modes we can't reproduce — the whole subtree falls back to CPU.
-    fused_records: list[tuple[dict, set[str], str | None]] = []
+    fused_records: list[tuple[dict, set[str], str | None, int]] = []
     for e in exprs:
         node_id = getattr(e, "node", None)
         if node_id is None:
@@ -520,7 +516,9 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
                 "_fused_columns": descriptors,
             }
             binding_cols = {name for kind, name in descriptors if kind == "col"}
-            fused_records.append((binding, binding_cols, null_mode_ir(nt, node_id, in_schema)))
+            fused_records.append(
+                (binding, binding_cols, null_mode_ir(nt, node_id, in_schema), node_id)
+            )
         else:
             expr_dict = _walk_agg_expr_node(nt, node_id, in_schema, _AGG_EXPR_MAX_DEPTH)
             if expr_dict is None:
@@ -541,15 +539,31 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
     # nulls, the dispatch reproduces Polars' null semantics for the binding's
     # mode (stamped as `_fused_null_mode`); modes we can't reproduce
     # (Kleene And/Or, null-skipping reductions, scans) fall the subtree to CPU.
-    for binding, binding_cols, null_mode in fused_records:
+    for binding, binding_cols, null_mode, node_id in fused_records:
         if not binding_cols or _fused_inputs_null_free(inner.plan, binding_cols):
             continue
-        if null_mode not in _SUPPORTED_FUSED_NULL_MODES:
+        if null_mode == "elementwise":
+            # Output null iff any input column null — dispatch ORs the input
+            # null masks. No extra graph.
+            binding["_fused_null_mode"] = "elementwise"
+        elif null_mode == "where":
+            # Data-dependent null mask — build a validity subgraph the dispatch
+            # evaluates (one extra MLX dispatch) to derive the null mask.
+            validity = analyze_ir_validity(nt, node_id, in_schema)
+            if validity is None:
+                return FallBack(
+                    reason="fused HStack Where has nulls but its validity graph "
+                    "is not constructible; CPU preserves Polars null semantics"
+                )
+            v_scope, v_columns = validity
+            binding["_fused_null_mode"] = "where"
+            binding["_fused_validity_scope"] = v_scope
+            binding["_fused_validity_columns"] = v_columns
+        else:
             return FallBack(
                 reason=f"fused HStack input has nulls and null_mode={null_mode!r} "
                 "is not reproducible on the fused path; CPU preserves Polars null semantics"
             )
-        binding["_fused_null_mode"] = null_mode
 
     return Handled(
         plan={
