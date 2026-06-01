@@ -419,6 +419,83 @@ def analyze_ir_with_columns(
         return None
 
 
+# Lowercase Agg.name (IR form) -> reduction OpId string. Used only by the
+# select-reduction path (`analyze_ir_reduction`). argmin/argmax are excluded:
+# they return integer indices, not an F32 scalar.
+_REDUCTION_OP: dict[str, str] = {
+    "sum": "Sum",
+    "mean": "Mean",
+    "min": "Min",
+    "max": "Max",
+    "std": "Std",
+    "var": "Var",
+}
+
+
+def analyze_ir_reduction(
+    nt: Any, agg_node_id: int, schema: dict[str, Any]
+) -> tuple[PyFusionScope, list[tuple[str, str | float]], str] | None:
+    """Analyze a full-column reduction `agg(expr)` (the terminus of a
+    `select(pl.col(...).std())`-shaped node) into a fused scope whose single
+    output is the scalar reduction.
+
+    Returns `(scope, descriptors, agg_kind)` or None if not fusion-eligible.
+    `agg_kind` (lowercase, e.g. "std") lets the dispatch apply the Bessel
+    correction — MLX uses population variance (ddof=0); Polars defaults to
+    sample (ddof=1).
+
+    The agg's *argument* subtree is analyzed with the shared leaf/op walkers
+    (which never recurse into Agg nodes), then the reduction op is pushed
+    explicitly as the terminus. A nested Agg in the argument aborts (the
+    shared walkers reject Agg), falling back to CPU — correct, just unfused.
+    """
+    try:
+        agg_node = nt.view_expression(agg_node_id)
+    except Exception:
+        return None
+    if type(agg_node).__name__ != "Agg":
+        return None
+    kind = str(getattr(agg_node, "name", "")).lower()
+    op_id = _REDUCTION_OP.get(kind)
+    if op_id is None:
+        return None
+    args = list(getattr(agg_node, "arguments", []))
+    if len(args) != 1:
+        return None
+    arg_id = args[0]
+    try:
+        scope = PyFusionScope()
+        descriptors: list[tuple[str, str | float]] = []
+        leaf_idx: dict[int, int] = {}
+        col_dedup: dict[str, int] = {}
+        lit_dedup: dict[float, int] = {}
+        _gather_leaves_ir(nt, arg_id, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup)
+        # Restrict to a bare single Float32 column. Two reasons:
+        #  1. The fused path emits an F32 scalar; Polars' reduction dtype depends
+        #     on the input dtype (sum/min/max of Int32 -> Int32, mean/std/var of
+        #     Int32 -> Float64), so non-F32 must fall back. (`_dtype_to_input_str`
+        #     also admits F64/I32/Bool for the HStack path.)
+        #  2. Polars reductions skip nulls; MLX over `to_numpy()` (nulls -> NaN)
+        #     does not. The dispatch falls back to a Polars reduction on the
+        #     source column when it has nulls — which is only reproducible for a
+        #     bare column (a compute chain's null propagation can't be replayed
+        #     without the original expression). Compute-chain reductions stay on
+        #     the CPU/GroupBy path for now.
+        inner_idx = _visit_ir_ops(nt, arg_id, schema, scope, leaf_idx)
+        if (
+            len(descriptors) != 1
+            or descriptors[0][0] != "col"
+            or scope.n_ops() != 0  # argument had ops -> not a bare column
+            or schema.get(descriptors[0][1]) != pl.Float32
+        ):
+            raise _Aborted
+        red_idx = scope.push_op(op_id, [inner_idx])
+        scope.mark_output(red_idx)
+        return scope, descriptors, kind
+    except _Aborted:
+        return None
+
+
 def _gather_leaves_ir(
     nt: Any,
     node_id: int,

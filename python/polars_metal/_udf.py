@@ -375,6 +375,12 @@ def _build_groupby(plan: dict) -> Any:
     plan (including the GroupBy root node) and dispatch to ``_dispatch_groupby``
     at call time.
     """
+    # M4 Phase 7 (Task 26): empty-key reduction whose every agg the analyzer
+    # accepted as a fused F32 reduction routes through the MLX subgraph path
+    # instead of the GroupBy conformance kernel.
+    if not plan.get("keys") and plan.get("_fused_aggs"):
+        return _build_select_reduction_fused(plan)
+
     df_pydf, wire_plan = _extract_scan_df_and_wire_plan(plan)
 
     def udf(
@@ -389,6 +395,75 @@ def _build_groupby(plan: dict) -> Any:
         if should_time:
             return df, []
         return df
+
+    return udf
+
+
+def _build_select_reduction_fused(plan: dict) -> Any:
+    """UDF for an empty-key Select reduction routed through the fused MLX path.
+
+    Each binding in ``plan['_fused_aggs']`` carries an analyzed scope whose
+    single output is the scalar reduction, the ordered input descriptors, the
+    output column name, and the lowercase agg kind. At call time we resolve the
+    upstream frame, run each reduction (scalar output), apply the Bessel
+    correction to std/var (MLX uses population variance, ddof=0; Polars
+    defaults to sample, ddof=1), and assemble a one-row DataFrame.
+    """
+    import math
+
+    import numpy as np
+
+    fused_aggs: list[dict] = plan["_fused_aggs"]
+    df_pydf, wire_plan = _extract_scan_df_and_wire_plan(plan)
+    input_plan = wire_plan["input"]
+
+    def udf(
+        with_columns: list[str] | None,
+        predicate: Any,
+        n_rows: int | None,
+        should_time: bool,
+    ) -> Any:
+        upstream = _dispatch(df_pydf, input_plan)
+        n = upstream.height
+        out_series: list[pl.Series] = []
+        for agg in fused_aggs:
+            scope = agg["_fused_scope"]
+            descriptors: list[tuple[str, str | float]] = agg["_fused_columns"]
+            name = agg["name"]
+            kind = agg["_agg_kind"]
+            # Bare single Float32 column (enforced by `analyze_ir_reduction`).
+            col_name = descriptors[0][1]
+            series = upstream.get_column(col_name)
+
+            # MLX over `to_numpy()` turns nulls into NaN (Polars skips nulls),
+            # and population std/var of <2 rows can't be Bessel-corrected. In
+            # those cases compute the reduction with Polars on the source column
+            # — exact (same null skipping, same n=0/1 semantics, same dtype).
+            if n < 2 or series.null_count() > 0:
+                value = getattr(series, kind)()
+                out_series.append(pl.Series(name, [value], dtype=series.dtype))
+                continue
+
+            arr = np.ascontiguousarray(series.to_numpy(), dtype=np.float32)
+            out_arr = np.empty(1, dtype=np.float32)
+            _native.execute_fused_expr(
+                scope=scope,
+                inputs=[(int(arr.__array_interface__["data"][0]), int(arr.size))],
+                out=(int(out_arr.__array_interface__["data"][0]), int(out_arr.size)),
+            )
+            val = float(out_arr[0])
+            # Bessel: MLX uses population variance (ddof=0); Polars defaults to
+            # sample (ddof=1). Only std/var need the correction.
+            if kind == "var":
+                val *= n / (n - 1)
+            elif kind == "std":
+                val *= math.sqrt(n / (n - 1))
+            out_series.append(pl.Series(name, [val], dtype=pl.Float32))
+
+        result = pl.DataFrame(out_series)
+        if should_time:
+            return result, []
+        return result
 
     return udf
 

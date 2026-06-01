@@ -79,7 +79,7 @@ from datetime import date as _date
 from datetime import datetime as _datetime
 from typing import Any
 
-from polars_metal._fusion_analyzer import analyze_ir_with_columns
+from polars_metal._fusion_analyzer import analyze_ir_reduction, analyze_ir_with_columns
 
 _fusion_log = logging.getLogger("polars_metal.fusion")
 
@@ -317,6 +317,32 @@ def _walk_select_reduction(nt: Any, exprs: list[Any]) -> WalkResult:
     finally:
         nt.set_node(parent_id)
 
+    # M4 Phase 7 (Task 26): if every aggregation is a fusion-eligible F32
+    # reduction (sum/mean/min/max/std/var of one column or a compute chain),
+    # route the whole Select through the fused MLX path instead of the
+    # empty-key GroupBy conformance kernel. All-or-nothing: a single
+    # non-eligible agg falls through to the GroupBy path below.
+    fused_aggs = _try_fused_select_reduction(nt, exprs, in_schema)
+    if fused_aggs is not None:
+        nt.set_node(inputs[0])
+        inner = _walk_at_current(nt)
+        if not isinstance(inner, FallBack):
+            return Handled(
+                plan={
+                    "kind": "GroupBy",
+                    "input": inner.plan,
+                    "keys": [],
+                    # Empty aggs: the router parses this as a no-op empty-key
+                    # GroupBy (non-fallback); the `_fused_aggs` side-channel
+                    # drives `_build_select_reduction_fused` on the dispatch
+                    # side, bypassing the GroupBy kernel entirely.
+                    "aggs": [],
+                    "_fused_aggs": fused_aggs,
+                }
+            )
+        # inner fell back — fall through to the GroupBy path, which will
+        # likely also fall back, but keep the single decision point below.
+
     aggs: list[dict[str, str]] = []
     for agg_expr in exprs:
         agg_dict = _walk_agg_expression(nt, agg_expr, in_schema)
@@ -337,6 +363,44 @@ def _walk_select_reduction(nt: Any, exprs: list[Any]) -> WalkResult:
             "aggs": aggs,
         }
     )
+
+
+def _try_fused_select_reduction(
+    nt: Any, exprs: list[Any], in_schema: dict[str, Any]
+) -> list[dict] | None:
+    """Return a list of fused-reduction binding dicts if every expression in
+    `exprs` is a fusion-eligible F32 reduction, else None.
+
+    Each binding carries the analyzed scope, its ordered input descriptors,
+    the output column name, and the lowercase agg kind (for the dispatch-side
+    Bessel correction on std/var).
+    """
+    bindings: list[dict] = []
+    for agg_expr in exprs:
+        node_id = getattr(agg_expr, "node", None)
+        output_name = getattr(agg_expr, "output_name", None)
+        if node_id is None or output_name is None:
+            return None
+        result = analyze_ir_reduction(nt, node_id, in_schema)
+        if result is None:
+            return None
+        scope, columns, agg_kind = result
+        _fusion_log.info(
+            "FusedReduction candidate column=%r kind=%s n_inputs=%d n_ops=%d",
+            output_name,
+            agg_kind,
+            scope.n_inputs(),
+            scope.n_ops(),
+        )
+        bindings.append(
+            {
+                "name": output_name,
+                "_fused_scope": scope,
+                "_fused_columns": columns,
+                "_agg_kind": agg_kind,
+            }
+        )
+    return bindings if bindings else None
 
 
 def _probe_fusion_analyzer(

@@ -100,6 +100,9 @@ def _plan_has_fused_binding(plan: dict) -> bool:
         for binding in plan.get("exprs", []):
             if "_fused_scope" in binding:
                 return True
+    # M4 Phase 7: empty-key GroupBy carrying fused reduction bindings.
+    if plan.get("kind") == "GroupBy" and plan.get("_fused_aggs"):
+        return True
     inner = plan.get("input")
     if isinstance(inner, dict):
         return _plan_has_fused_binding(inner)
