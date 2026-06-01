@@ -4001,7 +4001,16 @@ Closes Phase 8."
 
 ---
 
-## Phase 9 — List/Array dot-product → MLX matmul (vector search)
+## Phase 9 — List/Array dot-product → MLX matmul (vector search) — **DEFERRED (2026-06-01)**
+
+> **Decision:** deferred. The walker can't recognize the dot expression: the
+> py-1.40.1 NodeTraverser `view_expression` raises on list/array exprs (and the
+> assumed `pl.col(...).arr.dot(lit)` API doesn't exist — real shapes are
+> `list.eval(element()*lit).list.sum()` / `(arr*arr_lit).arr.sum()`, both
+> unviewable). Same systemic opacity that deferred Task 29 (corr). Routes when
+> picked up: a pre-optimization plan-capture recognizer (`lf.serialize` exposes
+> these), a viewable layout (D separate F32 columns → MAC chain through the
+> existing fused path), or upstream visitor support. See `docs/open-questions.md`.
 
 Phase 10 of the roadmap. Two source shapes:
 - `Array[F32, D]`: `pl.col("emb").arr.dot(query_lit)` (clean dtype contract)
@@ -4250,7 +4259,19 @@ git commit -m "M4 Phase 9: L2 k-NN perf bench (may be marked as Phase 10.next st
 
 ---
 
-## Phase 10 — `pl.col("x").metal.fft()` public API
+## Phase 10 — `pl.col("x").metal.fft()` public API — **DEFERRED (2026-06-01)**
+
+> **Decision:** deferred. The plan's `map_batches` placeholder is opaque to the
+> walker (`view_expression` → `"anonymousfunction"`). **Investigated unlock:** a
+> viewable `as_struct` hybrid sentinel —
+> `pl.struct([col("x").alias("real"), col("x").map_batches(_raise).alias("imag")])`
+> — IS walker-routable (view `as_struct`, field[0]=`Column(x)` is the input,
+> field[1] opaque marker, output dtype `Struct{real,imag}`) AND raises cleanly on
+> CPU. So FFT *can* fit the plugin (unlike dot/corr). Remaining work when picked
+> up: (1) namespace returns the hybrid sentinel; (2) walker recognizes it;
+> (3) **new Rust/FFI** for MLX complex → two F32 arrays → Polars `Struct` readback
+> (the `Fft` op is wired in `fusion/subgraph.rs`; only the complex readback is
+> missing). See `docs/open-questions.md`.
 
 Phase 11 of the roadmap. New Polars expression namespace `.metal`, registered when `import polars_metal` runs. The engine intercepts at walk time and routes to MLX FFT.
 

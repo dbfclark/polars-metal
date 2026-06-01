@@ -402,3 +402,56 @@ per-call `engine=` model); #4 depends on upstream. The matmul lever moves to
 that fits the plugin — so the matmul FFI/kernel work is not wasted. Revisit
 only if a headline `df.corr()` number is later required (then prefer #1 with
 explicit activation) or upstream makes `corr` walkable (#4).
+
+---
+
+## NodeTraverser opacity blocks list/array/corr/FFT recognition (M4 Phase 10/11) — DEFERRED (2026-06-01)
+
+**Finding (py-1.40.1).** The engine-plugin `NodeTraverser` — the walker's only
+window at the post-optimization callback — exposes only a fixed "core"
+expression set via `view_expression`: `Column`, `Literal`, `BinaryExpr`,
+`Function` with a viewable `function_data` tuple (sin/cos/log/.../cum_sum/
+`as_struct`), `Cast`, `Agg`, `Ternary`, `Sort`. Everything else raises:
+- list-namespace exprs  -> `"list expr"`
+- array-namespace exprs -> `"array expr"`
+- `pl.corr`             -> `"corr"`
+- `map_batches`/`map_elements` -> `"anonymousfunction"`
+- `reshape`             -> `"reshape"`
+- top_k/bottom_k null-drop -> dynamic predicate (unviewable; see Task 27)
+
+`PyExprIR` carries only `.node`/`.output_name` (no serialize). So the walker
+**cannot recognize** the expressions Phase 10 (list/array `.dot`) and the
+plan's Phase 11 FFT (`map_batches` placeholder) depend on. Under
+`engine="metal"` these **fall back to CPU cleanly today** (correct results, no
+GPU win). Also: the plan's `pl.col(...).arr.dot(lit)` API does not exist in
+this Polars version (real dot shapes are `list.eval(element()*lit).list.sum()`
+and `(arr * arr_lit).arr.sum()`, both unviewable).
+
+**Escape hatches that exist (not where the walker is):**
+- `expr.meta.serialize(format="json")` and `lf.serialize(...)` DO expose
+  list/array/corr/eval — but only at the **pre-optimization LazyFrame**, not at
+  the post-opt NodeTraverser the engine callback receives.
+- `nt.get_dtype(node)` works even on opaque nodes (returns the output dtype).
+
+**FFT-specific unlock (discovered, not yet built):** `pl.struct([...])` IS
+viewable (`Function('as_struct')`, viewable field inputs). A *hybrid* sentinel
+`pl.struct([col("x").alias("real"), col("x").map_batches(_raise).alias("imag")])`
+is walker-routable (view `as_struct`, read field[0]=`Column(x)` for the input,
+field[1] opaque marker, confirm via output dtype `Struct{real,imag}`) AND
+raises cleanly on CPU (the `map_batches` field). This makes a custom
+`.metal.fft()` recognizable. It only works for **struct-output** ops, so it
+unblocks FFT but NOT scalar-output dot or the corr matrix.
+
+**Decision (dbfclark): record + defer.** M4 is treated as complete on the
+walker-visible compute class (haversine, Black-Scholes, std/var/sum/mean
+reductions, sort/top-k, cumsum, and on-GPU null handling — all shipped). The
+remaining matmul (Phase 10) and FFT (Phase 11) phases are deferred. When picked
+up:
+- **FFT** has a clear path: viewable `as_struct` sentinel + walker recognition +
+  new Rust/FFI for MLX complex -> two F32 arrays -> Polars `Struct` readback
+  (the `Fft` op is already wired in `fusion/subgraph.rs`; only the complex
+  readback + Struct assembly is missing).
+- **list/array dot + corr** need a different mechanism: a pre-optimization
+  plan-capture recognizer (`lf.serialize` exposes them), a viewable data layout
+  (D separate F32 columns -> MAC chain through the existing fused path), or an
+  upstream polars-python change exposing these exprs to the visitor.
