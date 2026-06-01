@@ -70,10 +70,10 @@ def test_cse_heavy_expr_is_single_dispatch(monkeypatch):
     dispatch_count = 0
     orig = _native.execute_fused_expr
 
-    def counting(scope, input_buffers):
+    def counting(scope, inputs, out):
         nonlocal dispatch_count
         dispatch_count += 1
-        return orig(scope=scope, input_buffers=input_buffers)
+        return orig(scope=scope, inputs=inputs, out=out)
 
     monkeypatch.setattr(_native, "execute_fused_expr", counting)
 

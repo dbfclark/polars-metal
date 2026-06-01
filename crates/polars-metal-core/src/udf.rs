@@ -2492,12 +2492,26 @@ fn dispatch_logical_py<'py>(
 // PyFusionScope as a side-channel on the binding and the UDF dispatch
 // (Task 23) invokes this entry point.
 
+/// Execute a fused MLX subgraph with zero-copy I/O.
+///
+/// `inputs` is a list of `(ptr, n_elements)` pairs, one per scope input, where
+/// `ptr` is the address of a live, C-contiguous float32 buffer (a numpy
+/// array's `__array_interface__` data pointer). `out` is `(ptr, capacity)` for
+/// a writable float32 array to receive the single subgraph output. Returns the
+/// number of elements written (1 for a literal-only / scalar output, else the
+/// column length).
+///
+/// The buffer protocol isn't available under the abi3 limited API, so we pass
+/// raw pointers from Python rather than `PyBuffer`. The caller MUST keep every
+/// input array and the output array alive for the duration of this (fully
+/// synchronous) call; `_udf._dispatch_hstack_fused` does so by holding the
+/// arrays in locals across the call.
 #[pyfunction]
-pub fn execute_fused_expr<'py>(
-    py: Python<'py>,
+pub fn execute_fused_expr(
     scope: &crate::fusion::py::PyFusionScope,
-    input_buffers: Vec<Bound<'py, PyBytes>>,
-) -> PyResult<Bound<'py, PyBytes>> {
+    inputs: Vec<(usize, usize)>,
+    out: (usize, usize),
+) -> PyResult<usize> {
     use std::sync::Arc;
     let device = MetalDevice::system_default().map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -2505,17 +2519,19 @@ pub fn execute_fused_expr<'py>(
         ))
     })?;
 
-    // Stage each input PyBytes (F32 column data) into a MetalBuffer.
-    let metal_buffers: Vec<Arc<polars_metal_buffer::MetalBuffer>> = input_buffers
+    // Stage each input float32 buffer into a MetalBuffer. The ingest is
+    // zero-copy when the pointer is page-aligned (numpy-origin / large
+    // allocations), else a single copy — handled inside `from_borrowed_f32`.
+    // The caller keeps the source arrays alive for the whole call, so the
+    // borrowed memory outlives every MetalBuffer and the synchronous eval.
+    let metal_buffers: Vec<Arc<polars_metal_buffer::MetalBuffer>> = inputs
         .iter()
-        .map(|bytes| {
-            let raw = bytes.as_bytes();
-            // SAFETY: caller-provided F32 column bytes. Length is a multiple
-            // of 4; alignment is unconstrained for u8 → f32 reinterpret on
-            // ARM macOS (no SIGBUS) and we only read.
-            let f32_slice =
-                unsafe { std::slice::from_raw_parts(raw.as_ptr().cast::<f32>(), raw.len() / 4) };
-            polars_metal_buffer::MetalBuffer::from_f32_slice(&device, f32_slice)
+        .map(|&(ptr, n)| {
+            let fptr = ptr as *const f32;
+            // SAFETY: `fptr` addresses `n` live, contiguous f32 (caller
+            // contract) for the lifetime of this call; page-aligned pointers
+            // take bytesNoCopy, others copy. See `from_borrowed_f32`.
+            unsafe { polars_metal_buffer::MetalBuffer::from_borrowed_f32(&device, fptr, n) }
                 .map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
                         "polars_metal: input buffer staging failed: {e}"
@@ -2525,7 +2541,6 @@ pub fn execute_fused_expr<'py>(
         })
         .collect::<PyResult<Vec<_>>>()?;
 
-    // Build the subgraph over zero-copy views, evaluate, read back as F32.
     let subgraph = crate::fusion::subgraph::MlxSubgraph::from_fusion_scope_buffers(
         &scope.inner,
         &metal_buffers,
@@ -2533,23 +2548,20 @@ pub fn execute_fused_expr<'py>(
     .map_err(|e| {
         pyo3::exceptions::PyValueError::new_err(format!("polars_metal: subgraph build: {e}"))
     })?;
-    let outputs = subgraph.eval().map_err(|e| {
+
+    // Output-zero-copy: eval writes directly into the caller's `out` array.
+    let (out_ptr, out_len) = out;
+    // SAFETY: `out_ptr` addresses `out_len` writable, contiguous f32 (caller
+    // contract), kept alive for the whole call. `eval_into` blocks on
+    // `mlx_array_eval` before copying, so no GPU writes are in-flight on
+    // readback. `mlx_array_copy_to_f32_slice` checks the output fits in `dst`.
+    let dst: &mut [f32] = unsafe { std::slice::from_raw_parts_mut(out_ptr as *mut f32, out_len) };
+    let counts = subgraph.eval_into(&mut [dst]).map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: subgraph eval: {e}"))
     })?;
-    let out_data = outputs.into_iter().next().ok_or_else(|| {
+    counts.into_iter().next().ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(
             "polars_metal: fused subgraph produced no outputs",
         )
-    })?;
-    let out_f32 = out_data.into_f32_vec();
-    // SAFETY: out_f32 is a Vec<f32>; bytes view is valid for the duration of
-    // the slice borrow (PyBytes::new_bound copies the bytes into a new
-    // Python object).
-    let out_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(
-            out_f32.as_ptr().cast::<u8>(),
-            std::mem::size_of_val(out_f32.as_slice()),
-        )
-    };
-    Ok(PyBytes::new_bound(py, out_bytes))
+    })
 }

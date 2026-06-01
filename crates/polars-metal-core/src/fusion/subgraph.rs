@@ -13,8 +13,8 @@
 
 use polars_metal_buffer::{MetalBuffer, MetalDevice};
 use polars_metal_mlx_sys::array::{
-    mlx_array_eval, mlx_array_from_f32_slice, mlx_array_to_f32_vec, mlx_array_view_metal_buffer,
-    MlxArrayHandle, MlxDtype,
+    mlx_array_copy_to_f32_slice, mlx_array_eval, mlx_array_from_f32_slice, mlx_array_to_f32_vec,
+    mlx_array_view_metal_buffer, MlxArrayHandle, MlxDtype,
 };
 use polars_metal_mlx_sys::elementwise::{
     mlx_abs, mlx_acos, mlx_add, mlx_asin, mlx_atan, mlx_atan2, mlx_cbrt, mlx_ceil, mlx_cos,
@@ -136,6 +136,29 @@ impl MlxSubgraph {
             outs.push(ColumnBuffer { data });
         }
         Ok(outs)
+    }
+
+    /// Eval the subgraph and copy each output directly into the matching
+    /// caller-owned slice (output-zero-copy: no intermediate `Vec`). `dsts[i]`
+    /// receives output `i` and must hold at least its element count. Returns
+    /// the per-output element counts written.
+    ///
+    /// The number of destination slices must equal the number of outputs.
+    pub fn eval_into(&self, dsts: &mut [&mut [f32]]) -> Result<Vec<usize>, BuildError> {
+        if dsts.len() != self.outputs.len() {
+            return Err(BuildError::InputCountMismatch {
+                expected: self.outputs.len(),
+                actual: dsts.len(),
+            });
+        }
+        mlx_array_eval(&self.outputs).map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+        let mut counts = Vec::with_capacity(self.outputs.len());
+        for (h, dst) in self.outputs.iter().zip(dsts.iter_mut()) {
+            let n = mlx_array_copy_to_f32_slice(h, dst)
+                .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+            counts.push(n);
+        }
+        Ok(counts)
     }
 
     /// Production-path constructor: build the subgraph over zero-copy views

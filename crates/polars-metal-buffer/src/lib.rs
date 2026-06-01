@@ -13,7 +13,7 @@ pub mod dict;
 mod error;
 mod null_bitmap;
 
-pub use alignment::{is_aligned, is_page_aligned, page_size};
+pub use alignment::{is_aligned, is_page_aligned, is_ptr_page_aligned, page_size};
 pub use bridge::MetalBuffer;
 pub use device::MetalDevice;
 pub use error::BufferError;

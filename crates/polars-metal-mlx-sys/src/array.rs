@@ -198,6 +198,43 @@ pub fn mlx_array_to_f32_vec(handle: &MlxArrayHandle) -> Result<Vec<f32>, FfiErro
     Ok(out)
 }
 
+/// Copy an eval'd F32 array's contents directly into a caller-owned slice,
+/// returning the number of elements written. This is the output-zero-copy
+/// readback: the destination is the final buffer (e.g. a numpy output array),
+/// so no intermediate `Vec` is allocated.
+///
+/// `dst` must hold at least `handle.shape().product()` elements; a shorter
+/// slice is an error (we never write past `dst`).
+///
+/// # Errors
+/// `FfiError::DtypeMismatch` if the array is not F32; `FfiError::Runtime` if
+/// `dst` is too small.
+pub fn mlx_array_copy_to_f32_slice(
+    handle: &MlxArrayHandle,
+    dst: &mut [f32],
+) -> Result<usize, FfiError> {
+    if !handle.dtype_is_f32() {
+        return Err(FfiError::DtypeMismatch);
+    }
+    let n: usize = handle.shape().iter().product();
+    if n == 0 {
+        return Ok(0);
+    }
+    if dst.len() < n {
+        return Err(FfiError::Runtime(format!(
+            "destination slice too small: have {}, need {n}",
+            dst.len()
+        )));
+    }
+    // SAFETY: `dst` holds at least `n` f32 (checked above); the C++ function
+    // writes exactly `n * sizeof(float)` bytes. The array is eval'd (caller
+    // contract) and F32 (checked), so `arr->data<float>()` is valid.
+    unsafe {
+        ffi::mlx_array_copy_to_f32(&handle.ptr, dst.as_mut_ptr(), n);
+    }
+    Ok(n)
+}
+
 /// Construct a zero-copy MLX array view over an existing `MetalBuffer`.
 ///
 /// The buffer's contents are exposed to MLX without copying: MLX receives the

@@ -209,18 +209,27 @@ def _analyzer_eval(
     scope, descriptors = result
 
     n_rows = len(next(iter(inputs.values())))
-    input_buffers: list[bytes] = []
+    # Hold the source arrays in this list across the call (the executor borrows
+    # their memory). Pass (ptr, n_elements) pairs — the abi3-safe input form.
+    input_arrays: list[np.ndarray] = []
     for kind, payload in descriptors:
         if kind == "col":
-            arr = inputs[payload].astype(np.float32, copy=False)
-            input_buffers.append(arr.tobytes())
+            input_arrays.append(np.ascontiguousarray(inputs[payload], dtype=np.float32))
         elif kind == "lit":
-            input_buffers.append(np.full(n_rows, payload, dtype=np.float32).tobytes())
+            input_arrays.append(np.asarray([payload], dtype=np.float32))
         else:
             raise AssertionError(f"unknown descriptor kind {kind!r}")
 
-    out_bytes = native.execute_fused_expr(scope=scope, input_buffers=input_buffers)
-    return np.frombuffer(out_bytes, dtype=np.float32).copy()
+    out_arr = np.empty(n_rows, dtype=np.float32)
+    in_ptrs = [(int(a.__array_interface__["data"][0]), int(a.size)) for a in input_arrays]
+    written = native.execute_fused_expr(
+        scope=scope,
+        inputs=in_ptrs,
+        out=(int(out_arr.__array_interface__["data"][0]), int(out_arr.size)),
+    )
+    if written == 1 and n_rows != 1:
+        out_arr.fill(out_arr[0])
+    return out_arr
 
 
 @given(expr_and_eval=_expr_strategy(max_depth=5))

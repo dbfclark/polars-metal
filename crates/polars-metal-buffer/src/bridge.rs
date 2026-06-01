@@ -21,7 +21,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice as _, MTLResource as _, MTLResourceOptions};
 
-use crate::{is_page_aligned, BufferError, MetalDevice};
+use crate::{is_page_aligned, is_ptr_page_aligned, BufferError, MetalDevice};
 
 /// A wrapper around an `MTLBuffer` in Shared storage mode.
 ///
@@ -144,6 +144,77 @@ impl MetalBuffer {
             _owner: None,
             _view_parent: None,
         })
+    }
+
+    /// Wrap a borrowed F32 region as a Metal buffer for the fused-expr input
+    /// path.
+    ///
+    /// Zero-copy via `newBufferWithBytesNoCopy` when `ptr` is page-aligned,
+    /// otherwise copies into a fresh Metal allocation. Unlike [`from_arrow`],
+    /// the length need not be page-aligned — only the pointer (Metal maps whole
+    /// pages but reads only `n_elements`, and a page-aligned allocation's
+    /// trailing partial page is committed; verified against the live driver).
+    /// Callers get the zero-copy path opportunistically: numpy-origin / large
+    /// allocations are page-aligned in practice, while Polars-allocated columns
+    /// (64-byte Arrow alignment) take the copy path transparently.
+    ///
+    /// # Safety
+    /// `ptr` must be non-null and valid for `n_elements * 4` bytes for the
+    /// entire lifetime of the returned `MetalBuffer`. On the zero-copy path the
+    /// buffer holds **no** keep-alive (`_owner` is `None`) — the caller owns the
+    /// memory and must outlive the buffer (e.g. by holding the source Python
+    /// array across a synchronous eval). On the copy path the data is read once
+    /// during construction and the borrow ends when this function returns.
+    pub unsafe fn from_borrowed_f32(
+        device: &MetalDevice,
+        ptr: *const f32,
+        n_elements: usize,
+    ) -> Result<Self, BufferError> {
+        let len = n_elements * std::mem::size_of::<f32>();
+        if len == 0 {
+            // Metal rejects zero-byte buffers (mirrors the copy path).
+            return Err(BufferError::AllocationFailed { bytes: 0 });
+        }
+        let nn = NonNull::new(ptr as *mut std::ffi::c_void)
+            .ok_or(BufferError::AllocationFailed { bytes: len })?;
+
+        if is_ptr_page_aligned(ptr as usize) {
+            // Zero-copy: no-op deallocator; the caller owns the backing memory
+            // (see the Safety contract). Metal only refcounts the block.
+            let deallocator: RcBlock<dyn Fn(NonNull<std::ffi::c_void>, usize)> =
+                RcBlock::new(move |_ptr, _len| {});
+            // SAFETY: `ptr` is valid for `len` bytes for the buffer's lifetime
+            // (caller-guaranteed); page-aligned pointer satisfies bytesNoCopy.
+            let inner = device
+                .raw()
+                .newBufferWithBytesNoCopy_length_options_deallocator(
+                    nn,
+                    len,
+                    MTLResourceOptions::MTLResourceStorageModeShared,
+                    Some(&deallocator),
+                )
+                .ok_or(BufferError::AllocationFailed { bytes: len })?;
+            Ok(Self {
+                inner,
+                _owner: None,
+                _view_parent: None,
+            })
+        } else {
+            // SAFETY: `ptr` is valid for `len` bytes; Metal copies them in now.
+            let inner = device
+                .raw()
+                .newBufferWithBytes_length_options(
+                    nn,
+                    len,
+                    MTLResourceOptions::MTLResourceStorageModeShared,
+                )
+                .ok_or(BufferError::AllocationFailed { bytes: len })?;
+            Ok(Self {
+                inner,
+                _owner: None,
+                _view_parent: None,
+            })
+        }
     }
 
     /// Byte length of the buffer.
@@ -431,6 +502,111 @@ mod tests {
             result.is_err(),
             "zero-length buffer should fail with AllocationFailed"
         );
+    }
+
+    // ── Borrowed-F32 ingest path (input zero-copy) ───────────────────────────
+
+    /// A page-aligned pointer with a NON-page-aligned length (the real shape
+    /// of a 10M F32 column: ptr aligned, byte length 40_000_000 % page != 0)
+    /// takes the zero-copy path: mutating the source after wrapping is visible
+    /// through the Metal buffer (shared storage, no copy).
+    #[test]
+    fn from_borrowed_f32_zero_copy_when_page_aligned() {
+        use crate::page_size;
+        let page = page_size();
+        // SAFETY: standard anonymous mmap; munmap'd at end of test.
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED, "mmap must succeed");
+        assert_eq!(raw as usize % page, 0, "mmap pointer is page-aligned");
+
+        // 1000 F32 = 4000 bytes, well under one page and NOT a page multiple.
+        let n = 1000usize;
+        let fptr = raw as *mut f32;
+        // SAFETY: fptr valid for n f32 within the page.
+        let src = unsafe { std::slice::from_raw_parts_mut(fptr, n) };
+        for (i, v) in src.iter_mut().enumerate() {
+            *v = i as f32;
+        }
+
+        let device = device();
+        // SAFETY: fptr valid for n*4 bytes for the buffer's lifetime (until munmap below).
+        let metal = unsafe { MetalBuffer::from_borrowed_f32(&device, fptr, n) }
+            .expect("borrowed allocation");
+        assert_eq!(metal.len(), n * 4);
+        assert_eq!(metal.to_f32_vec()[..5], [0.0, 1.0, 2.0, 3.0, 4.0]);
+
+        // Mutate the SOURCE after wrapping — a zero-copy view must observe it.
+        src[7] = 999.0;
+        assert_eq!(
+            metal.to_f32_vec()[7],
+            999.0,
+            "page-aligned ptr must be zero-copy (source mutation visible)"
+        );
+
+        // SAFETY: raw/page came from mmap; metal is dropped after this scope but
+        // its no-op deallocator means the munmap is the real free.
+        drop(metal);
+        unsafe { libc::munmap(raw, page) };
+    }
+
+    /// An unaligned pointer falls back to the copy path: a post-wrap source
+    /// mutation is NOT visible through the Metal buffer.
+    #[test]
+    fn from_borrowed_f32_copies_when_unaligned() {
+        use crate::page_size;
+        let page = page_size();
+        // SAFETY: mmap two pages so an offset pointer is still valid memory.
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                2 * page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED, "mmap must succeed");
+
+        // Offset by 4 bytes → guaranteed NOT page-aligned, still 4-byte aligned
+        // (valid for f32 access).
+        let fptr = unsafe { (raw as *mut u8).add(4) }.cast::<f32>();
+        assert_ne!(
+            fptr as usize % page,
+            0,
+            "offset pointer is not page-aligned"
+        );
+        let n = 1000usize;
+        let src = unsafe { std::slice::from_raw_parts_mut(fptr, n) };
+        for (i, v) in src.iter_mut().enumerate() {
+            *v = i as f32;
+        }
+
+        let device = device();
+        // SAFETY: fptr valid for n*4 bytes (within the 2-page mapping).
+        let metal = unsafe { MetalBuffer::from_borrowed_f32(&device, fptr, n) }
+            .expect("borrowed allocation");
+        assert_eq!(metal.to_f32_vec()[..5], [0.0, 1.0, 2.0, 3.0, 4.0]);
+
+        // Mutate the source — a COPY must not observe it.
+        src[7] = 999.0;
+        assert_eq!(
+            metal.to_f32_vec()[7],
+            7.0,
+            "unaligned ptr must take the copy path (source mutation invisible)"
+        );
+
+        drop(metal);
+        unsafe { libc::munmap(raw, 2 * page) };
     }
 
     // ── Zero-copy path ───────────────────────────────────────────────────────

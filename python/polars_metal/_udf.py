@@ -156,31 +156,45 @@ def _dispatch_hstack_fused(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
         descriptors: list[tuple[str, str | float]] = binding["_fused_columns"]
         name = binding["name"]
 
-        input_buffers: list[bytes] = []
+        input_arrays: list[np.ndarray] = []
         for kind, payload in descriptors:
             if kind == "col":
                 series = upstream.get_column(payload)
-                arr = series.to_numpy().astype(np.float32, copy=False)
-                input_buffers.append(arr.tobytes())
+                # Pass the column as a float32 numpy view. For a dense,
+                # single-chunk F32 column `to_numpy()` is zero-copy and already
+                # C-contiguous F32, so `ascontiguousarray` is a no-op view; the
+                # Rust ingest then takes the zero-copy bytesNoCopy path when the
+                # buffer is page-aligned (numpy-origin / large allocations) and
+                # a single copy otherwise. Columns with nulls / multiple chunks
+                # copy here (correctness preserved), then ingest-copy.
+                input_arrays.append(np.ascontiguousarray(series.to_numpy(), dtype=np.float32))
             elif kind == "lit":
-                # Single scalar — executor builds shape=[1] MLX array, which
-                # broadcasts in elementwise ops. Saves an n_rows*4-byte
-                # allocation + tobytes + MetalBuffer copy per literal.
-                input_buffers.append(np.float32(payload).tobytes())
+                # Single scalar — executor builds a shape=[1] MLX array, which
+                # broadcasts in elementwise ops. No n_rows-wide materialization.
+                input_arrays.append(np.asarray([payload], dtype=np.float32))
             else:
                 raise RuntimeError(f"polars_metal: unknown input descriptor {kind!r}")
 
-        out_bytes = _native.execute_fused_expr(
+        # Output-zero-copy: pre-allocate the result array and let the executor
+        # write the MLX output directly into it (one MLX->numpy copy, no PyBytes
+        # round-trip). `pl.Series` then wraps it without copying.
+        out_arr = np.empty(n_rows, dtype=np.float32)
+        # The buffer protocol isn't available under abi3, so hand the executor
+        # raw (ptr, n_elements) pairs. `input_arrays` and `out_arr` are held in
+        # these locals across the fully synchronous call, keeping the borrowed
+        # memory alive (the executor's safety contract).
+        inputs = [(int(a.__array_interface__["data"][0]), int(a.size)) for a in input_arrays]
+        written = _native.execute_fused_expr(
             scope=scope,
-            input_buffers=input_buffers,
+            inputs=inputs,
+            out=(int(out_arr.__array_interface__["data"][0]), int(out_arr.size)),
         )
-        out_arr = np.frombuffer(out_bytes, dtype=np.float32).copy()
-        # Literal-only expressions produce a length-1 output (scalar
-        # broadcast never widened by an n_rows-shaped column). Polars
-        # requires the new column's length to match the frame height, so
-        # broadcast it ourselves before stitching.
-        if out_arr.size == 1 and n_rows != 1:
-            out_arr = np.broadcast_to(out_arr, n_rows).copy()
+        # Literal-only expressions produce a length-1 output (scalar broadcast
+        # never widened by an n_rows-shaped column). Polars requires the new
+        # column's length to match the frame height, so broadcast the single
+        # written value across the pre-allocated array.
+        if written == 1 and n_rows != 1:
+            out_arr.fill(out_arr[0])
         new_columns.append(pl.Series(name, out_arr))
 
     return upstream.with_columns(new_columns)
