@@ -375,11 +375,22 @@ def _walk_select_reduction(nt: Any, exprs: list[Any]) -> WalkResult:
     )
 
 
+# Bare (plain-column) reductions worth routing to MLX on their own: their CPU
+# cost clears the ~1 ms fused-dispatch floor. sum/min/max/mean are bandwidth-
+# bound (a ~0.35 ms memory scan on CPU) and lose ~3x on Metal, so a *lone* one
+# stays on CPU — it only rides to GPU alongside a compute-worthy reduction in
+# the same select (CLAUDE.md principle #3: route on compute intensity, not op
+# identity). Chain-terminated reductions are worthy regardless of op (the chain
+# amortizes the floor) — that lands in a follow-up increment.
+_BARE_GPU_WORTHY_REDUCTIONS: frozenset[str] = frozenset({"std", "var"})
+
+
 def _try_fused_select_reduction(
     nt: Any, exprs: list[Any], in_schema: dict[str, Any]
 ) -> list[dict] | None:
     """Return a list of fused-reduction binding dicts if every expression in
-    `exprs` is a fusion-eligible F32 reduction, else None.
+    `exprs` is a fusion-eligible F32 reduction AND at least one is GPU-worthy,
+    else None.
 
     Each binding carries the analyzed scope, its ordered input descriptors,
     the output column name, and the lowercase agg kind (for the dispatch-side
@@ -410,7 +421,16 @@ def _try_fused_select_reduction(
                 "_agg_kind": agg_kind,
             }
         )
-    return bindings if bindings else None
+    if not bindings:
+        return None
+    # Compute-intensity gate: only route the select to MLX if at least one
+    # reduction is worth the dispatch floor on its own. Otherwise (a select of
+    # only bandwidth-bound bare sum/min/max/mean) leave it to CPU, which is
+    # ~3x faster. `analyze_ir_reduction` is bare-column-only today, so a chain
+    # never reaches here yet; the follow-up increment adds chains as worthy.
+    if not any(b["_agg_kind"] in _BARE_GPU_WORTHY_REDUCTIONS for b in bindings):
+        return None
+    return bindings
 
 
 def _probe_fusion_analyzer(

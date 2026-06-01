@@ -1,12 +1,16 @@
 """M4 Phase 7 (Task 26): full-column F32 reductions route through fused MLX.
 
 `select(pl.col("x").std())` is an empty-key reduction. Before M4 it went to the
-empty-key GroupBy conformance kernel; now a fusion-eligible reduction (sum/mean/
-min/max/std/var of a bare Float32 column) routes through the fused MLX subgraph.
-std/var carry a Bessel correction at the dispatch boundary because MLX uses
-population variance (ddof=0) while Polars defaults to sample (ddof=1). Null
-columns and degenerate (<2-row) inputs fall back to a Polars reduction on the
-source column (MLX over `to_numpy()` would turn nulls into NaN).
+empty-key GroupBy conformance kernel; now a *compute-bound* bare reduction
+(std/var of a Float32 column) routes through the fused MLX subgraph. Bandwidth-
+bound bare reductions (sum/mean/min/max) stay on CPU when alone — they're ~3x
+slower on Metal (the ~1 ms dispatch floor dwarfs a 0.35 ms scan) — but ride to
+GPU alongside a worthy reduction in the same select (see
+`test_reduction_routing.py`). std/var carry a Bessel correction at the dispatch
+boundary because MLX uses population variance (ddof=0) while Polars defaults to
+sample (ddof=1). Null columns and degenerate (<2-row) inputs fall back to a
+Polars reduction on the source column (MLX over `to_numpy()` would turn nulls
+into NaN).
 """
 
 import math
@@ -59,12 +63,24 @@ def test_var_matches_cpu(monkeypatch):
     _check(monkeypatch, lambda: pl.col("x").var().alias("v"), expected_dispatches=1)
 
 
-def test_sum_matches_cpu(monkeypatch):
-    _check(monkeypatch, lambda: pl.col("x").sum().alias("s"), expected_dispatches=1)
+def test_lone_sum_stays_on_cpu(monkeypatch):
+    # Bandwidth-bound: a lone bare sum is ~3x slower on Metal, so it stays on
+    # CPU (0 dispatches) — correct result either way.
+    _check(monkeypatch, lambda: pl.col("x").sum().alias("s"), expected_dispatches=0)
 
 
-def test_mean_matches_cpu(monkeypatch):
-    _check(monkeypatch, lambda: pl.col("x").mean().alias("m"), expected_dispatches=1)
+def test_lone_mean_stays_on_cpu(monkeypatch):
+    _check(monkeypatch, lambda: pl.col("x").mean().alias("m"), expected_dispatches=0)
+
+
+def test_sum_rides_along_with_std(monkeypatch):
+    # A bare sum alongside a compute-worthy std routes to GPU (the dispatch
+    # floor is already paid) — two scalar dispatches.
+    _check(
+        monkeypatch,
+        lambda: [pl.col("x").sum().alias("s"), pl.col("x").std().alias("d")],
+        expected_dispatches=2,
+    )
 
 
 def test_std_and_var_together(monkeypatch):
