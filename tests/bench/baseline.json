@@ -136,24 +136,28 @@
       }
     },
     "phase8_haversine_10m": {
-      "cpu_ms": null,
-      "metal_ms": null,
-      "ratio_metal_over_cpu": null,
+      "cpu_ms": 154.7,
+      "metal_ms": 6.9,
+      "ratio_metal_over_cpu": 0.0446,
       "n_rows": 10000000,
       "hardware": "M2 Ultra",
-      "_notes": "M4 placeholder: Haversine over 10M F32 rows via fused MLX subgraph. Target wall-clock < 6.0 ms; ratio gate set at landing.",
-      "_pending": true,
-      "_target_ms": 6.0
+      "_notes": "Haversine over 10M F32 rows via fused MLX subgraph (zero-copy I/O). Measured 6.9 ms metal vs 154.7 ms CPU = 22.4x on M2 Ultra. Gate: metal must stay >10x faster (ratio < 0.1) to catch a fusion-path regression.",
+      "_pending": false,
+      "_gate": {
+        "ratio_lt": 0.1
+      }
     },
     "phase8_black_scholes_10m": {
-      "cpu_ms": null,
-      "metal_ms": null,
-      "ratio_metal_over_cpu": null,
+      "cpu_ms": 206.2,
+      "metal_ms": 7.3,
+      "ratio_metal_over_cpu": 0.0354,
       "n_rows": 10000000,
       "hardware": "M2 Ultra",
-      "_notes": "M4 placeholder: Black-Scholes-shape log/exp/sqrt/tanh chain. Target wall-clock < 6.0 ms; ratio gate set at landing.",
-      "_pending": true,
-      "_target_ms": 6.0
+      "_notes": "Black-Scholes-shape log/exp/sqrt/tanh chain over 10M F32 (zero-copy I/O). Measured 7.3 ms metal vs 206.2 ms CPU = 28.2x on M2 Ultra. Gate: metal must stay >10x faster (ratio < 0.1) to catch a fusion-path regression.",
+      "_pending": false,
+      "_gate": {
+        "ratio_lt": 0.1
+      }
     },
     "phase8_std_var_10m": {
       "cpu_ms": null,
