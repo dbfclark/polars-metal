@@ -47,8 +47,10 @@ def main() -> None:
     print("=== Correctness check (100k subset) ===")
     df_small = df.head(100_000)
     cpu_small = df_small.lazy().with_columns(cs=pl.col("x").cum_sum()).collect()
-    metal_small = df_small.lazy().with_columns(cs=pl.col("x").cum_sum()).collect(
-        engine=polars_metal.MetalEngine()
+    metal_small = (
+        df_small.lazy()
+        .with_columns(cs=pl.col("x").cum_sum())
+        .collect(engine=polars_metal.MetalEngine())
     )
     max_abs_err = float(np.max(np.abs(cpu_small["cs"].to_numpy() - metal_small["cs"].to_numpy())))
     print(f"  max abs error vs CPU: {max_abs_err:.2e}")
