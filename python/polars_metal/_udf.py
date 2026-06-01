@@ -155,6 +155,7 @@ def _dispatch_hstack_fused(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
         scope = binding["_fused_scope"]
         descriptors: list[tuple[str, str | float]] = binding["_fused_columns"]
         name = binding["name"]
+        null_mode = binding.get("_fused_null_mode")
 
         input_arrays: list[np.ndarray] = []
         for kind, payload in descriptors:
@@ -195,6 +196,21 @@ def _dispatch_hstack_fused(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
         # written value across the pre-allocated array.
         if written == 1 and n_rows != 1:
             out_arr.fill(out_arr[0])
+
+        # Null handling (walker stamped `_fused_null_mode` only when an input
+        # column may have nulls). MLX computed over NaN-filled nulls; Polars
+        # propagates nulls instead. For an "elementwise" chain the output is
+        # null iff any input column is null at that row, so OR the input null
+        # masks and mark those positions null (the NaN data underneath is
+        # ignored by Arrow). The transcendental compute already ran on the GPU.
+        if null_mode == "elementwise":
+            col_names = [payload for kind, payload in descriptors if kind == "col"]
+            null_mask = np.zeros(n_rows, dtype=bool)
+            for col_name in col_names:
+                null_mask |= upstream.get_column(col_name).is_null().to_numpy()
+            if null_mask.any():
+                new_columns.append(pl.Series(name, pa.array(out_arr, mask=null_mask)))
+                continue
         new_columns.append(pl.Series(name, out_arr))
 
     return upstream.with_columns(new_columns)

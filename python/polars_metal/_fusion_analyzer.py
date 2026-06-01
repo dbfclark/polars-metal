@@ -496,6 +496,94 @@ def analyze_ir_reduction(
         return None
 
 
+def null_mode_ir(nt: Any, node_id: int, schema: dict[str, Any]) -> str | None:
+    """Classify how nulls propagate through a fused HStack expression, so the
+    walker can keep null-bearing inputs on the GPU instead of falling back.
+
+    Returns:
+      - ``"elementwise"`` — output is null iff *any* input column is null at
+        that row (arithmetic / transcendental / cast / comparison chains). The
+        dispatch combines the input columns' null masks and attaches them to
+        the output; the value compute stays on the GPU.
+      - ``"where"`` — the expression contains a ``Ternary``/``Where`` whose
+        null mask is data-dependent (``cond_null or (cond ? then_null :
+        else_null)``); handled by a validity subgraph at dispatch.
+      - ``None`` — null semantics we don't reproduce on the fused path:
+        Kleene 3-valued ``And``/``Or``, null-skipping reductions (``Agg``), or
+        cumulative scans (``CumSum``). The walker falls these back to CPU when
+        an input has nulls.
+
+    Recognizes exactly the node set ``_visit_ir_ops`` accepts, so a scope the
+    value-graph builder admitted always classifies here (never desyncs).
+    """
+    state = {"where": False}
+    try:
+        _classify_null_ir(nt, node_id, schema, state)
+    except _Aborted:
+        return None
+    return "where" if state["where"] else "elementwise"
+
+
+def _classify_null_ir(nt: Any, node_id: int, schema: dict[str, Any], state: dict) -> None:
+    """DFS the IR recording whether a data-dependent ``Where`` appears; abort
+    on any op whose null semantics the fused path can't reproduce."""
+    try:
+        node = nt.view_expression(node_id)
+    except Exception as e:
+        raise _Aborted from e
+    cls = type(node).__name__
+
+    if cls in ("Column", "Literal"):
+        return
+
+    if cls == "BinaryExpr":
+        op = getattr(node, "op", None)
+        op_name = getattr(op, "name", None) or str(op).rsplit(".", 1)[-1]
+        op_id = _BINOP_MAP.get(op_name)
+        if op_id is None or op_id in ("LogicalAnd", "LogicalOr"):
+            # LogicalAnd/Or use Kleene 3-valued logic (false&null=false), which
+            # is not the AND-of-validity rule; refuse rather than mis-null.
+            raise _Aborted
+        _classify_null_ir(nt, node.left, schema, state)
+        _classify_null_ir(nt, node.right, schema, state)
+        return
+
+    if cls == "Cast":
+        if getattr(node, "dtype", None) != pl.Float32:
+            raise _Aborted
+        _classify_null_ir(nt, node.expr, schema, state)
+        return
+
+    if cls == "Function":
+        fd = getattr(node, "function_data", ())
+        if not fd:
+            raise _Aborted
+        fn_name = str(fd[0]).lower()
+        if _is_reverse_cumulative(fn_name, fd):
+            raise _Aborted
+        if fn_name not in ("log", "pow") and fn_name not in _IR_FUNCTION_MAP:
+            raise _Aborted
+        if _IR_FUNCTION_MAP.get(fn_name) == "CumSum":
+            # Scan: Polars cum_sum null propagation isn't the AND rule.
+            raise _Aborted
+        for cid in list(getattr(node, "input", [])):
+            _classify_null_ir(nt, cid, schema, state)
+        return
+
+    if cls == "Agg":
+        # Reductions skip nulls; MLX over NaN-filled inputs would not.
+        raise _Aborted
+
+    if cls == "Ternary":
+        state["where"] = True
+        _classify_null_ir(nt, node.predicate, schema, state)
+        _classify_null_ir(nt, node.truthy, schema, state)
+        _classify_null_ir(nt, node.falsy, schema, state)
+        return
+
+    raise _Aborted
+
+
 def _gather_leaves_ir(
     nt: Any,
     node_id: int,

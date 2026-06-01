@@ -81,7 +81,16 @@ from typing import Any
 
 import polars as pl
 
-from polars_metal._fusion_analyzer import analyze_ir_reduction, analyze_ir_with_columns
+from polars_metal._fusion_analyzer import (
+    analyze_ir_reduction,
+    analyze_ir_with_columns,
+    null_mode_ir,
+)
+
+# Null-propagation modes (from `null_mode_ir`) the fused HStack dispatch can
+# reproduce when an input column has nulls. Modes outside this set fall back to
+# CPU. Grows as the dispatch side learns to handle more null semantics.
+_SUPPORTED_FUSED_NULL_MODES: frozenset[str] = frozenset({"elementwise"})
 
 _fusion_log = logging.getLogger("polars_metal.fusion")
 
@@ -472,12 +481,14 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
         nt.set_node(parent_id)
 
     out_exprs: list[dict] = []
-    # Columns read by any fused binding. The fused MLX path ingests each input
-    # via `series.to_numpy()`, which turns nulls into NaN — but Polars
-    # elementwise ops propagate nulls. We can't replay a transcendental chain
-    # on CPU from the wire plan, so if any of these columns has nulls we fall
-    # the whole subtree back to CPU below (see `_fused_inputs_null_free`).
-    fused_input_cols: set[str] = set()
+    # Per fused binding: ``(binding, input_col_names, null_mode)``. The fused
+    # MLX path ingests each input via `series.to_numpy()`, which turns nulls
+    # into NaN — but Polars elementwise ops propagate nulls. After the inner
+    # walk we check (against the Scan leaf) whether each binding's inputs can
+    # have nulls; if so the dispatch reproduces Polars' null semantics for the
+    # binding's `null_mode` (e.g. "elementwise" = union of input null masks),
+    # or — for modes we can't reproduce — the whole subtree falls back to CPU.
+    fused_records: list[tuple[dict, set[str], str | None]] = []
     for e in exprs:
         node_id = getattr(e, "node", None)
         if node_id is None:
@@ -502,13 +513,14 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
                 (name for kind, name in descriptors if kind == "col"),
                 next(iter(in_schema), ""),
             )
-            fused_input_cols.update(name for kind, name in descriptors if kind == "col")
             binding: dict = {
                 "name": output_name,
                 "expr": {"kind": "Column", "name": real_col},
                 "_fused_scope": scope,
                 "_fused_columns": descriptors,
             }
+            binding_cols = {name for kind, name in descriptors if kind == "col"}
+            fused_records.append((binding, binding_cols, null_mode_ir(nt, node_id, in_schema)))
         else:
             expr_dict = _walk_agg_expr_node(nt, node_id, in_schema, _AGG_EXPR_MAX_DEPTH)
             if expr_dict is None:
@@ -524,13 +536,20 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
     if isinstance(inner, FallBack):
         return inner
 
-    # Null guard for the fused path (see `fused_input_cols` above). Only when a
-    # binding actually fuses; the non-fused Rust path handles nulls correctly.
-    if fused_input_cols and not _fused_inputs_null_free(inner.plan, fused_input_cols):
-        return FallBack(
-            reason="fused HStack input column has nulls (or is not a confirmed "
-            "null-free scan column); CPU preserves Polars null semantics"
-        )
+    # Null handling for the fused path. A binding whose inputs are all confirmed
+    # null-free runs the fast path with no per-row mask. When an input may have
+    # nulls, the dispatch reproduces Polars' null semantics for the binding's
+    # mode (stamped as `_fused_null_mode`); modes we can't reproduce
+    # (Kleene And/Or, null-skipping reductions, scans) fall the subtree to CPU.
+    for binding, binding_cols, null_mode in fused_records:
+        if not binding_cols or _fused_inputs_null_free(inner.plan, binding_cols):
+            continue
+        if null_mode not in _SUPPORTED_FUSED_NULL_MODES:
+            return FallBack(
+                reason=f"fused HStack input has nulls and null_mode={null_mode!r} "
+                "is not reproducible on the fused path; CPU preserves Polars null semantics"
+            )
+        binding["_fused_null_mode"] = null_mode
 
     return Handled(
         plan={
