@@ -79,6 +79,8 @@ from datetime import date as _date
 from datetime import datetime as _datetime
 from typing import Any
 
+import polars as pl
+
 from polars_metal._fusion_analyzer import analyze_ir_reduction, analyze_ir_with_columns
 
 _fusion_log = logging.getLogger("polars_metal.fusion")
@@ -470,6 +472,12 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
         nt.set_node(parent_id)
 
     out_exprs: list[dict] = []
+    # Columns read by any fused binding. The fused MLX path ingests each input
+    # via `series.to_numpy()`, which turns nulls into NaN — but Polars
+    # elementwise ops propagate nulls. We can't replay a transcendental chain
+    # on CPU from the wire plan, so if any of these columns has nulls we fall
+    # the whole subtree back to CPU below (see `_fused_inputs_null_free`).
+    fused_input_cols: set[str] = set()
     for e in exprs:
         node_id = getattr(e, "node", None)
         if node_id is None:
@@ -494,6 +502,7 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
                 (name for kind, name in descriptors if kind == "col"),
                 next(iter(in_schema), ""),
             )
+            fused_input_cols.update(name for kind, name in descriptors if kind == "col")
             binding: dict = {
                 "name": output_name,
                 "expr": {"kind": "Column", "name": real_col},
@@ -515,6 +524,14 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
     if isinstance(inner, FallBack):
         return inner
 
+    # Null guard for the fused path (see `fused_input_cols` above). Only when a
+    # binding actually fuses; the non-fused Rust path handles nulls correctly.
+    if fused_input_cols and not _fused_inputs_null_free(inner.plan, fused_input_cols):
+        return FallBack(
+            reason="fused HStack input column has nulls (or is not a confirmed "
+            "null-free scan column); CPU preserves Polars null semantics"
+        )
+
     return Handled(
         plan={
             "kind": "HStack",
@@ -522,6 +539,41 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
             "exprs": out_exprs,
         }
     )
+
+
+def _find_scan_df(plan: dict) -> Any:
+    """Return the captured ``PyDataFrame`` from the (unique) Scan leaf of a
+    walker plan tree, or ``None`` if no Scan leaf carries one."""
+    if plan.get("kind") == "Scan":
+        return plan.get("df")
+    inner = plan.get("input")
+    if isinstance(inner, dict):
+        return _find_scan_df(inner)
+    return None
+
+
+def _fused_inputs_null_free(inner_plan: dict, cols: set[str]) -> bool:
+    """True iff every column in ``cols`` is a confirmed null-free column of the
+    Scan leaf under ``inner_plan``.
+
+    A column not present in the Scan leaf (one computed by an upstream node) is
+    treated as *not confirmed* — we conservatively report False so the caller
+    falls back to CPU. The headline fused shapes (haversine / Black-Scholes)
+    read raw Scan columns directly, so they hit the fast O(1) ``null_count``
+    check (Arrow tracks null_count; clean columns short-circuit). Chained
+    ``with_columns`` over a computed column is rare and stays correct on CPU.
+    """
+    scan_df = _find_scan_df(inner_plan)
+    if scan_df is None:
+        return False
+    df = pl.DataFrame._from_pydf(scan_df)
+    available = set(df.columns)
+    for name in cols:
+        if name not in available:
+            return False
+        if df.get_column(name).null_count() > 0:
+            return False
+    return True
 
 
 def _walk_sort(nt: Any, node: Any) -> WalkResult:
