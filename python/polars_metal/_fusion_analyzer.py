@@ -358,7 +358,19 @@ _IR_FUNCTION_MAP: dict[str, str] = {
     "floor": "Floor",
     "ceil": "Ceil",
     "round": "Round",
+    # Cumulative scan (Phase 7 Task 28). Polars encodes `cum_sum` as a
+    # Function whose function_data is ('cum_sum', reverse: bool). MLX's binding
+    # is forward-only, so reverse=True falls back to CPU (see the guards in
+    # `_gather_leaves_ir` / `_visit_ir_ops`).
+    "cum_sum": "CumSum",
 }
+
+
+def _is_reverse_cumulative(fn_name: str, fd: tuple) -> bool:
+    """True for a reverse cumulative scan, which has no MLX forward-only
+    binding and must fall back to CPU. `fd` is the Function.function_data
+    tuple, e.g. ('cum_sum', True)."""
+    return fn_name == "cum_sum" and len(fd) > 1 and bool(fd[1])
 
 
 def analyze_ir_expression(nt: Any, node_id: int, schema: dict[str, Any]) -> PyFusionScope | None:
@@ -491,6 +503,8 @@ def _gather_leaves_ir(
         fn_inputs = list(getattr(node, "input", []))
         if fn_name != "log" and fn_name != "pow" and fn_name not in _IR_FUNCTION_MAP:
             raise _Aborted
+        if _is_reverse_cumulative(fn_name, fd):
+            raise _Aborted
         for cid in fn_inputs:
             _gather_leaves_ir(nt, cid, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup)
         return
@@ -566,6 +580,8 @@ def _visit_ir_ops(
             raise _Aborted
         fn_name = str(fd[0]).lower()
         fn_inputs = list(getattr(node, "input", []))
+        if _is_reverse_cumulative(fn_name, fd):
+            raise _Aborted
         if fn_name == "log":
             return _visit_ir_log_ops(nt, fn_inputs, schema, scope, leaf_idx)
         if fn_name == "pow":

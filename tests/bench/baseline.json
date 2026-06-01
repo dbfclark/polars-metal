@@ -190,14 +190,16 @@
       "_target_ms": 10.0
     },
     "phase8_cumsum_f32_10m": {
-      "cpu_ms": null,
-      "metal_ms": null,
-      "ratio_metal_over_cpu": null,
+      "cpu_ms": 38.0,
+      "metal_ms": 8.4,
+      "ratio_metal_over_cpu": 0.2211,
       "n_rows": 10000000,
       "hardware": "M2 Ultra",
-      "_notes": "M4 placeholder: Cumsum on F32 column via MLX parallel scan. Target wall-clock < 8.0 ms; ratio gate set at landing.",
-      "_pending": true,
-      "_target_ms": 8.0
+      "_notes": "Cumsum on 10M F32 via MLX parallel scan (HStack fused path). Measured 8.4 ms metal vs 38.0 ms CPU = 4.5x on M2 Ultra. Lower than the transcendental chains because a scan is bandwidth-bound. Gate ratio_lt 0.45 (metal must stay >2.2x faster) catches a fusion-path regression with headroom.",
+      "_pending": false,
+      "_gate": {
+        "ratio_lt": 0.45
+      }
     },
     "phase8_corr_matrix_200x200k": {
       "cpu_ms": null,
