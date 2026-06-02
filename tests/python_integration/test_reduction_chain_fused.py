@@ -62,9 +62,48 @@ def test_chain_std_uses_gpu():
     assert_frame_equal(lf.collect(engine=eng), lf.collect(), check_exact=False, rel_tol=1e-3)
 
 
-def test_chain_with_nulls_falls_back():
+def _null_df(n=5_000):
+    rng = np.random.default_rng(0xC4)
+    x = (np.abs(rng.standard_normal(n)) + 0.1).astype(np.float32)
+    df = pl.DataFrame({"x": x})
+    return df.with_columns(
+        pl.when(pl.int_range(pl.len()) % 9 == 0).then(None).otherwise(pl.col("x")).alias("x")
+    )
+
+
+def test_null_chain_falls_back_to_cpu():
+    """A chain reduction over a null-bearing column falls back to CPU. The
+    chain's null propagation + reduction null-skip can't be replayed from the
+    wire plan, and running it on the GPU doesn't pay off — null marshalling
+    (NaN-injecting to_numpy + mask + host reduce) costs more than it saves
+    except for heavy chains (measured 2026-06-02; see open-questions.md)."""
     eng = polars_metal.MetalEngine()
-    df = pl.DataFrame({"x": pl.Series([1.0, None, 3.0, 4.0, 5.0], dtype=pl.Float32)})
+    df = _null_df()
+    assert df["x"].null_count() > 0
     lf = df.lazy().select(pl.col("x").log().exp().sum().alias("r"))
-    assert _dispatches(lf, eng) == 0, "chain over a null column must fall back to CPU"
+    assert _dispatches(lf, eng) == 0, "null-bearing chain must fall back to CPU"
     assert_frame_equal(lf.collect(engine=eng), lf.collect(), check_exact=False, rel_tol=1e-3)
+
+
+def test_null_where_chain_matches_cpu():
+    eng = polars_metal.MetalEngine()
+    lf = (
+        _null_df()
+        .lazy()
+        .select(pl.when(pl.col("x") > 1.0).then(pl.col("x").sqrt()).otherwise(0.0).sum().alias("r"))
+    )
+    assert _dispatches(lf, eng) == 0
+    assert_frame_equal(lf.collect(engine=eng), lf.collect(), check_exact=False, rel_tol=1e-3)
+
+
+def test_tiny_chain_matches_cpu():
+    """Degenerate n on a null-free chain: empty / single-row reductions match
+    Polars (sum=0.0 on empty; std/var of <2 rows are null)."""
+    eng = polars_metal.MetalEngine()
+    for data in ([], [2.0], [3.0, 4.0]):
+        df = pl.DataFrame({"x": pl.Series(data, dtype=pl.Float32)})
+        lf = df.lazy().select(
+            (pl.col("x") * 2.0).sum().alias("s"),
+            (pl.col("x") * 2.0).std().alias("d"),
+        )
+        assert_frame_equal(lf.collect(engine=eng), lf.collect(), check_exact=False, rel_tol=1e-3)

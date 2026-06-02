@@ -439,10 +439,14 @@ def _fused_reduction_nulls_ok(fused_aggs: list[dict], inner_plan: dict) -> bool:
     """True iff every chain reduction's input columns are confirmed null-free.
 
     A bare reduction handles nulls in the dispatch (replaying the reduction on
-    the source column). A *chain* reduction can't — Polars propagates nulls
-    through the chain then the reduction skips them, and we can't replay that
-    from the wire plan — so a chain over a possibly-null column must fall back
-    to CPU. Reuses the Scan-leaf null check from the HStack path."""
+    the source column). A *chain* reduction can't be replayed from the wire
+    plan, and running it on the GPU for null data doesn't pay off — the null
+    marshalling (NaN-injecting `to_numpy` + mask + host reduction) costs more
+    than it saves except for heavy chains, and is incorrect to shortcut for
+    `where` chains (a null cond keeps the else branch valid). So a chain over a
+    possibly-null column falls back to CPU. Reuses the Scan-leaf null check
+    from the HStack path. (Measured 2026-06-02 — see docs/open-questions.md.)
+    """
     chain_cols: set[str] = set()
     for b in fused_aggs:
         if b.get("_is_chain"):

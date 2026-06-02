@@ -455,3 +455,34 @@ up:
   plan-capture recognizer (`lf.serialize` exposes them), a viewable data layout
   (D separate F32 columns -> MAC chain through the existing fused path), or an
   upstream polars-python change exposing these exprs to the visitor.
+
+---
+
+## Null-bearing chain reductions: GPU not worth it (measured 2026-06-02)
+
+**Question:** a chain reduction over a null column (e.g. `(x.log().exp()).sum()`
+with nulls) can't be replayed from the wire plan (the fused scope is GPU-only;
+no CPU-evaluable AST). Should we compute it on the GPU instead of falling back?
+
+**Tried two builds:**
+1. *Naive* (chain → null-correct Polars Series via the HStack path → host
+   reduce): **65 ms vs 44 ms CPU** at 10M for `log().exp().sum()` — a loss. The
+   cost is null marshalling: `to_numpy()` on a null F32 column NaN-injects
+   (~27 ms), `pa.array(out, mask=...)` builds the masked Series (~20 ms).
+2. *Optimized* (raw Arrow F32 buffer in, skipping NaN-inject; numpy `where=`
+   reduction, skipping the Series build): `log().exp().sum()` 28 ms (**1.5×**,
+   a win), but `(x*3).min()` 27 ms vs 5 ms CPU (**0.2×**) and `(x*2+1).std()`
+   46 ms vs 16 ms (**0.4×**) — still losses. Irreducible overhead: `is_null`
+   mask (~8 ms) + the host reduction itself (numpy min ~5 ms, std two-pass
+   ~20 ms). Only **heavy chain + cheap reduction** clears it. Worse, raw
+   buffers are **incorrect for `where` chains**: a null cond keeps the `else`
+   branch *valid* (value 0.0), but the GPU chain over garbage computes the
+   `then` branch there → wrong result. `where` chains need the NaN-inject
+   path, which erases the win.
+
+**Decision (dbfclark): fall back null chains to CPU** (the behavior shipped in
+b2ae73a). Capturing only the winning slice (heavy elementwise chain + sum/min/
+max) would need an elementwise-only + compute-density gate + a `where` carve-
+out — too much machinery for a ~1.5× win on one shape. Null-*free* chains keep
+their big GPU wins (Increment 2). If revisited, the lever is reducing the ~8 ms
+`is_null` cost and host-reduction cost, or a density gate.
