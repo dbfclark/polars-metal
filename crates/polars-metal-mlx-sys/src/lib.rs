@@ -12,6 +12,19 @@
 mod error;
 pub use error::FfiError;
 
+pub mod array;
+pub mod elementwise;
+pub mod fft;
+pub mod matmul;
+pub mod reduce;
+pub mod scan;
+pub mod sort;
+
+// cxx's SharedPtr<T> implementation expands a panic! macro in the generated
+// Rust glue (inside SharedPtr::is_null()'s unreachable branch). This is
+// internal to the cxx crate and cannot be suppressed at the call site.
+// Allow clippy::panic for this module only.
+#[allow(clippy::panic)]
 #[cxx::bridge(namespace = "polars_metal_mlx")]
 mod ffi {
     unsafe extern "C++" {
@@ -32,6 +45,207 @@ mod ffi {
         // into the caller's output slice — those are the only data-touching
         // passes left in this call. T30 Step 3 / `docs/open-questions.md`.
         fn cumsum_u8_to_u32(input: &[u8], output: &mut [u32]) -> Result<()>;
+
+        // M4 Phase 1: array construction + eval + readback.
+        //
+        // MlxArray is a type alias for mlx::core::array on the C++ side,
+        // exposed here as an opaque cxx type. All access is via SharedPtr
+        // so the MLX refcount manages lifetime (drop is refcount decrement).
+        type MlxArray;
+
+        // Construct a 1-D F32 array from a raw pointer + length. The MLX
+        // `array(ptr, shape, dtype)` constructor copies the input bytes into
+        // MLX-owned memory (one memcpy). Returns a null SharedPtr on failure.
+        // SAFETY: `data` must point to at least `n` valid f32 values.
+        unsafe fn mlx_array_from_f32_data(
+            data: *const f32,
+            n: usize,
+        ) -> Result<SharedPtr<MlxArray>>;
+
+        // Return the shape of `arr` as a Vec<u64>. Wraps `arr->shape()`.
+        fn mlx_array_shape(arr: &SharedPtr<MlxArray>) -> Vec<u64>;
+
+        // Return true iff `arr`'s dtype is mlx::core::float32.
+        fn mlx_array_is_f32(arr: &SharedPtr<MlxArray>) -> bool;
+
+        // Copy `n` f32 values from the materialized array into the
+        // caller-provided buffer. Must be called after `mlx_array_eval_one`.
+        // SAFETY: `out` must point to a buffer of at least `n` f32 values.
+        unsafe fn mlx_array_copy_to_f32(arr: &SharedPtr<MlxArray>, out: *mut f32, n: usize);
+
+        // Force evaluation (materialize) of a single array. Wraps
+        // `mlx::core::eval(*arr)`. Returns Err on any MLX exception.
+        fn mlx_array_eval_one(arr: &SharedPtr<MlxArray>) -> Result<()>;
+
+        // Construct a zero-copy view of an existing MTL::Buffer as an MLX array.
+        //
+        // `mtl_ptr` must be a valid `MTL::Buffer*` cast to `*const u8` (cxx maps
+        // `*const u8` cleanly; we use it as an opaque pointer carrier — the C++
+        // side casts it back to `const void*` before wrapping in
+        // `mlx::core::allocator::Buffer`).  `shape` specifies the array
+        // dimensions; their product must equal the element count implied by the
+        // buffer's byte length and `dtype`. `dtype` is the `MlxDtype` tag cast to
+        // `u32` (0=F32, 1=F64, 2=I32, 3=Bool).
+        //
+        // MLX is given a no-op Deleter so it never tries to free the buffer; the
+        // Rust side (via `_input_refs` in `MlxArrayHandle`) holds the keep-alive.
+        //
+        // SAFETY: `mtl_ptr` must remain valid for the lifetime of every
+        // `MlxArrayHandle` that was built from it (enforced by `_input_refs`).
+        unsafe fn mlx_array_view_mtl_buffer(
+            mtl_ptr: *const u8,
+            shape: &[i64],
+            dtype: u32,
+        ) -> Result<SharedPtr<MlxArray>>;
+
+        // M4 Phase 1 Task 6: elementwise op bindings.
+        // Each takes one or more SharedPtr<MlxArray> args and returns a fresh
+        // SharedPtr<MlxArray> representing the graph node (lazy; eval to materialize).
+        // Operations throw on dtype/shape mismatch, which propagates via Result<>.
+
+        fn mlx_op_add(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_sub(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_mul(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_div(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_mod(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_pow(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_eq(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_ne(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_lt(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_le(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_gt(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_ge(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_logical_and(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_logical_or(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_logical_not(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_neg(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_abs(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_square(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_where(
+            cond: &SharedPtr<MlxArray>,
+            then_v: &SharedPtr<MlxArray>,
+            else_v: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+
+        // SAFETY: `data` must point to at least `n` valid u8 values (each representing
+        // a bool: 0=false, non-zero=true), or be null when `n == 0`.
+        unsafe fn mlx_array_from_bool_data(
+            data: *const u8,
+            n: usize,
+        ) -> Result<SharedPtr<MlxArray>>;
+
+        // M4 Phase 1 Task 7: transcendentals + roots + rounding + atan2 + cast.
+
+        fn mlx_op_sin(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_cos(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_tan(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_sinh(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_cosh(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_tanh(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_asin(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_acos(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_atan(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_log(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_log2(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_log10(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_log1p(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_exp(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_exp2(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_sqrt(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_cbrt(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_floor(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_ceil(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_round(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_atan2(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_cast(a: &SharedPtr<MlxArray>, dtype: u32) -> Result<SharedPtr<MlxArray>>;
+
+        // M4 Phase 1 Task 8: reduction bindings.
+
+        fn mlx_op_sum_all(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_mean_all(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_min_all(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_max_all(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_std_all(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_var_all(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_argmin_all(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_argmax_all(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_sum_axis(a: &SharedPtr<MlxArray>, axis: i32) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_mean_axis(a: &SharedPtr<MlxArray>, axis: i32) -> Result<SharedPtr<MlxArray>>;
+
+        // M4 Phase 1 Task 9: sort + argpartition.
+
+        fn mlx_op_sort(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_argpartition(a: &SharedPtr<MlxArray>, kth: i32) -> Result<SharedPtr<MlxArray>>;
+
+        // M4 Phase 1 Task 10: cumulative scans + matmul + fft.
+
+        fn mlx_op_cumsum(a: &SharedPtr<MlxArray>, axis: i32) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_cumprod(a: &SharedPtr<MlxArray>, axis: i32) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_cummax(a: &SharedPtr<MlxArray>, axis: i32) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_cummin(a: &SharedPtr<MlxArray>, axis: i32) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_matmul(
+            a: &SharedPtr<MlxArray>,
+            b: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_fft_1d(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_ifft_1d(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_real(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_imag(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
     }
 }
 

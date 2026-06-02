@@ -34,6 +34,11 @@ thiserror = "1"
 criterion = "0.5"
 proptest = "1"
 rand = "0.8"
+# Test-only access to the IR types so signature tests can exercise the
+# IR → kernel-layer descriptor conversion path. Cargo permits this
+# dev-dep cycle (polars-metal-core depends on polars-metal-kernels) by
+# only linking it for the test binaries.
+polars-metal-core = { path = "../polars-metal-core" }
 
 [[bench]]
 name = "cmp_i64"
@@ -61,6 +66,18 @@ harness = false
 
 [[bench]]
 name = "groupby_aggregate"
+harness = false
+
+[[bench]]
+name = "aggregate_fused"
+harness = false
+
+[[bench]]
+name = "groupby_build_partitioned"
+harness = false
+
+[[bench]]
+name = "groupby_build_sort"
 harness = false
 
 [lints]

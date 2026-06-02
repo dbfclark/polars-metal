@@ -94,6 +94,40 @@ fn parse_and_route(
             lifting.set(id.clone(), cost::decide_groupby(n_rows));
             Ok(id)
         }
+        "Sort" => {
+            let input_obj = dict
+                .get_item("input")?
+                .ok_or_else(|| PyKeyError::new_err("Sort: missing input"))?;
+            let input_dict: Bound<PyDict> = input_obj.downcast_into()?;
+            let child_id = parse_and_route(&input_dict, next_seq, lifting)?;
+            let id = NodeId::new("Sort", *next_seq);
+            *next_seq += 1;
+            let child_decision = lifting
+                .get(&child_id)
+                .cloned()
+                .unwrap_or(NodeDecision::Fallback("missing child decision".into()));
+            lifting.set(id.clone(), child_decision);
+            Ok(id)
+        }
+        "HStack" => {
+            // HStack is a metadata-only node from the router's perspective —
+            // the appended columns are evaluated via Polars in the Python
+            // dispatch path before the downstream GroupBy/etc. consumes
+            // them. Inherit the child's decision (mirrors Project / Sort).
+            let input_obj = dict
+                .get_item("input")?
+                .ok_or_else(|| PyKeyError::new_err("HStack: missing input"))?;
+            let input_dict: Bound<PyDict> = input_obj.downcast_into()?;
+            let child_id = parse_and_route(&input_dict, next_seq, lifting)?;
+            let id = NodeId::new("HStack", *next_seq);
+            *next_seq += 1;
+            let child_decision = lifting
+                .get(&child_id)
+                .cloned()
+                .unwrap_or(NodeDecision::Fallback("missing child decision".into()));
+            lifting.set(id.clone(), child_decision);
+            Ok(id)
+        }
         other => {
             // Walk a single "input" if present so seq numbering matches
             // the walker's post-order traversal.
@@ -129,7 +163,7 @@ fn peek_input_row_count(dict: &Bound<PyDict>) -> PyResult<usize> {
                 .extract()?;
             Ok(n)
         }
-        "Project" | "Filter" | "GroupBy" => {
+        "Project" | "Filter" | "GroupBy" | "Sort" | "HStack" => {
             let input_obj = dict
                 .get_item("input")?
                 .ok_or_else(|| PyKeyError::new_err("missing 'input' in row-count peek"))?;

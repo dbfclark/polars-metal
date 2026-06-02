@@ -42,6 +42,14 @@ pub enum KeyDtype {
     Bool,
     I32,
     F32,
+    // M3 additions
+    I8,
+    I16,
+    U8,
+    U16,
+    U32,
+    // M3 Phase 7: dictionary-encoded, 32-bit codes + dict carried in schema.
+    Utf8,
 }
 
 impl KeyDtype {
@@ -50,7 +58,9 @@ impl KeyDtype {
         match self {
             KeyDtype::I64 | KeyDtype::F64 => 64,
             KeyDtype::Bool => 1,
-            KeyDtype::I32 | KeyDtype::F32 => 32,
+            KeyDtype::I32 | KeyDtype::F32 | KeyDtype::U32 | KeyDtype::Utf8 => 32,
+            KeyDtype::I16 | KeyDtype::U16 => 16,
+            KeyDtype::I8 | KeyDtype::U8 => 8,
         }
     }
 }
@@ -67,6 +77,11 @@ pub struct KeyColumn<'a> {
     /// Bit-packed validity bitmap, `ceil(n_rows / 8)` bytes minimum.
     pub valid: &'a [u8],
     pub n_rows: usize,
+    /// Only present for KeyDtype::Utf8. Caller must build the dict via
+    /// `polars_metal_buffer::dict::build_dict_nullable` (or similar) and
+    /// supply the resulting `Vec<String>` here; `data` then holds the
+    /// u32 codes as little-endian bytes. None for all other dtypes.
+    pub dict: Option<Vec<String>>,
 }
 
 /// One field's position in the encoded u128 lane. Both fields and
@@ -79,11 +94,19 @@ pub struct KeyField {
     pub null_bit_offset: u32,
     /// Bit position of this field's data, immediately following the null bit.
     pub data_bit_offset: u32,
+    /// Only present when dtype == Utf8. Carries the dictionary so
+    /// `decode_keys` can map u32 codes back to strings.
+    pub dict: Option<Vec<String>>,
 }
 
 /// Schema for a composite-key encoding. Sufficient to decode an encoded
 /// u128 stream back to per-column values.
-#[derive(Debug, Clone)]
+///
+/// The `Default` impl yields an empty schema (no fields, 0 bits) — used
+/// by the empty-keys (single-group) reduction path in `dispatch_groupby`
+/// / `dispatch_groupby_fused`, where no encoding occurs and the schema
+/// is only passed through for shape consistency.
+#[derive(Debug, Clone, Default)]
 pub struct KeySchema {
     fields: Vec<KeyField>,
     total_bits: u32,
@@ -123,6 +146,8 @@ pub enum KeyEncodeError {
         got: usize,
         need: usize,
     },
+    #[error("KeyColumn for {col:?} has dtype Utf8 but no dict")]
+    Utf8MissingDict { col: String },
 }
 
 /// Encode `cols` to a `Vec<u128>` (one u128 per row). Returns the
@@ -147,9 +172,16 @@ pub fn encode_keys(cols: &[KeyColumn<'_>]) -> Result<(Vec<u128>, KeySchema), Key
     for c in cols {
         let need_data = match c.dtype {
             KeyDtype::I64 | KeyDtype::F64 => n_rows * 8,
-            KeyDtype::I32 | KeyDtype::F32 => n_rows * 4,
+            KeyDtype::I32 | KeyDtype::F32 | KeyDtype::U32 | KeyDtype::Utf8 => n_rows * 4,
+            KeyDtype::I16 | KeyDtype::U16 => n_rows * 2,
+            KeyDtype::I8 | KeyDtype::U8 => n_rows,
             KeyDtype::Bool => min_valid_bytes,
         };
+        if c.dtype == KeyDtype::Utf8 && c.dict.is_none() {
+            return Err(KeyEncodeError::Utf8MissingDict {
+                col: c.name.clone(),
+            });
+        }
         if c.data.len() < need_data {
             return Err(KeyEncodeError::DataTooShort {
                 col: c.name.clone(),
@@ -178,51 +210,86 @@ pub fn encode_keys(cols: &[KeyColumn<'_>]) -> Result<(Vec<u128>, KeySchema), Key
             dtype: c.dtype,
             null_bit_offset,
             data_bit_offset,
+            dict: c.dict.clone(),
         });
         offset += field_bits;
     }
     let total_bits = offset;
 
-    let mut encoded = vec![0u128; n_rows];
-    for (field_idx, c) in cols.iter().enumerate() {
-        let field = &fields[field_idx];
-        for (row, lane) in encoded.iter_mut().enumerate() {
-            let valid_byte = c.valid[row >> 3];
-            let valid_bit = (valid_byte >> (row & 7)) & 1;
-            if valid_bit == 0 {
-                *lane |= 1u128 << field.null_bit_offset;
-                continue;
+    // Parallelize over rows. Each row is independent (different lane);
+    // each column appends bits into its row's lane with disjoint bit
+    // ranges (null_bit_offset + data_bit_offset are per-field). We
+    // rayon-parallelize the row loop and let each thread compute its
+    // lane sequentially over all fields. ~6× speedup at 10M rows × 2
+    // keys vs the serial loop.
+    use rayon::prelude::*;
+    let encoded: Vec<u128> = (0..n_rows)
+        .into_par_iter()
+        .map(|row| {
+            let mut lane: u128 = 0;
+            for (field_idx, c) in cols.iter().enumerate() {
+                let field = &fields[field_idx];
+                let valid_byte = c.valid[row >> 3];
+                let valid_bit = (valid_byte >> (row & 7)) & 1;
+                if valid_bit == 0 {
+                    lane |= 1u128 << field.null_bit_offset;
+                    continue;
+                }
+                let data_value: u128 = match c.dtype {
+                    KeyDtype::I64 => {
+                        let mut bytes = [0u8; 8];
+                        bytes.copy_from_slice(&c.data[row * 8..(row + 1) * 8]);
+                        i64::from_le_bytes(bytes) as u64 as u128
+                    }
+                    KeyDtype::F64 => {
+                        let mut bytes = [0u8; 8];
+                        bytes.copy_from_slice(&c.data[row * 8..(row + 1) * 8]);
+                        f64::from_le_bytes(bytes).to_bits() as u128
+                    }
+                    KeyDtype::I32 => {
+                        let mut bytes = [0u8; 4];
+                        bytes.copy_from_slice(&c.data[row * 4..(row + 1) * 4]);
+                        i32::from_le_bytes(bytes) as u32 as u128
+                    }
+                    KeyDtype::F32 => {
+                        let mut bytes = [0u8; 4];
+                        bytes.copy_from_slice(&c.data[row * 4..(row + 1) * 4]);
+                        f32::from_le_bytes(bytes).to_bits() as u128
+                    }
+                    KeyDtype::U32 | KeyDtype::Utf8 => {
+                        let mut bytes = [0u8; 4];
+                        bytes.copy_from_slice(&c.data[row * 4..(row + 1) * 4]);
+                        u32::from_le_bytes(bytes) as u128
+                    }
+                    KeyDtype::I16 => {
+                        let mut bytes = [0u8; 2];
+                        bytes.copy_from_slice(&c.data[row * 2..(row + 1) * 2]);
+                        i16::from_le_bytes(bytes) as u16 as u128
+                    }
+                    KeyDtype::U16 => {
+                        let mut bytes = [0u8; 2];
+                        bytes.copy_from_slice(&c.data[row * 2..(row + 1) * 2]);
+                        u16::from_le_bytes(bytes) as u128
+                    }
+                    KeyDtype::I8 => {
+                        let byte = c.data[row];
+                        i8::from_le_bytes([byte]) as u8 as u128
+                    }
+                    KeyDtype::U8 => {
+                        let byte = c.data[row];
+                        u8::from_le_bytes([byte]) as u128
+                    }
+                    KeyDtype::Bool => {
+                        let byte = c.data[row >> 3];
+                        let bit = (byte >> (row & 7)) & 1;
+                        bit as u128
+                    }
+                };
+                lane |= data_value << field.data_bit_offset;
             }
-            let data_value: u128 = match c.dtype {
-                KeyDtype::I64 => {
-                    let mut bytes = [0u8; 8];
-                    bytes.copy_from_slice(&c.data[row * 8..(row + 1) * 8]);
-                    i64::from_le_bytes(bytes) as u64 as u128
-                }
-                KeyDtype::F64 => {
-                    let mut bytes = [0u8; 8];
-                    bytes.copy_from_slice(&c.data[row * 8..(row + 1) * 8]);
-                    f64::from_le_bytes(bytes).to_bits() as u128
-                }
-                KeyDtype::I32 => {
-                    let mut bytes = [0u8; 4];
-                    bytes.copy_from_slice(&c.data[row * 4..(row + 1) * 4]);
-                    i32::from_le_bytes(bytes) as u32 as u128
-                }
-                KeyDtype::F32 => {
-                    let mut bytes = [0u8; 4];
-                    bytes.copy_from_slice(&c.data[row * 4..(row + 1) * 4]);
-                    f32::from_le_bytes(bytes).to_bits() as u128
-                }
-                KeyDtype::Bool => {
-                    let byte = c.data[row >> 3];
-                    let bit = (byte >> (row & 7)) & 1;
-                    bit as u128
-                }
-            };
-            *lane |= data_value << field.data_bit_offset;
-        }
-    }
+            lane
+        })
+        .collect();
 
     Ok((
         encoded,
@@ -333,16 +400,15 @@ pub fn dispatch_hash(
     Ok(())
 }
 
-/// Output of the build phase.
-pub struct BuildOutput {
-    /// `row_to_group[i]` = group ID for row i.
-    pub row_to_group: Vec<u32>,
-    /// Total number of distinct groups produced by the build.
-    pub group_count: u32,
-    /// `first_row_per_group[g]` = a representative source-row index for
-    /// group g, used to reconstruct key columns in the result.
-    pub first_row_per_group: Vec<u32>,
-}
+/// Output of the build phase. Fields: `row_to_group`, `n_groups`,
+/// `first_row_per_group`.
+///
+/// Re-exported from `crate::groupby_build_partitioned` so the CPU build
+/// (`dispatch_build`), the GPU A1 build (`partition_and_build`), and
+/// the A2 sort-based build (`sort_and_segment`) all return the same
+/// shape — the engine's UDF dispatch can swap among them without
+/// adapter code.
+pub use crate::groupby_build_partitioned::BuildOutput;
 
 /// Dispatch the `groupby_build` phase.
 ///
@@ -365,24 +431,22 @@ pub struct BuildOutput {
 ///    the contested slots settle, especially when many rows hash to a small
 ///    cluster of keys.
 ///
-/// Both failure modes produce 0xFFFFFFFF sentinels in `row_to_group` and
-/// manifest as equivalence-class divergence in the proptest.
+/// The CPU build path remains correct, simple, and fast for the small
+/// cardinalities that dominate typical workloads. Phase 4 / 4.5 added a
+/// GPU build (capability A1 — `partition_and_build_with_scratch`) that
+/// wins at high row counts and low-to-medium cardinality. The router
+/// here picks A1 above [`A1_ROWS_THRESHOLD`] and falls back to CPU on
+/// A1 overflow (cardinality exceeds A1's TGSM capacity).
 ///
-/// The build phase is NOT where GPU parallelism pays off for GroupBy:
-/// the key cardinality is small (≤ millions of groups vs. ≥ billions of
-/// rows), so the table fills quickly and most threads merely lookup an
-/// existing key.  The aggregation phase (Phase 6 shaders) IS where the
-/// parallelism matters — one thread per row, no contention.
-///
-/// **Conclusion**: run the build phase on CPU using a `HashMap`, which is
-/// correct, simple, and fast for realistic cardinalities.  The aggregation
-/// kernels receive the CPU-produced `row_to_group` mapping and run fully
-/// on-GPU.
+/// Empirical crossover from `tests/bench_cpu_build_compare.rs`:
+///   - 100K rows: CPU wins (A1 is 3-5× slower; GPU dispatch overhead dominates)
+///   - 1M rows × 1024 groups: A1 ~2× CPU win
+///   - 10M rows × 1024 groups: A1 ~4× CPU win
+///   - >16K unique groups: A1 overflows; CPU is the fallback
 ///
 /// `hashes` is accepted but unused (kept in the signature for API
-/// compatibility — callers that compute hashes for the GPU hash kernel can
-/// pass them here without branching).
-#[allow(unused_variables)]
+/// compatibility — callers that compute hashes for the GPU hash kernel
+/// can pass them here without branching).
 pub fn dispatch_build(
     device: &MetalDevice,
     queue: &mut CommandQueue,
@@ -390,13 +454,13 @@ pub fn dispatch_build(
     hashes: &[u32],
     n_rows: usize,
 ) -> Result<BuildOutput, GroupByError> {
-    let _ = device;
     let _ = queue;
+    let _ = hashes;
 
     if n_rows == 0 {
         return Ok(BuildOutput {
             row_to_group: vec![],
-            group_count: 0,
+            n_groups: 0,
             first_row_per_group: vec![],
         });
     }
@@ -408,16 +472,37 @@ pub fn dispatch_build(
         });
     }
 
-    // Open-addressing hash table on CPU.  Uses `HashMap` for simplicity
-    // and correctness; a raw linear-probe table would be faster but the
-    // build phase is not the bottleneck for typical GroupBy workloads.
+    // A1 (GPU) path for inputs large enough that the GPU dispatch +
+    // host↔device traffic amortizes. Falls back to CPU on overflow.
+    if n_rows >= A1_ROWS_THRESHOLD {
+        if let Some(out) = try_a1_build(device, &encoded[..n_rows]) {
+            return Ok(out);
+        }
+        // None ⇒ A1 overflowed or hit a transient dispatch error; fall
+        // through to CPU.
+    }
+
+    cpu_hashmap_build(&encoded[..n_rows])
+}
+
+/// Row-count crossover above which A1 is empirically faster than CPU.
+/// Measured 2026-05-26 on M2 Ultra: at 1M rows × 4 groups, A1 = 9.1ms
+/// vs CPU = 10.7ms (tied); at 1M × 1024 groups, A1 = 6.5ms vs CPU =
+/// 13.2ms. Below 500K, CPU is faster. Conservative threshold leaves
+/// some margin for jitter.
+pub const A1_ROWS_THRESHOLD: usize = 500_000;
+
+/// CPU HashMap build (original M2 path; remains the fallback for small
+/// inputs and high-cardinality cases where A1 overflows).
+fn cpu_hashmap_build(encoded: &[u128]) -> Result<BuildOutput, GroupByError> {
+    let n_rows = encoded.len();
     let mut group_for_key: std::collections::HashMap<u128, u32> =
         std::collections::HashMap::with_capacity(n_rows.min(1 << 20));
     let mut next_gid: u32 = 0;
     let mut row_to_group = Vec::with_capacity(n_rows);
     let mut first_row_per_group: Vec<u32> = Vec::new();
 
-    for (row, &key) in encoded[..n_rows].iter().enumerate() {
+    for (row, &key) in encoded.iter().enumerate() {
         let gid = *group_for_key.entry(key).or_insert_with(|| {
             let g = next_gid;
             next_gid = next_gid.checked_add(1).unwrap_or(u32::MAX);
@@ -429,9 +514,48 @@ pub fn dispatch_build(
 
     Ok(BuildOutput {
         row_to_group,
-        group_count: next_gid,
+        n_groups: next_gid,
         first_row_per_group,
     })
+}
+
+/// Try A1 GPU build using the process-wide [`BuildScratch`] arena.
+/// Returns `Some(BuildOutput)` on success, `None` on
+/// [`PartitionedBuildError::Overflow`] (caller should fall back to CPU).
+/// Other dispatch errors are converted to `None` and likewise route to
+/// CPU — A1 is the optimization; correctness comes from the CPU path.
+fn try_a1_build(device: &MetalDevice, encoded: &[u128]) -> Option<BuildOutput> {
+    use crate::groupby_build_partitioned::gpu::partition_and_build_with_scratch;
+    use crate::groupby_build_partitioned::PartitionedBuildError;
+
+    let scratch_mutex = a1_scratch(device)?;
+    let mut scratch = scratch_mutex.lock().ok()?;
+    match partition_and_build_with_scratch(device, &mut scratch, encoded, 16) {
+        Ok(out) => Some(out),
+        Err(PartitionedBuildError::Overflow) => None,
+        Err(_) => None,
+    }
+}
+
+/// Process-wide A1 scratch arena, lazily initialized on first GPU build
+/// dispatch. One per device — Polars currently uses a single device.
+/// `Mutex` serializes concurrent queries, which is fine because the
+/// polars callback layer runs queries one at a time per process.
+///
+/// Returns `None` if scratch allocation fails (extremely unusual —
+/// Metal must support 16-byte buffer allocation); the caller then falls
+/// back to the CPU build path so the engine never returns wrong
+/// results, only loses the perf optimization.
+fn a1_scratch(
+    device: &MetalDevice,
+) -> Option<&'static std::sync::Mutex<crate::groupby_build_partitioned::BuildScratch>> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<crate::groupby_build_partitioned::BuildScratch>> = OnceLock::new();
+    if let Some(c) = CACHE.get() {
+        return Some(c);
+    }
+    let scratch = crate::groupby_build_partitioned::BuildScratch::new(device).ok()?;
+    Some(CACHE.get_or_init(|| Mutex::new(scratch)))
 }
 
 // -----------------------------------------------------------------------
@@ -779,9 +903,45 @@ pub fn dispatch_max_u32(
 
 // ---- f32 GPU aggregation ----
 
+/// Hard cap on n_groups for the F32 pre-reduce kernels. Matches the
+/// `MAX_GROUPS` constant baked into `shaders/aggregate.metal` — exceeding
+/// this would overflow the per-thread register array. Callers must route
+/// queries with more groups to the M2 per-agg / CPU finalize path.
+pub(crate) const F32_AGG_MAX_GROUPS: usize = 16;
+
+/// Threadgroup width for the F32 pre-reduce kernels. The MSL side
+/// (`shaders/aggregate.metal`) hardcodes `MAX_SIMDS_PER_TG = 8` which
+/// corresponds to a 256-wide threadgroup on Apple Silicon (32-lane simd).
+/// Dispatcher MUST match.
+const F32_AGG_TG_WIDTH: usize = 256;
+
+/// Cap on the number of threadgroups dispatched for the F32 pre-reduce
+/// kernels. Each TG runs the full pre-reduce + simd reduce + final flush
+/// once, and emits up to `n_groups` atomic CAS-adds against the device
+/// output buffer. Capping at 128 TGs keeps the post-reduction atomic
+/// contention bounded (≤ 128 * n_groups device atomics, well under the
+/// GPU watchdog budget) while still saturating Apple Silicon's compute
+/// units. Each thread strides over ~`n_rows / (caps × 256)` rows.
+const F32_AGG_MAX_TGS: usize = 128;
+
 /// Shared helper for f32 aggregation kernels.
-/// The MSL kernels use `atomic_uint` as a bit-pattern container for f32;
-/// the init value is passed as the bit pattern of the f32 identity element.
+///
+/// Routes between two MSL kernels depending on `n_groups`:
+///
+/// - **`<kernel>_prereduce`** (low cardinality, ≤ [`F32_AGG_MAX_GROUPS`]):
+///   per-thread register pre-reduce → simdgroup reduce → per-TG CAS to
+///   device. Avoids the GPU watchdog at 10M rows × 4 groups where the
+///   per-row variant retries O(N²/2) times.
+/// - **`<kernel>` (per-row CAS, high cardinality > [`F32_AGG_MAX_GROUPS`]):
+///   per-row CAS-loop on the device output. At high group cardinality
+///   contention is low and CAS retries are rare; the pre-reduce variant
+///   can't run anyway (register-array cap).
+///
+/// `kernel_name` is the **base** kernel name (e.g. `"agg_sum_f32"`); the
+/// helper picks the right suffix.
+///
+/// The init value is passed as the bit pattern of the f32 identity
+/// element (the kernel reads it via `as_type<float>`).
 #[allow(clippy::too_many_arguments)]
 fn dispatch_agg_f32(
     device: &MetalDevice,
@@ -838,7 +998,6 @@ fn dispatch_agg_f32(
         unsafe { std::slice::from_raw_parts(init_buf.as_ptr() as *const u8, n_groups * 4) };
 
     let lib = shared_library(device)?;
-    let pso = lib.pipeline(kernel_name)?;
 
     let vals_buf = device.new_buffer_from_bytes(values_bytes)?;
     let valid_buf = device.new_buffer_from_bytes(&valid[..valid_bytes])?;
@@ -846,11 +1005,46 @@ fn dispatch_agg_f32(
     let out_buf = device.new_buffer_from_bytes(init_bytes)?;
     let n_rows_buf = device.new_buffer_from_bytes(&n_rows_u32.to_le_bytes())?;
 
-    queue.dispatch_1d(
-        &pso,
-        &[&vals_buf, &valid_buf, &r2g_buf, &out_buf, &n_rows_buf],
-        n_rows,
-    )?;
+    if n_groups <= F32_AGG_MAX_GROUPS {
+        // Low-cardinality: route to the pre-reduce kernel.
+        let n_groups_u32: u32 = u32::try_from(n_groups).map_err(|_| {
+            // Unreachable given the cap above, but keeps the path total.
+            GroupByError::RowCountOverflow { n_rows: n_groups }
+        })?;
+        let n_groups_buf = device.new_buffer_from_bytes(&n_groups_u32.to_le_bytes())?;
+        let pso_name = format!("{kernel_name}_prereduce");
+        let pso = lib.pipeline(&pso_name)?;
+
+        // Grid size: pre-reduce kernels stride per-thread, so we want far
+        // fewer threads than rows. Pick the smallest multiple of TG width
+        // that fits in [TG_width, MAX_TGS * TG_width].
+        let target_tgs = n_rows.div_ceil(F32_AGG_TG_WIDTH);
+        let n_tgs = target_tgs.clamp(1, F32_AGG_MAX_TGS);
+        let n_threads = n_tgs * F32_AGG_TG_WIDTH;
+
+        queue.dispatch_1d_with_tg(
+            &pso,
+            &[
+                &vals_buf,
+                &valid_buf,
+                &r2g_buf,
+                &out_buf,
+                &n_rows_buf,
+                &n_groups_buf,
+            ],
+            n_threads,
+            F32_AGG_TG_WIDTH,
+        )?;
+    } else {
+        // High-cardinality: route to per-row CAS. Contention is low
+        // enough that the CAS retries don't hit the watchdog budget.
+        let pso = lib.pipeline(kernel_name)?;
+        queue.dispatch_1d(
+            &pso,
+            &[&vals_buf, &valid_buf, &r2g_buf, &out_buf, &n_rows_buf],
+            n_rows,
+        )?;
+    }
     queue.wait_until_complete()?;
 
     let out_bytes = out_buf.as_slice();
@@ -1096,38 +1290,39 @@ pub fn aggregate_sum_f64_cpu(
     n_groups: usize,
 ) -> Vec<f64> {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    let slots: Vec<AtomicU64> = (0..n_groups).map(|_| AtomicU64::new(0)).collect();
+    // Thread-local accumulators + reduce: each rayon work-unit sums into
+    // its own [n_groups]-sized array, then we sum across chunks. Avoids
+    // the per-row atomic-CAS contention that dominated the previous
+    // par_iter design at low cardinality (4 groups × 9.5M rows → 9.5M
+    // CAS retries serialized on 4 slots → 3.4s; this pattern: ~2ms).
     let n = values.len().min(row_to_group.len());
-    values[..n].par_iter().enumerate().for_each(|(i, &v)| {
-        let byte = valid.get(i >> 3).copied().unwrap_or(0);
-        if (byte >> (i & 7)) & 1 == 0 {
-            return;
-        }
-        let g = row_to_group[i] as usize;
-        if g >= n_groups {
-            return;
-        }
-        let mut old_bits = slots[g].load(Ordering::Relaxed);
-        loop {
-            let cur = f64::from_bits(old_bits);
-            let next_bits = (cur + v).to_bits();
-            match slots[g].compare_exchange_weak(
-                old_bits,
-                next_bits,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(latest) => old_bits = latest,
-            }
-        }
-    });
-    slots
-        .into_iter()
-        .map(|a| f64::from_bits(a.into_inner()))
-        .collect()
+
+    (0..n)
+        .into_par_iter()
+        .fold(
+            || vec![0.0f64; n_groups],
+            |mut local, i| {
+                let byte = valid.get(i >> 3).copied().unwrap_or(0);
+                if (byte >> (i & 7)) & 1 == 0 {
+                    return local;
+                }
+                let g = row_to_group[i] as usize;
+                if g < n_groups {
+                    local[g] += values[i];
+                }
+                local
+            },
+        )
+        .reduce(
+            || vec![0.0f64; n_groups],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x += *y;
+                }
+                a
+            },
+        )
 }
 
 /// Sum i64 values by group. Null rows skipped. All-null group → 0.
@@ -1138,22 +1333,36 @@ pub fn aggregate_sum_i64_cpu(
     n_groups: usize,
 ) -> Vec<i64> {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicI64, Ordering};
 
-    let slots: Vec<AtomicI64> = (0..n_groups).map(|_| AtomicI64::new(0)).collect();
+    // Thread-local accumulators + reduce. See `aggregate_sum_f64_cpu`
+    // for the perf rationale; ~10× speedup at low cardinality vs the
+    // atomic-fetch_add design.
     let n = values.len().min(row_to_group.len());
-    values[..n].par_iter().enumerate().for_each(|(i, &v)| {
-        let byte = valid.get(i >> 3).copied().unwrap_or(0);
-        if (byte >> (i & 7)) & 1 == 0 {
-            return;
-        }
-        let g = row_to_group[i] as usize;
-        if g >= n_groups {
-            return;
-        }
-        slots[g].fetch_add(v, Ordering::Relaxed);
-    });
-    slots.into_iter().map(|a| a.into_inner()).collect()
+    (0..n)
+        .into_par_iter()
+        .fold(
+            || vec![0i64; n_groups],
+            |mut local, i| {
+                let byte = valid.get(i >> 3).copied().unwrap_or(0);
+                if (byte >> (i & 7)) & 1 == 0 {
+                    return local;
+                }
+                let g = row_to_group[i] as usize;
+                if g < n_groups {
+                    local[g] = local[g].wrapping_add(values[i]);
+                }
+                local
+            },
+        )
+        .reduce(
+            || vec![0i64; n_groups],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x = x.wrapping_add(*y);
+                }
+                a
+            },
+        )
 }
 
 /// Min i64 values by group. Null rows skipped.
@@ -1165,32 +1374,45 @@ pub fn aggregate_min_i64_cpu(
     n_groups: usize,
 ) -> (Vec<i64>, Vec<bool>) {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
-    let slots: Vec<AtomicI64> = (0..n_groups).map(|_| AtomicI64::new(i64::MAX)).collect();
-    let has_value: Vec<AtomicBool> = (0..n_groups).map(|_| AtomicBool::new(false)).collect();
     let n = values.len().min(row_to_group.len());
-    values[..n].par_iter().enumerate().for_each(|(i, &v)| {
-        let byte = valid.get(i >> 3).copied().unwrap_or(0);
-        if (byte >> (i & 7)) & 1 == 0 {
-            return;
-        }
-        let g = row_to_group[i] as usize;
-        if g >= n_groups {
-            return;
-        }
-        has_value[g].store(true, Ordering::Relaxed);
-        let mut old = slots[g].load(Ordering::Relaxed);
-        while v < old {
-            match slots[g].compare_exchange_weak(old, v, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => break,
-                Err(cur) => old = cur,
-            }
-        }
-    });
-    let vals: Vec<i64> = slots.into_iter().map(|a| a.into_inner()).collect();
-    let valid_out: Vec<bool> = has_value.into_iter().map(|a| a.into_inner()).collect();
-    (vals, valid_out)
+    let (vals, has_value) = (0..n)
+        .into_par_iter()
+        .fold(
+            || (vec![i64::MAX; n_groups], vec![false; n_groups]),
+            |(mut vals, mut has), i| {
+                let byte = valid.get(i >> 3).copied().unwrap_or(0);
+                if (byte >> (i & 7)) & 1 == 0 {
+                    return (vals, has);
+                }
+                let g = row_to_group[i] as usize;
+                if g < n_groups {
+                    let v = values[i];
+                    if v < vals[g] {
+                        vals[g] = v;
+                    }
+                    has[g] = true;
+                }
+                (vals, has)
+            },
+        )
+        .reduce(
+            || (vec![i64::MAX; n_groups], vec![false; n_groups]),
+            |(mut va, mut ha), (vb, hb)| {
+                for ((a, &b), (ah, &bh)) in va
+                    .iter_mut()
+                    .zip(vb.iter())
+                    .zip(ha.iter_mut().zip(hb.iter()))
+                {
+                    if b < *a {
+                        *a = b;
+                    }
+                    *ah |= bh;
+                }
+                (va, ha)
+            },
+        );
+    (vals, has_value)
 }
 
 /// Max i64 values by group. Null rows skipped.
@@ -1202,32 +1424,44 @@ pub fn aggregate_max_i64_cpu(
     n_groups: usize,
 ) -> (Vec<i64>, Vec<bool>) {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
-    let slots: Vec<AtomicI64> = (0..n_groups).map(|_| AtomicI64::new(i64::MIN)).collect();
-    let has_value: Vec<AtomicBool> = (0..n_groups).map(|_| AtomicBool::new(false)).collect();
     let n = values.len().min(row_to_group.len());
-    values[..n].par_iter().enumerate().for_each(|(i, &v)| {
-        let byte = valid.get(i >> 3).copied().unwrap_or(0);
-        if (byte >> (i & 7)) & 1 == 0 {
-            return;
-        }
-        let g = row_to_group[i] as usize;
-        if g >= n_groups {
-            return;
-        }
-        has_value[g].store(true, Ordering::Relaxed);
-        let mut old = slots[g].load(Ordering::Relaxed);
-        while v > old {
-            match slots[g].compare_exchange_weak(old, v, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => break,
-                Err(cur) => old = cur,
-            }
-        }
-    });
-    let vals: Vec<i64> = slots.into_iter().map(|a| a.into_inner()).collect();
-    let valid_out: Vec<bool> = has_value.into_iter().map(|a| a.into_inner()).collect();
-    (vals, valid_out)
+    (0..n)
+        .into_par_iter()
+        .fold(
+            || (vec![i64::MIN; n_groups], vec![false; n_groups]),
+            |(mut vals, mut has), i| {
+                let byte = valid.get(i >> 3).copied().unwrap_or(0);
+                if (byte >> (i & 7)) & 1 == 0 {
+                    return (vals, has);
+                }
+                let g = row_to_group[i] as usize;
+                if g < n_groups {
+                    let v = values[i];
+                    if v > vals[g] {
+                        vals[g] = v;
+                    }
+                    has[g] = true;
+                }
+                (vals, has)
+            },
+        )
+        .reduce(
+            || (vec![i64::MIN; n_groups], vec![false; n_groups]),
+            |(mut va, mut ha), (vb, hb)| {
+                for ((a, &b), (ah, &bh)) in va
+                    .iter_mut()
+                    .zip(vb.iter())
+                    .zip(ha.iter_mut().zip(hb.iter()))
+                {
+                    if b > *a {
+                        *a = b;
+                    }
+                    *ah |= bh;
+                }
+                (va, ha)
+            },
+        )
 }
 
 /// Min f64 values by group. Null rows skipped.
@@ -1241,58 +1475,49 @@ pub fn aggregate_min_f64_cpu(
     n_groups: usize,
 ) -> (Vec<f64>, Vec<bool>) {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    // Seeded with +INFINITY bit pattern so any real value wins.
-    let slots: Vec<AtomicU64> = (0..n_groups)
-        .map(|_| AtomicU64::new(f64::INFINITY.to_bits()))
-        .collect();
-    let has_value: Vec<AtomicBool> = (0..n_groups).map(|_| AtomicBool::new(false)).collect();
     let n = values.len().min(row_to_group.len());
-    values[..n].par_iter().enumerate().for_each(|(i, &v)| {
-        let byte = valid.get(i >> 3).copied().unwrap_or(0);
-        if (byte >> (i & 7)) & 1 == 0 {
-            return;
-        }
-        let g = row_to_group[i] as usize;
-        if g >= n_groups {
-            return;
-        }
-        has_value[g].store(true, Ordering::Relaxed);
-        // NaN poisons: if we see a NaN, force NaN into the slot permanently.
-        if v.is_nan() {
-            slots[g].store(v.to_bits(), Ordering::Relaxed);
-            return;
-        }
-        let mut old_bits = slots[g].load(Ordering::Relaxed);
-        loop {
-            let cur = f64::from_bits(old_bits);
-            // If the slot is already NaN (from a prior NaN row), leave it.
-            if cur.is_nan() {
-                break;
-            }
-            // v is non-NaN (checked above) and cur is non-NaN (checked here),
-            // so plain >= is safe and well-defined.
-            if v >= cur {
-                break;
-            }
-            match slots[g].compare_exchange_weak(
-                old_bits,
-                v.to_bits(),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(latest) => old_bits = latest,
-            }
-        }
-    });
-    let vals: Vec<f64> = slots
-        .into_iter()
-        .map(|a| f64::from_bits(a.into_inner()))
-        .collect();
-    let valid_out: Vec<bool> = has_value.into_iter().map(|a| a.into_inner()).collect();
-    (vals, valid_out)
+    (0..n)
+        .into_par_iter()
+        .fold(
+            || (vec![f64::INFINITY; n_groups], vec![false; n_groups]),
+            |(mut vals, mut has), i| {
+                let byte = valid.get(i >> 3).copied().unwrap_or(0);
+                if (byte >> (i & 7)) & 1 == 0 {
+                    return (vals, has);
+                }
+                let g = row_to_group[i] as usize;
+                if g < n_groups {
+                    let v = values[i];
+                    has[g] = true;
+                    // NaN poisons: once NaN, stay NaN.
+                    if v.is_nan() || vals[g].is_nan() {
+                        vals[g] = f64::NAN;
+                    } else if v < vals[g] {
+                        vals[g] = v;
+                    }
+                }
+                (vals, has)
+            },
+        )
+        .reduce(
+            || (vec![f64::INFINITY; n_groups], vec![false; n_groups]),
+            |(mut va, mut ha), (vb, hb)| {
+                for ((a, &b), (ah, &bh)) in va
+                    .iter_mut()
+                    .zip(vb.iter())
+                    .zip(ha.iter_mut().zip(hb.iter()))
+                {
+                    if a.is_nan() || b.is_nan() {
+                        *a = f64::NAN;
+                    } else if b < *a {
+                        *a = b;
+                    }
+                    *ah |= bh;
+                }
+                (va, ha)
+            },
+        )
 }
 
 /// Max f64 values by group. Null rows skipped.
@@ -1305,91 +1530,108 @@ pub fn aggregate_max_f64_cpu(
     n_groups: usize,
 ) -> (Vec<f64>, Vec<bool>) {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    // Seeded with -INFINITY bit pattern so any real value wins.
-    let slots: Vec<AtomicU64> = (0..n_groups)
-        .map(|_| AtomicU64::new(f64::NEG_INFINITY.to_bits()))
-        .collect();
-    let has_value: Vec<AtomicBool> = (0..n_groups).map(|_| AtomicBool::new(false)).collect();
     let n = values.len().min(row_to_group.len());
-    values[..n].par_iter().enumerate().for_each(|(i, &v)| {
-        let byte = valid.get(i >> 3).copied().unwrap_or(0);
-        if (byte >> (i & 7)) & 1 == 0 {
-            return;
-        }
-        let g = row_to_group[i] as usize;
-        if g >= n_groups {
-            return;
-        }
-        has_value[g].store(true, Ordering::Relaxed);
-        if v.is_nan() {
-            slots[g].store(v.to_bits(), Ordering::Relaxed);
-            return;
-        }
-        let mut old_bits = slots[g].load(Ordering::Relaxed);
-        loop {
-            let cur = f64::from_bits(old_bits);
-            if cur.is_nan() {
-                break;
-            }
-            // v is non-NaN (checked above) and cur is non-NaN (checked here).
-            if v <= cur {
-                break;
-            }
-            match slots[g].compare_exchange_weak(
-                old_bits,
-                v.to_bits(),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(latest) => old_bits = latest,
-            }
-        }
-    });
-    let vals: Vec<f64> = slots
-        .into_iter()
-        .map(|a| f64::from_bits(a.into_inner()))
-        .collect();
-    let valid_out: Vec<bool> = has_value.into_iter().map(|a| a.into_inner()).collect();
-    (vals, valid_out)
+    (0..n)
+        .into_par_iter()
+        .fold(
+            || (vec![f64::NEG_INFINITY; n_groups], vec![false; n_groups]),
+            |(mut vals, mut has), i| {
+                let byte = valid.get(i >> 3).copied().unwrap_or(0);
+                if (byte >> (i & 7)) & 1 == 0 {
+                    return (vals, has);
+                }
+                let g = row_to_group[i] as usize;
+                if g < n_groups {
+                    let v = values[i];
+                    has[g] = true;
+                    if v.is_nan() || vals[g].is_nan() {
+                        vals[g] = f64::NAN;
+                    } else if v > vals[g] {
+                        vals[g] = v;
+                    }
+                }
+                (vals, has)
+            },
+        )
+        .reduce(
+            || (vec![f64::NEG_INFINITY; n_groups], vec![false; n_groups]),
+            |(mut va, mut ha), (vb, hb)| {
+                for ((a, &b), (ah, &bh)) in va
+                    .iter_mut()
+                    .zip(vb.iter())
+                    .zip(ha.iter_mut().zip(hb.iter()))
+                {
+                    if a.is_nan() || b.is_nan() {
+                        *a = f64::NAN;
+                    } else if b > *a {
+                        *a = b;
+                    }
+                    *ah |= bh;
+                }
+                (va, ha)
+            },
+        )
 }
 
 /// Count of non-null rows per group (CPU path).
 pub fn aggregate_count_cpu(valid: &[u8], row_to_group: &[u32], n_groups: usize) -> Vec<u64> {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
+    // Thread-local accumulators + reduce; same rationale as aggregate_sum_*.
     let n = row_to_group.len();
-    let slots: Vec<AtomicU64> = (0..n_groups).map(|_| AtomicU64::new(0)).collect();
-    (0..n).into_par_iter().for_each(|i| {
-        let byte = valid.get(i >> 3).copied().unwrap_or(0);
-        if (byte >> (i & 7)) & 1 == 0 {
-            return;
-        }
-        let g = row_to_group[i] as usize;
-        if g >= n_groups {
-            return;
-        }
-        slots[g].fetch_add(1, Ordering::Relaxed);
-    });
-    slots.into_iter().map(|a| a.into_inner()).collect()
+    (0..n)
+        .into_par_iter()
+        .fold(
+            || vec![0u64; n_groups],
+            |mut local, i| {
+                let byte = valid.get(i >> 3).copied().unwrap_or(0);
+                if (byte >> (i & 7)) & 1 == 0 {
+                    return local;
+                }
+                let g = row_to_group[i] as usize;
+                if g < n_groups {
+                    local[g] += 1;
+                }
+                local
+            },
+        )
+        .reduce(
+            || vec![0u64; n_groups],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x += *y;
+                }
+                a
+            },
+        )
 }
 
 /// Total row count per group, ignoring validity (CPU path).
 pub fn aggregate_len_cpu(row_to_group: &[u32], n_groups: usize) -> Vec<u64> {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    let slots: Vec<AtomicU64> = (0..n_groups).map(|_| AtomicU64::new(0)).collect();
-    row_to_group.par_iter().for_each(|&g| {
-        let g = g as usize;
-        if g < n_groups {
-            slots[g].fetch_add(1, Ordering::Relaxed);
-        }
-    });
-    slots.into_iter().map(|a| a.into_inner()).collect()
+    row_to_group
+        .par_iter()
+        .fold(
+            || vec![0u64; n_groups],
+            |mut local, &g| {
+                let g = g as usize;
+                if g < n_groups {
+                    local[g] += 1;
+                }
+                local
+            },
+        )
+        .reduce(
+            || vec![0u64; n_groups],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x += *y;
+                }
+                a
+            },
+        )
 }
 
 // -----------------------------------------------------------------------
@@ -1539,11 +1781,52 @@ pub fn hash_u128_reference(lo: u64, hi: u64) -> u32 {
 /// DataFrames after the kernel returns indices.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecodedColumn {
-    I64 { values: Vec<i64>, valid: Vec<bool> },
-    F64 { values: Vec<f64>, valid: Vec<bool> },
-    Bool { values: Vec<bool>, valid: Vec<bool> },
-    I32 { values: Vec<i32>, valid: Vec<bool> },
-    F32 { values: Vec<f32>, valid: Vec<bool> },
+    I64 {
+        values: Vec<i64>,
+        valid: Vec<bool>,
+    },
+    F64 {
+        values: Vec<f64>,
+        valid: Vec<bool>,
+    },
+    Bool {
+        values: Vec<bool>,
+        valid: Vec<bool>,
+    },
+    I32 {
+        values: Vec<i32>,
+        valid: Vec<bool>,
+    },
+    F32 {
+        values: Vec<f32>,
+        valid: Vec<bool>,
+    },
+    // M3 additions
+    I8 {
+        values: Vec<i8>,
+        valid: Vec<bool>,
+    },
+    I16 {
+        values: Vec<i16>,
+        valid: Vec<bool>,
+    },
+    U8 {
+        values: Vec<u8>,
+        valid: Vec<bool>,
+    },
+    U16 {
+        values: Vec<u16>,
+        valid: Vec<bool>,
+    },
+    U32 {
+        values: Vec<u32>,
+        valid: Vec<bool>,
+    },
+    // M3 Phase 7: dictionary-decoded Utf8 keys.
+    Utf8 {
+        values: Vec<String>,
+        valid: Vec<bool>,
+    },
 }
 
 /// Decode a u128-encoded composite-key stream back to per-column values.
@@ -1569,6 +1852,30 @@ pub fn decode_keys(encoded: &[u128], schema: &KeySchema) -> Vec<DecodedColumn> {
                 valid: Vec::with_capacity(encoded.len()),
             },
             KeyDtype::F32 => DecodedColumn::F32 {
+                values: Vec::with_capacity(encoded.len()),
+                valid: Vec::with_capacity(encoded.len()),
+            },
+            KeyDtype::I8 => DecodedColumn::I8 {
+                values: Vec::with_capacity(encoded.len()),
+                valid: Vec::with_capacity(encoded.len()),
+            },
+            KeyDtype::I16 => DecodedColumn::I16 {
+                values: Vec::with_capacity(encoded.len()),
+                valid: Vec::with_capacity(encoded.len()),
+            },
+            KeyDtype::U8 => DecodedColumn::U8 {
+                values: Vec::with_capacity(encoded.len()),
+                valid: Vec::with_capacity(encoded.len()),
+            },
+            KeyDtype::U16 => DecodedColumn::U16 {
+                values: Vec::with_capacity(encoded.len()),
+                valid: Vec::with_capacity(encoded.len()),
+            },
+            KeyDtype::U32 => DecodedColumn::U32 {
+                values: Vec::with_capacity(encoded.len()),
+                valid: Vec::with_capacity(encoded.len()),
+            },
+            KeyDtype::Utf8 => DecodedColumn::Utf8 {
                 values: Vec::with_capacity(encoded.len()),
                 valid: Vec::with_capacity(encoded.len()),
             },
@@ -1614,6 +1921,57 @@ pub fn decode_keys(encoded: &[u128], schema: &KeySchema) -> Vec<DecodedColumn> {
                         f32::from_bits(raw as u32)
                     } else {
                         0.0f32
+                    };
+                    values.push(v);
+                    valid.push(is_valid);
+                }
+                (DecodedColumn::U32 { values, valid }, KeyDtype::U32) => {
+                    let raw = (lane >> field.data_bit_offset) & ((1u128 << 32) - 1);
+                    let v = if is_valid { raw as u32 } else { 0u32 };
+                    values.push(v);
+                    valid.push(is_valid);
+                }
+                (DecodedColumn::I16 { values, valid }, KeyDtype::I16) => {
+                    let raw = (lane >> field.data_bit_offset) & ((1u128 << 16) - 1);
+                    let v = if is_valid { raw as u16 as i16 } else { 0i16 };
+                    values.push(v);
+                    valid.push(is_valid);
+                }
+                (DecodedColumn::U16 { values, valid }, KeyDtype::U16) => {
+                    let raw = (lane >> field.data_bit_offset) & ((1u128 << 16) - 1);
+                    let v = if is_valid { raw as u16 } else { 0u16 };
+                    values.push(v);
+                    valid.push(is_valid);
+                }
+                (DecodedColumn::I8 { values, valid }, KeyDtype::I8) => {
+                    let raw = (lane >> field.data_bit_offset) & ((1u128 << 8) - 1);
+                    let v = if is_valid { raw as u8 as i8 } else { 0i8 };
+                    values.push(v);
+                    valid.push(is_valid);
+                }
+                (DecodedColumn::U8 { values, valid }, KeyDtype::U8) => {
+                    let raw = (lane >> field.data_bit_offset) & ((1u128 << 8) - 1);
+                    let v = if is_valid { raw as u8 } else { 0u8 };
+                    values.push(v);
+                    valid.push(is_valid);
+                }
+                (DecodedColumn::Utf8 { values, valid }, KeyDtype::Utf8) => {
+                    let raw = (lane >> field.data_bit_offset) & ((1u128 << 32) - 1);
+                    let code = raw as u32;
+                    // `encode_keys` guarantees `dict` is `Some` for every
+                    // Utf8 field it emits (validated up-front via
+                    // `KeyEncodeError::Utf8MissingDict`). A `None` here
+                    // would mean a schema was constructed by some other
+                    // path; degrade gracefully to empty-string output
+                    // rather than panicking on a kernel-layer assumption.
+                    let v = if is_valid {
+                        field
+                            .dict
+                            .as_ref()
+                            .and_then(|d| d.get(code as usize).cloned())
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
                     };
                     values.push(v);
                     valid.push(is_valid);
@@ -1715,6 +2073,34 @@ pub fn dispatch_groupby(
         }
     }
 
+    // Empty-keys path: a SELECT(agg(expr)) with no group-by keys is a
+    // single-group reduction over the entire input (TPC-H Q6 shape). Skip
+    // the build phase (no hashing, no dedup) and synthesize a BuildOutput
+    // that maps every row to group 0.
+    if key_cols.is_empty() {
+        if n_rows == 0 {
+            let agg_outputs = agg_specs
+                .iter()
+                .map(|(req, _)| empty_output_for(req.kind))
+                .collect();
+            return Ok(GroupByResult {
+                decoded_keys: vec![],
+                agg_outputs,
+                n_groups: 0,
+            });
+        }
+        let row_to_group = vec![0u32; n_rows];
+        let mut agg_outputs = Vec::with_capacity(agg_specs.len());
+        for (req, vcol) in agg_specs {
+            agg_outputs.push(run_one_agg(device, queue, req, vcol, &row_to_group, 1)?);
+        }
+        return Ok(GroupByResult {
+            decoded_keys: vec![],
+            agg_outputs,
+            n_groups: 1,
+        });
+    }
+
     let (encoded, schema) = encode_keys(key_cols)?;
 
     if n_rows == 0 {
@@ -1730,10 +2116,13 @@ pub fn dispatch_groupby(
         });
     }
 
-    let mut hashes = vec![0u32; n_rows];
-    dispatch_hash(device, queue, &encoded, n_rows, &mut hashes)?;
-    let build = dispatch_build(device, queue, &encoded, &hashes, n_rows)?;
-    let n_groups = build.group_count;
+    // The current build path (CPU HashMap + A1 GPU build) ignores
+    // precomputed hashes — they were a relic of the GPU global-CAS hash
+    // table M2 abandoned. Skip the dispatch_hash kernel entirely; an
+    // empty slice satisfies the `hashes` parameter for both build paths.
+    // (~23 ms saved at 10M rows.)
+    let build = dispatch_build(device, queue, &encoded, &[], n_rows)?;
+    let n_groups = build.n_groups;
 
     let mut agg_outputs = Vec::with_capacity(agg_specs.len());
     for (req, vcol) in agg_specs {
@@ -2104,4 +2493,806 @@ fn run_one_agg(
             })
         }
     }
+}
+
+// ============================================================================
+// Fused groupby dispatch (Task 15)
+// ============================================================================
+//
+// Parallel entry point to `dispatch_groupby` that uses a single MSL kernel
+// for ALL aggregations rather than launching one kernel per agg. The fused
+// kernel is emitted by `aggregate_fused::emitter::emit_msl` and cached by
+// signature hash in `FusedLibraryCache`.
+//
+// The caller (IR layer in `polars-metal-core::udf`) decides between this
+// path and the M2 per-agg path based on `signature_supported_by_fused` and
+// agg shape (see `udf::pick_groupby_dispatch`).
+//
+// ## Buffer slot layout (must match `emitter.rs`)
+//
+//   slot 0:                  row_to_group  (u32 per row)
+//   slot 1:                  n_rows scalar (1-element u32)
+//   slots 2 .. 2+C:          value_<i> column data, in `sig.column_order()`
+//   slots 2+C .. 2+2C:       validity_<i> bitmap, in `sig.column_order()`
+//   slots 2+2C ..:           outputs — one per agg, plus a second u32 count
+//                            companion for every Mean.
+
+use crate::aggregate_fused::cache::{FusedCacheError, FusedLibraryCache};
+use crate::aggregate_fused::emitter::{signature_supported_by_fused, FUSED_TG_WIDTH, MAX_GROUPS};
+use crate::aggregate_fused::signature::{
+    AggOp as KAggOp, AggSignature, AggSignatureError, AggSpec as KAggSpec,
+    MetalDtype as KMetalDtype,
+};
+
+/// Errors specific to the fused dispatcher. Wraps `GroupByError` for the
+/// shared path and adds variants for fused-only signal failures.
+#[derive(Debug, thiserror::Error)]
+pub enum FusedDispatchError {
+    #[error("groupby: {0}")]
+    GroupBy(#[from] GroupByError),
+    #[error("signature: {0}")]
+    Signature(#[from] AggSignatureError),
+    #[error("fused cache: {0}")]
+    Cache(#[from] FusedCacheError),
+    #[error(
+        "fused dispatch rejected: signature contains 64-bit input dtypes; \
+         caller must route to the M2 per-agg path"
+    )]
+    SignatureNotFused,
+    /// `n_groups` exceeds the kernel's per-thread register-array cap
+    /// (`MAX_GROUPS` in `aggregate_fused/emitter.rs`). The caller must
+    /// route to the M2 per-agg path; that path uses per-row atomics
+    /// directly on device memory, which scales to arbitrary cardinality
+    /// (and isn't penalized at high cardinality the way the pre-reduce
+    /// fused kernel would be).
+    #[error("fused dispatch rejected: n_groups={n_groups} exceeds MAX_GROUPS={max_groups}; caller must route to the M2 per-agg path")]
+    NgroupsExceedsFusedCap { n_groups: usize, max_groups: usize },
+    #[error("missing value column for slot {slot} ({name})")]
+    MissingValueColumn { slot: usize, name: String },
+    #[error("value column {name}: dtype mismatch (signature has {sig_dt:?}, caller {got:?})")]
+    ValueDtypeMismatch {
+        name: String,
+        sig_dt: KMetalDtype,
+        got: &'static str,
+    },
+}
+
+/// Per-output buffer descriptor used while encoding the dispatch and
+/// reading results back. Kept private — callers only see `AggOutput`.
+struct OutputBuf {
+    primary: polars_metal_buffer::MetalBuffer,
+    /// Mean carries a companion `count` (u32). For non-Mean aggs this is `None`.
+    count: Option<polars_metal_buffer::MetalBuffer>,
+    /// What the primary buffer holds, used to widen back to AggOutput. The
+    /// fused emitter accumulates Sum/Min/Max into one of three 32-bit
+    /// containers: i32 (for signed-integer inputs), u32 (for unsigned),
+    /// or f32-bit-pattern stored in a u32 (for float inputs).
+    primary_kind: PrimaryKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PrimaryKind {
+    /// Output is u32 (Count, Length, unsigned-integer Sum/Min/Max).
+    U32,
+    /// Output is i32 (signed-integer Sum/Min/Max).
+    I32,
+    /// Output is f32, stored as u32 bit pattern (float Sum/Min/Max + Mean's sum slot).
+    F32Bits,
+}
+
+/// Fused-kernel groupby dispatch.
+///
+/// Single MSL kernel handles all aggs; one kernel launch per groupby
+/// regardless of agg count.
+///
+/// # Preconditions
+///
+/// - Every value column is 32-bit or narrower (caller verified via
+///   [`signature_supported_by_fused`]); F64 / I64 input columns must route
+///   to [`dispatch_groupby`] instead.
+/// - Every column referenced by a Simple or Expression agg appears in
+///   `value_columns_by_name`. `Length` aggs need no value columns.
+/// - `value_columns_by_name` typing matches `col_dtypes` exactly. The two
+///   must come from a single caller-side derivation step.
+///
+/// Returns the same shape of result as [`dispatch_groupby`].
+pub fn dispatch_groupby_fused(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    cache: &FusedLibraryCache,
+    key_cols: &[KeyColumn<'_>],
+    aggs: &[KAggSpec],
+    value_columns_by_name: &std::collections::HashMap<String, ValueColumn<'_>>,
+    n_rows: usize,
+) -> Result<GroupByResult, FusedDispatchError> {
+    // Defensive: every key column reports the same n_rows.
+    for kc in key_cols {
+        if kc.n_rows != n_rows {
+            return Err(FusedDispatchError::GroupBy(GroupByError::OutputTooShort {
+                got: kc.n_rows,
+                need: n_rows,
+            }));
+        }
+    }
+
+    // Empty-keys path: SELECT(agg(expr)) with no group-by keys becomes a
+    // single-group reduction over the full input. Skip encode/hash/build
+    // and synthesize a BuildOutput in which every row maps to group 0.
+    // (TPC-H Q6 takes this shape after optimization.)
+    let (encoded, schema) = if key_cols.is_empty() {
+        (Vec::<u128>::new(), KeySchema::default())
+    } else {
+        encode_keys(key_cols).map_err(GroupByError::KeyEncode)?
+    };
+
+    if n_rows == 0 {
+        let decoded_keys = if key_cols.is_empty() {
+            Vec::new()
+        } else {
+            decode_keys(&[], &schema)
+        };
+        let agg_outputs = aggs.iter().map(empty_output_for_kagg).collect();
+        return Ok(GroupByResult {
+            decoded_keys,
+            agg_outputs,
+            n_groups: 0,
+        });
+    }
+
+    // Build col_dtypes from value_columns_by_name. Walk every column that
+    // any agg references — Simple.input_col or Expression.referenced_columns.
+    let mut col_dtypes: std::collections::BTreeMap<String, KMetalDtype> =
+        std::collections::BTreeMap::new();
+    for agg in aggs {
+        match agg {
+            KAggSpec::Simple { input_col, .. } => {
+                insert_dtype(&mut col_dtypes, input_col, value_columns_by_name)?;
+            }
+            KAggSpec::Expression { expr, .. } => {
+                for col in expr.referenced_columns() {
+                    insert_dtype(&mut col_dtypes, &col, value_columns_by_name)?;
+                }
+            }
+            KAggSpec::Length { .. } => {}
+        }
+    }
+
+    let sig = AggSignature::from_specs(aggs, &col_dtypes)?;
+    if !signature_supported_by_fused(&sig) {
+        return Err(FusedDispatchError::SignatureNotFused);
+    }
+
+    // Compile / look up the PSO.
+    let pso = cache.get_or_compile(&sig, aggs)?;
+
+    // Build hashes / row_to_group via the existing CPU build phase. For
+    // empty-keys (single-group reduction) we synthesize the BuildOutput
+    // directly — every row belongs to group 0.
+    let build = if key_cols.is_empty() {
+        BuildOutput {
+            row_to_group: vec![0u32; n_rows],
+            n_groups: 1,
+            first_row_per_group: vec![0],
+        }
+    } else {
+        let mut hashes = vec![0u32; n_rows];
+        dispatch_hash(device, queue, &encoded, n_rows, &mut hashes)?;
+        dispatch_build(device, queue, &encoded, &hashes, n_rows)?
+    };
+    let n_groups_u32 = build.n_groups;
+    let n_groups = n_groups_u32 as usize;
+
+    // Pre-reduce fused kernel caps n_groups at MAX_GROUPS (16). Higher
+    // cardinality must route via the M2 per-agg path — that path is
+    // strictly faster at high cardinality anyway because contention is
+    // low and the register-array overhead disappears.
+    if n_groups > MAX_GROUPS {
+        return Err(FusedDispatchError::NgroupsExceedsFusedCap {
+            n_groups,
+            max_groups: MAX_GROUPS,
+        });
+    }
+
+    // ---- allocate per-slot value/validity buffers in column_order -----------
+    let column_order = sig.column_order().to_vec();
+    let column_dtypes = sig.column_dtypes().to_vec();
+
+    let mut value_bufs: Vec<polars_metal_buffer::MetalBuffer> =
+        Vec::with_capacity(column_order.len());
+    let mut valid_bufs: Vec<polars_metal_buffer::MetalBuffer> =
+        Vec::with_capacity(column_order.len());
+    let valid_bytes_needed = (n_rows + 7) / 8;
+    for (slot, name) in column_order.iter().enumerate() {
+        let vcol = value_columns_by_name.get(name).ok_or_else(|| {
+            FusedDispatchError::MissingValueColumn {
+                slot,
+                name: name.clone(),
+            }
+        })?;
+        let sig_dt = column_dtypes[slot];
+        let (data_bytes, valid_bytes_src) = vcol_bytes_for_slot(vcol, sig_dt, name, n_rows)?;
+        let val_buf = device
+            .new_buffer_from_bytes(data_bytes)
+            .map_err(GroupByError::Buffer)?;
+        // Defensive: ensure the validity buffer has enough bytes.
+        if valid_bytes_src.len() < valid_bytes_needed {
+            return Err(FusedDispatchError::GroupBy(GroupByError::OutputTooShort {
+                got: valid_bytes_src.len(),
+                need: valid_bytes_needed,
+            }));
+        }
+        let valid_slice = &valid_bytes_src[..valid_bytes_needed];
+        // Metal rejects zero-byte allocations; new_buffer_from_bytes also
+        // rejects empty slices. Pad to at least 4 bytes for alignment.
+        let padded;
+        let valid_for_buf: &[u8] = if valid_slice.len() < 4 {
+            padded = {
+                let mut v = vec![0u8; 4];
+                v[..valid_slice.len()].copy_from_slice(valid_slice);
+                v
+            };
+            &padded
+        } else {
+            valid_slice
+        };
+        let valid_buf = device
+            .new_buffer_from_bytes(valid_for_buf)
+            .map_err(GroupByError::Buffer)?;
+        value_bufs.push(val_buf);
+        valid_bufs.push(valid_buf);
+    }
+
+    // ---- allocate output buffers per agg ------------------------------------
+    let mut output_bufs: Vec<OutputBuf> = Vec::with_capacity(aggs.len());
+    for agg in aggs {
+        output_bufs.push(allocate_agg_output(device, agg, &col_dtypes, n_groups)?);
+    }
+
+    // ---- row_to_group + n_rows scalar buffers --------------------------------
+    let r2g_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            build.row_to_group.as_ptr() as *const u8,
+            build.row_to_group.len() * 4,
+        )
+    };
+    let r2g_buf = device
+        .new_buffer_from_bytes(r2g_bytes)
+        .map_err(GroupByError::Buffer)?;
+    let n_rows_u32: u32 =
+        u32::try_from(n_rows).map_err(|_| GroupByError::RowCountOverflow { n_rows })?;
+    let n_rows_buf = device
+        .new_buffer_from_bytes(&n_rows_u32.to_le_bytes())
+        .map_err(GroupByError::Buffer)?;
+    let n_groups_u32_le: u32 =
+        u32::try_from(n_groups).map_err(|_| GroupByError::RowCountOverflow { n_rows: n_groups })?;
+    let n_groups_buf = device
+        .new_buffer_from_bytes(&n_groups_u32_le.to_le_bytes())
+        .map_err(GroupByError::Buffer)?;
+
+    // ---- assemble bindings in emitter slot order ----------------------------
+    let mut bindings: Vec<&polars_metal_buffer::MetalBuffer> = Vec::new();
+    bindings.push(&r2g_buf);
+    bindings.push(&n_rows_buf);
+    bindings.push(&n_groups_buf);
+    for vb in &value_bufs {
+        bindings.push(vb);
+    }
+    for vb in &valid_bufs {
+        bindings.push(vb);
+    }
+    for ob in &output_bufs {
+        bindings.push(&ob.primary);
+        if let Some(cnt) = &ob.count {
+            bindings.push(cnt);
+        }
+    }
+
+    // ---- dispatch and wait --------------------------------------------------
+    //
+    // Pre-reduce kernel strides each thread over the row range, so we
+    // dispatch far fewer threads than rows. The cap matches the standalone
+    // F32 dispatcher (`F32_AGG_MAX_TGS`) — each TG emits at most n_groups
+    // device atomics, so the total post-reduction atomic count is
+    // <= n_threadgroups * n_groups, well under the GPU watchdog budget.
+    const FUSED_MAX_TGS: usize = 128;
+    let target_tgs = n_rows.div_ceil(FUSED_TG_WIDTH);
+    let n_tgs = target_tgs.clamp(1, FUSED_MAX_TGS);
+    let n_threads = n_tgs * FUSED_TG_WIDTH;
+    queue
+        .dispatch_1d_with_tg(&pso, &bindings, n_threads, FUSED_TG_WIDTH)
+        .map_err(GroupByError::from)?;
+    queue.wait_until_complete().map_err(GroupByError::from)?;
+
+    // ---- read back and finalize ---------------------------------------------
+    let mut agg_outputs: Vec<AggOutput> = Vec::with_capacity(aggs.len());
+    for (i, agg) in aggs.iter().enumerate() {
+        agg_outputs.push(finalize_agg_output(
+            agg,
+            &output_bufs[i],
+            n_groups,
+            &col_dtypes,
+        )?);
+    }
+
+    let decoded_keys = if key_cols.is_empty() {
+        Vec::new()
+    } else {
+        let representative_keys: Vec<u128> = build
+            .first_row_per_group
+            .iter()
+            .map(|&row| encoded[row as usize])
+            .collect();
+        decode_keys(&representative_keys, &schema)
+    };
+
+    Ok(GroupByResult {
+        decoded_keys,
+        agg_outputs,
+        n_groups: n_groups_u32,
+    })
+}
+
+/// Empty-shape output for an `AggSpec` (kernel-layer variant).
+fn empty_output_for_kagg(agg: &KAggSpec) -> AggOutput {
+    match agg {
+        KAggSpec::Simple { op, .. } => empty_output_for_op_simple(*op),
+        KAggSpec::Expression { op, .. } => empty_output_for_op_expression(*op),
+        KAggSpec::Length { .. } => AggOutput::U64 { values: vec![] },
+    }
+}
+
+fn empty_output_for_op_simple(op: KAggOp) -> AggOutput {
+    // Match the M2 dtype shape for these ops. Sum keeps its input width;
+    // Mean is always F32 (in the fused path — we only handle 32-bit inputs).
+    match op {
+        KAggOp::Count | KAggOp::Len => AggOutput::U64 { values: vec![] },
+        KAggOp::Mean => AggOutput::F32 {
+            values: vec![],
+            valid: vec![],
+        },
+        // Fall back to F32 for the other empty cases — the actual width is
+        // dtype-dependent but on an empty input no values are produced
+        // anyway; the python encoder reads `values.len()` (== 0) regardless.
+        KAggOp::Sum | KAggOp::Min | KAggOp::Max => AggOutput::F32 {
+            values: vec![],
+            valid: vec![],
+        },
+    }
+}
+
+fn empty_output_for_op_expression(op: KAggOp) -> AggOutput {
+    // Expression aggs always evaluate to f32 in the fused emitter.
+    match op {
+        KAggOp::Count | KAggOp::Len => AggOutput::U64 { values: vec![] },
+        _ => AggOutput::F32 {
+            values: vec![],
+            valid: vec![],
+        },
+    }
+}
+
+fn insert_dtype(
+    out: &mut std::collections::BTreeMap<String, KMetalDtype>,
+    name: &str,
+    by_name: &std::collections::HashMap<String, ValueColumn<'_>>,
+) -> Result<(), FusedDispatchError> {
+    if out.contains_key(name) {
+        return Ok(());
+    }
+    let vcol = by_name
+        .get(name)
+        .ok_or_else(|| FusedDispatchError::MissingValueColumn {
+            slot: out.len(),
+            name: name.to_string(),
+        })?;
+    let dt = match vcol {
+        ValueColumn::I32 { .. } => KMetalDtype::I32,
+        ValueColumn::F32 { .. } => KMetalDtype::F32,
+        ValueColumn::I64 { .. } => KMetalDtype::I64,
+        ValueColumn::F64 { .. } => KMetalDtype::F64,
+    };
+    out.insert(name.to_string(), dt);
+    Ok(())
+}
+
+/// Borrow the data and validity byte slices for a value column. Verifies
+/// the runtime dtype matches the signature's per-slot dtype (callers are
+/// expected to derive both from the same source, so a mismatch is a bug).
+fn vcol_bytes_for_slot<'a>(
+    vcol: &'a ValueColumn<'a>,
+    sig_dt: KMetalDtype,
+    name: &str,
+    n_rows: usize,
+) -> Result<(&'a [u8], &'a [u8]), FusedDispatchError> {
+    match (sig_dt, vcol) {
+        (KMetalDtype::I32, ValueColumn::I32 { data, valid }) => {
+            // SAFETY: i32 is plain-old-data; we expose the n_rows*4 byte
+            // window onto the typed slice.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, n_rows * 4) };
+            Ok((bytes, valid))
+        }
+        (KMetalDtype::F32, ValueColumn::F32 { data, valid }) => {
+            // SAFETY: f32 is plain-old-data.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, n_rows * 4) };
+            Ok((bytes, valid))
+        }
+        (sig_dt, got) => {
+            let got_name = match got {
+                ValueColumn::I32 { .. } => "I32",
+                ValueColumn::F32 { .. } => "F32",
+                ValueColumn::I64 { .. } => "I64",
+                ValueColumn::F64 { .. } => "F64",
+            };
+            Err(FusedDispatchError::ValueDtypeMismatch {
+                name: name.to_string(),
+                sig_dt,
+                got: got_name,
+            })
+        }
+    }
+}
+
+/// Allocate the output buffer(s) for one agg, seeded per op semantics.
+/// Mean reserves a count companion (u32); other ops use only the primary.
+fn allocate_agg_output(
+    device: &MetalDevice,
+    agg: &KAggSpec,
+    col_dtypes: &std::collections::BTreeMap<String, KMetalDtype>,
+    n_groups: usize,
+) -> Result<OutputBuf, FusedDispatchError> {
+    let (op, primary_kind) = match agg {
+        KAggSpec::Simple { op, input_col, .. } => {
+            let dt = *col_dtypes.get(input_col).ok_or_else(|| {
+                FusedDispatchError::MissingValueColumn {
+                    slot: 0,
+                    name: input_col.clone(),
+                }
+            })?;
+            (*op, primary_kind_for(*op, dt))
+        }
+        KAggSpec::Expression { expr, op, .. } => {
+            // Expression aggs always evaluate to f32 in the emitter (see
+            // `emit_expr_msl`).
+            let _ = expr; // unused except for documentation
+            (*op, primary_kind_for(*op, KMetalDtype::F32))
+        }
+        KAggSpec::Length { .. } => (KAggOp::Len, PrimaryKind::U32),
+    };
+
+    let primary = match (op, primary_kind) {
+        // Sum / Mean's sum slot / Count / Len → zero-init.
+        (KAggOp::Sum, _) | (KAggOp::Count, _) | (KAggOp::Len, _) | (KAggOp::Mean, _) => device
+            .new_buffer_zeroed(n_groups * 4)
+            .map_err(GroupByError::Buffer)?,
+        // Min over signed int: seed with i32::MAX.
+        (KAggOp::Min, PrimaryKind::I32) => seed_buffer_i32(device, i32::MAX, n_groups)?,
+        // Min over unsigned int: seed with u32::MAX.
+        (KAggOp::Min, PrimaryKind::U32) => seed_buffer_u32(device, u32::MAX, n_groups)?,
+        // Min over float: seed with +INFINITY's bit pattern.
+        (KAggOp::Min, PrimaryKind::F32Bits) => {
+            seed_buffer_u32(device, f32::INFINITY.to_bits(), n_groups)?
+        }
+        // Max over signed int: seed with i32::MIN.
+        (KAggOp::Max, PrimaryKind::I32) => seed_buffer_i32(device, i32::MIN, n_groups)?,
+        // Max over unsigned int: seed with u32::MIN (0). Same as zero-init.
+        (KAggOp::Max, PrimaryKind::U32) => device
+            .new_buffer_zeroed(n_groups * 4)
+            .map_err(GroupByError::Buffer)?,
+        // Max over float: seed with -INFINITY's bit pattern.
+        (KAggOp::Max, PrimaryKind::F32Bits) => {
+            seed_buffer_u32(device, f32::NEG_INFINITY.to_bits(), n_groups)?
+        }
+    };
+
+    let count = if matches!(op, KAggOp::Mean) {
+        Some(
+            device
+                .new_buffer_zeroed(n_groups * 4)
+                .map_err(GroupByError::Buffer)?,
+        )
+    } else {
+        None
+    };
+
+    Ok(OutputBuf {
+        primary,
+        count,
+        primary_kind,
+    })
+}
+
+fn primary_kind_for(op: KAggOp, input_dt: KMetalDtype) -> PrimaryKind {
+    match op {
+        KAggOp::Count | KAggOp::Len => PrimaryKind::U32,
+        // Mean's sum slot follows the same shape as a float Sum (CAS on
+        // atomic_uint as a bit-pattern container) when the input is float,
+        // or i32/u32 otherwise. The CPU finalize divides by count.
+        _ => match input_dt {
+            KMetalDtype::F32 | KMetalDtype::F64 => PrimaryKind::F32Bits,
+            KMetalDtype::I32 | KMetalDtype::I16 | KMetalDtype::I8 | KMetalDtype::I64 => {
+                PrimaryKind::I32
+            }
+            KMetalDtype::U32 | KMetalDtype::U16 | KMetalDtype::U8 | KMetalDtype::Bool => {
+                PrimaryKind::U32
+            }
+            // Utf8 is never an agg value-column dtype; the dispatch router
+            // filters this out. Treat as U32 (its underlying code dtype) for
+            // exhaustiveness; reaching this arm would mean a router bug.
+            KMetalDtype::Utf8 => PrimaryKind::U32,
+        },
+    }
+}
+
+fn seed_buffer_i32(
+    device: &MetalDevice,
+    seed: i32,
+    n_groups: usize,
+) -> Result<polars_metal_buffer::MetalBuffer, FusedDispatchError> {
+    let v: Vec<i32> = vec![seed; n_groups];
+    // SAFETY: i32 is plain-old-data.
+    let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, n_groups * 4) };
+    device
+        .new_buffer_from_bytes(bytes)
+        .map_err(|e| FusedDispatchError::GroupBy(GroupByError::Buffer(e)))
+}
+
+fn seed_buffer_u32(
+    device: &MetalDevice,
+    seed: u32,
+    n_groups: usize,
+) -> Result<polars_metal_buffer::MetalBuffer, FusedDispatchError> {
+    let v: Vec<u32> = vec![seed; n_groups];
+    // SAFETY: u32 is plain-old-data.
+    let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, n_groups * 4) };
+    device
+        .new_buffer_from_bytes(bytes)
+        .map_err(|e| FusedDispatchError::GroupBy(GroupByError::Buffer(e)))
+}
+
+/// Read back one agg's output buffer(s) and widen into `AggOutput`.
+fn finalize_agg_output(
+    agg: &KAggSpec,
+    obuf: &OutputBuf,
+    n_groups: usize,
+    col_dtypes: &std::collections::BTreeMap<String, KMetalDtype>,
+) -> Result<AggOutput, FusedDispatchError> {
+    let primary_bytes = obuf.primary.as_slice();
+    let need = n_groups * 4;
+    if primary_bytes.len() < need {
+        return Err(FusedDispatchError::GroupBy(GroupByError::OutputTooShort {
+            got: primary_bytes.len(),
+            need,
+        }));
+    }
+
+    // For Mean, read the count companion now.
+    let count_vec: Option<Vec<u32>> = obuf.count.as_ref().map(|c| {
+        let b = c.as_slice();
+        (0..n_groups)
+            .map(|g| u32::from_le_bytes(b[g * 4..g * 4 + 4].try_into().unwrap_or([0; 4])))
+            .collect::<Vec<u32>>()
+    });
+
+    match agg {
+        KAggSpec::Length { .. } => {
+            let vals = read_u32_to_u64(primary_bytes, n_groups);
+            Ok(AggOutput::U64 { values: vals })
+        }
+        KAggSpec::Simple { op, input_col, .. } => {
+            let dt = *col_dtypes.get(input_col).ok_or_else(|| {
+                FusedDispatchError::MissingValueColumn {
+                    slot: 0,
+                    name: input_col.clone(),
+                }
+            })?;
+            finalize_simple_like(*op, dt, obuf, primary_bytes, n_groups, count_vec)
+        }
+        KAggSpec::Expression { op, .. } => {
+            // Expression evaluates to f32 always; treat as F32 input dtype.
+            finalize_simple_like(
+                *op,
+                KMetalDtype::F32,
+                obuf,
+                primary_bytes,
+                n_groups,
+                count_vec,
+            )
+        }
+    }
+}
+
+/// Shared finalize: handles Sum / Mean / Min / Max / Count given the
+/// (op, input dtype) pair. The fused emitter's primary kind disambiguates
+/// the 32-bit container type.
+fn finalize_simple_like(
+    op: KAggOp,
+    input_dt: KMetalDtype,
+    obuf: &OutputBuf,
+    primary_bytes: &[u8],
+    n_groups: usize,
+    count_vec: Option<Vec<u32>>,
+) -> Result<AggOutput, FusedDispatchError> {
+    match op {
+        KAggOp::Count => Ok(AggOutput::U64 {
+            values: read_u32_to_u64(primary_bytes, n_groups),
+        }),
+        KAggOp::Len => Ok(AggOutput::U64 {
+            values: read_u32_to_u64(primary_bytes, n_groups),
+        }),
+        KAggOp::Sum => match obuf.primary_kind {
+            PrimaryKind::I32 => {
+                let values: Vec<i32> = read_i32(primary_bytes, n_groups);
+                // Polars sum of an all-null group returns 0 (not null) —
+                // matches the M2 i32 sum path.
+                Ok(AggOutput::I32 {
+                    values,
+                    valid: vec![true; n_groups],
+                })
+            }
+            PrimaryKind::U32 => {
+                let values: Vec<i32> = read_u32(primary_bytes, n_groups)
+                    .into_iter()
+                    .map(|v| v as i32)
+                    .collect();
+                Ok(AggOutput::I32 {
+                    values,
+                    valid: vec![true; n_groups],
+                })
+            }
+            PrimaryKind::F32Bits => {
+                let values: Vec<f32> = read_f32_bits(primary_bytes, n_groups);
+                Ok(AggOutput::F32 {
+                    values,
+                    valid: vec![true; n_groups],
+                })
+            }
+        },
+        KAggOp::Mean => {
+            let counts = count_vec.unwrap_or_else(|| vec![0u32; n_groups]);
+            match obuf.primary_kind {
+                PrimaryKind::I32 => {
+                    let sums: Vec<i32> = read_i32(primary_bytes, n_groups);
+                    let (values, valid) = mean_from_sum_count_i32(&sums, &counts);
+                    Ok(AggOutput::F32 { values, valid })
+                }
+                PrimaryKind::U32 => {
+                    let sums: Vec<u32> = read_u32(primary_bytes, n_groups);
+                    let (values, valid) = mean_from_sum_count_u32(&sums, &counts);
+                    Ok(AggOutput::F32 { values, valid })
+                }
+                PrimaryKind::F32Bits => {
+                    let sums: Vec<f32> = read_f32_bits(primary_bytes, n_groups);
+                    let (values, valid) = mean_from_sum_count_f32(&sums, &counts);
+                    Ok(AggOutput::F32 { values, valid })
+                }
+            }
+        }
+        KAggOp::Min | KAggOp::Max => {
+            // Per-group validity: a group is null only when no input row
+            // contributed. The fused emitter doesn't currently materialize
+            // a per-agg count companion for Min/Max (Task 16 will explore
+            // adding one). Q1-shape workloads have no all-null groups, so
+            // we treat all groups as valid for now. See the commit message
+            // for Task 15 for the limitation note.
+            match obuf.primary_kind {
+                PrimaryKind::I32 => {
+                    let values: Vec<i32> = read_i32(primary_bytes, n_groups);
+                    Ok(AggOutput::I32 {
+                        values,
+                        valid: vec![true; n_groups],
+                    })
+                }
+                PrimaryKind::U32 => {
+                    // unsigned-input Min/Max isn't exercised in Q1 today, but
+                    // the emitter still emits a u32 accumulator. We preserve
+                    // it by returning as I32 (Polars surfaces u32 separately;
+                    // M2's per-agg path doesn't yet route u32 either, so
+                    // this is unreachable on the canonical workloads). Mark
+                    // every group valid.
+                    let _ = input_dt; // silence
+                    let values: Vec<i32> = read_u32(primary_bytes, n_groups)
+                        .into_iter()
+                        .map(|v| v as i32)
+                        .collect();
+                    Ok(AggOutput::I32 {
+                        values,
+                        valid: vec![true; n_groups],
+                    })
+                }
+                PrimaryKind::F32Bits => {
+                    let values: Vec<f32> = read_f32_bits(primary_bytes, n_groups);
+                    Ok(AggOutput::F32 {
+                        values,
+                        valid: vec![true; n_groups],
+                    })
+                }
+            }
+        }
+    }
+}
+
+// ---- typed read helpers --------------------------------------------------
+
+fn read_u32(bytes: &[u8], n: usize) -> Vec<u32> {
+    let mut out = Vec::with_capacity(n);
+    for g in 0..n {
+        let b = &bytes[g * 4..g * 4 + 4];
+        out.push(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    }
+    out
+}
+
+fn read_u32_to_u64(bytes: &[u8], n: usize) -> Vec<u64> {
+    let mut out = Vec::with_capacity(n);
+    for g in 0..n {
+        let b = &bytes[g * 4..g * 4 + 4];
+        out.push(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64);
+    }
+    out
+}
+
+fn read_i32(bytes: &[u8], n: usize) -> Vec<i32> {
+    let mut out = Vec::with_capacity(n);
+    for g in 0..n {
+        let b = &bytes[g * 4..g * 4 + 4];
+        out.push(i32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    }
+    out
+}
+
+fn read_f32_bits(bytes: &[u8], n: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(n);
+    for g in 0..n {
+        let b = &bytes[g * 4..g * 4 + 4];
+        let bits = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        out.push(f32::from_bits(bits));
+    }
+    out
+}
+
+fn mean_from_sum_count_f32(sums: &[f32], counts: &[u32]) -> (Vec<f32>, Vec<bool>) {
+    let mut values = Vec::with_capacity(sums.len());
+    let mut valid = Vec::with_capacity(sums.len());
+    for (s, &c) in sums.iter().zip(counts.iter()) {
+        if c == 0 {
+            values.push(0.0f32);
+            valid.push(false);
+        } else {
+            values.push(*s / c as f32);
+            valid.push(true);
+        }
+    }
+    (values, valid)
+}
+
+fn mean_from_sum_count_i32(sums: &[i32], counts: &[u32]) -> (Vec<f32>, Vec<bool>) {
+    let mut values = Vec::with_capacity(sums.len());
+    let mut valid = Vec::with_capacity(sums.len());
+    for (s, &c) in sums.iter().zip(counts.iter()) {
+        if c == 0 {
+            values.push(0.0f32);
+            valid.push(false);
+        } else {
+            values.push(*s as f32 / c as f32);
+            valid.push(true);
+        }
+    }
+    (values, valid)
+}
+
+fn mean_from_sum_count_u32(sums: &[u32], counts: &[u32]) -> (Vec<f32>, Vec<bool>) {
+    let mut values = Vec::with_capacity(sums.len());
+    let mut valid = Vec::with_capacity(sums.len());
+    for (s, &c) in sums.iter().zip(counts.iter()) {
+        if c == 0 {
+            values.push(0.0f32);
+            valid.push(false);
+        } else {
+            values.push(*s as f32 / c as f32);
+            valid.push(true);
+        }
+    }
+    (values, valid)
 }

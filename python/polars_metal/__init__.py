@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 from functools import partial, wraps
 from typing import Any
@@ -18,6 +19,48 @@ __version__ = _native.version_string()
 _PATCH_ATTR = "_polars_metal_original_gpu_engine_callback"
 _COLLECT_PATCH_ATTR = "_polars_metal_original_collect"
 _EXPECTED_PARAMS = {"engine", "streaming", "background", "new_streaming", "_eager"}
+
+# Optimization flags forwarded verbatim when we rebuild a user-supplied
+# `optimizations` object with CSE forced off (see `_opt_flags_without_cse`).
+_OPT_FLAG_FIELDS = (
+    "predicate_pushdown",
+    "projection_pushdown",
+    "simplify_expression",
+    "slice_pushdown",
+    "comm_subplan_elim",
+    "cluster_with_columns",
+    "collapse_joins",
+    "check_order_observe",
+    "fast_projection",
+    "sort_collapse",
+)
+
+
+def _opt_flags_without_cse(user_opt: Any) -> Any:
+    """Return a fresh ``QueryOptFlags`` with ``comm_subexpr_elim`` forced off.
+
+    Polars' common-subexpression-elimination pass hoists shared subexpressions
+    into ``__POLARS_CSER_*`` temp columns. For a Metal-routed compute subtree
+    that fragments one fused MLX subgraph into several — each temp column
+    becomes its own dispatch, with its result round-tripping Series→Metal→Series
+    between dispatches. That is exactly the per-dispatch fragmentation
+    CLAUDE.md's principle #1 warns against; MLX does its own kernel-level CSE,
+    so Polars-side CSE only hurts us here. Measured: the 10M haversine collapses
+    from 3 dispatches to 1 with CSE off.
+
+    ``QueryOptFlags.update`` mutates in place and the module-level default is a
+    shared singleton, so we never mutate — we construct a new object, copying
+    any caller-supplied flags through and overriding only CSE.
+    """
+    from polars.lazyframe.opt_flags import QueryOptFlags
+
+    kwargs: dict[str, Any] = {}
+    if user_opt is not None:
+        for field in _OPT_FLAG_FIELDS:
+            value = getattr(user_opt, field, None)
+            if value is not None:
+                kwargs[field] = value
+    return QueryOptFlags(comm_subexpr_elim=False, **kwargs)
 
 
 def _verify_patch_site() -> None:
@@ -129,6 +172,14 @@ def _patch_gpu_engine_callback() -> None:
                     return existing_cb(nt, *args, **kw)
 
                 cb = chained
+            # Force CSE off for Metal-routed plans so a compute subtree stays
+            # a single fused MLX subgraph rather than fragmenting across one
+            # dispatch per hoisted temp column (see `_opt_flags_without_cse`).
+            # A deprecated direct `comm_subexpr_elim` kwarg, if present, is
+            # dropped — the `optimizations` object is the supported channel and
+            # we override CSE regardless of what the caller requested.
+            kwargs.pop("comm_subexpr_elim", None)
+            kwargs["optimizations"] = _opt_flags_without_cse(kwargs.pop("optimizations", None))
             # post_opt_callback is an internal bypass that injects a callback
             # directly, skipping _gpu_engine_callback. We run the query on
             # the CPU engine; in M0 our callback falls through, so the result
@@ -140,6 +191,24 @@ def _patch_gpu_engine_callback() -> None:
 
 
 _patch_gpu_engine_callback()
+
+
+def _warmup_kernels() -> None:
+    """Pre-compile common fused-agg signatures at import time (Task 18).
+
+    Cost: ~100-500ms one-time per process. Benefit: first user query of
+    common shapes (single F32 Sum, F32 Mean, Q1-shape 10-agg, Q1 disc_price
+    expression) doesn't pay MSL compile (~100-300ms each).
+
+    Best-effort: any error (missing Metal device, compile failure) is
+    swallowed so module import never breaks. Real failures resurface when
+    a query of that shape actually runs.
+    """
+    with contextlib.suppress(Exception):
+        _native.warmup_common_fused_signatures()
+
+
+_warmup_kernels()
 
 
 __all__ = ["MetalEngine", "__version__"]

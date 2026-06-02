@@ -75,7 +75,12 @@ fn key_width_bits(dtype: MetalDtype) -> usize {
     match dtype {
         MetalDtype::Bool => 1 + 1,
         MetalDtype::I64 | MetalDtype::F64 => 1 + 64,
-        MetalDtype::I32 | MetalDtype::F32 => 1 + 32,
+        MetalDtype::I32 | MetalDtype::F32 | MetalDtype::U32 => 1 + 32,
+        MetalDtype::I16 | MetalDtype::U16 => 1 + 16,
+        MetalDtype::I8 | MetalDtype::U8 => 1 + 8,
+        // M3 Phase 7: Utf8 keys are dictionary-encoded into u32 codes; same
+        // width as U32 from the composite-key encoder's perspective.
+        MetalDtype::Utf8 => 1 + 32,
     }
 }
 
@@ -85,8 +90,17 @@ fn key_width_bits(dtype: MetalDtype) -> usize {
 pub fn decide_groupby_with_keys(
     n_rows: usize,
     keys: &[(String, MetalDtype)],
-    _aggs: &[AggSpec],
+    aggs: &[AggSpec],
 ) -> NodeDecision {
+    // Phase 3 (Task 15) wires Expression aggs to the fused-kernel consumer
+    // via `udf::dispatch_groupby_fused`. The Phase 2 plan-time gate that
+    // forced Fallback on any Expression spec is removed; routing of
+    // fused-vs-per-agg now happens at dispatch time and is invisible to
+    // the cost model. `aggs` is retained in the signature so future
+    // dtype-aware checks (e.g. F64 aggregation falls back at plan time)
+    // can land here without an API churn.
+    let _ = aggs;
+
     let total_bits: usize = keys.iter().map(|(_, d)| key_width_bits(*d)).sum();
     if total_bits > 128 {
         return NodeDecision::Fallback(format!(

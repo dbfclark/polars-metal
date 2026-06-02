@@ -21,14 +21,19 @@
 //! directly via PyO3 `call_method1`. `PyDataFrame.select` is a synchronous,
 //! in-place column reorder/subset that bypasses the lazy plan entirely.
 
-use crate::plan::{AggOp, MetalDtype, MetalPlanNode, PredicateAst};
+use crate::plan::{AggExpr, AggOp, BinaryOp, MetalDtype, MetalPlanNode, PredicateAst};
 use polars_metal_buffer::MetalDevice;
+use polars_metal_kernels::aggregate_fused::cache::FusedLibraryCache;
+use polars_metal_kernels::aggregate_fused::signature::{
+    AggExpr as KAggExpr, AggOp as KAggOp, AggSpec as KAggSpec, BinaryOp as KBinaryOp,
+    MetalDtype as KMetalDtype,
+};
 use polars_metal_kernels::cmp::{
     dispatch_cmp_f64, dispatch_cmp_f64_scalar, dispatch_cmp_i64, dispatch_cmp_i64_scalar, CompareOp,
 };
 use polars_metal_kernels::command::CommandQueue;
 use polars_metal_kernels::groupby::{
-    AggKind, AggRequest, GroupByError, KeyColumn, KeyDtype, ValueColumn,
+    dispatch_groupby_fused, AggKind, AggRequest, GroupByError, KeyColumn, KeyDtype, ValueColumn,
 };
 use polars_metal_kernels::logical::{dispatch_bool_and, dispatch_bool_or};
 use polars_metal_kernels::pipeline::{
@@ -37,7 +42,185 @@ use polars_metal_kernels::pipeline::{
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::OnceLock;
+
+// ----------------------------------------------------------------------------
+// IR → kernel-layer mirrors (Phase 3 / Task 15)
+// ----------------------------------------------------------------------------
+
+/// Convert IR `AggOp` → kernel-layer `AggOp` mirror.
+fn convert_agg_op(op: AggOp) -> KAggOp {
+    match op {
+        AggOp::Sum => KAggOp::Sum,
+        AggOp::Mean => KAggOp::Mean,
+        AggOp::Count => KAggOp::Count,
+        AggOp::Min => KAggOp::Min,
+        AggOp::Max => KAggOp::Max,
+        AggOp::Len => KAggOp::Len,
+    }
+}
+
+/// Convert IR `BinaryOp` → kernel-layer mirror.
+fn convert_binary_op(op: BinaryOp) -> KBinaryOp {
+    match op {
+        BinaryOp::Add => KBinaryOp::Add,
+        BinaryOp::Sub => KBinaryOp::Sub,
+        BinaryOp::Mul => KBinaryOp::Mul,
+        BinaryOp::Div => KBinaryOp::Div,
+    }
+}
+
+/// Convert IR `AggExpr` → kernel-layer mirror (mechanical tree walk).
+fn convert_agg_expr(expr: &AggExpr) -> KAggExpr {
+    match expr {
+        AggExpr::Column(name) => KAggExpr::Column(name.clone()),
+        AggExpr::LiteralF64(v) => KAggExpr::LiteralF64(*v),
+        AggExpr::LiteralI64(v) => KAggExpr::LiteralI64(*v),
+        AggExpr::Binary { op, lhs, rhs } => KAggExpr::Binary {
+            op: convert_binary_op(*op),
+            lhs: Box::new(convert_agg_expr(lhs)),
+            rhs: Box::new(convert_agg_expr(rhs)),
+        },
+    }
+}
+
+/// Wire dtype tag (`"I32"` / `"F32"` / ...) → kernel-layer `MetalDtype`.
+fn wire_dtype_tag_to_kernel(tag: &str) -> Option<KMetalDtype> {
+    match tag {
+        "I64" => Some(KMetalDtype::I64),
+        "F64" => Some(KMetalDtype::F64),
+        "Bool" => Some(KMetalDtype::Bool),
+        "I32" => Some(KMetalDtype::I32),
+        "F32" => Some(KMetalDtype::F32),
+        "I8" => Some(KMetalDtype::I8),
+        "I16" => Some(KMetalDtype::I16),
+        "U8" => Some(KMetalDtype::U8),
+        "U16" => Some(KMetalDtype::U16),
+        "U32" => Some(KMetalDtype::U32),
+        // M3 Phase 7: Utf8 is a key dtype only — never a valid agg value
+        // column. Returning None here forces `decide_groupby_dispatch` down
+        // the PerAgg branch (or further fallback) if a router bug ever lifts
+        // a Utf8 column into agg-input position.
+        "Utf8" | "String" => None,
+        _ => None,
+    }
+}
+
+/// Routing decision for one groupby query: fused single-kernel dispatch
+/// vs M2's per-agg loop. See `decide_groupby_dispatch` for the rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupByDispatchChoice {
+    Fused,
+    PerAgg,
+}
+
+/// Decide between the fused kernel and M2's per-agg path.
+///
+/// Rules (Task 15):
+///   1. If any agg is Expression → Fused (Expression has no per-agg fallback).
+///   2. Otherwise, if every agg is Simple/Length AND there are ≥ 2 aggs
+///      AND the signature is fused-supported (all 32-bit-or-narrower inputs)
+///      → Fused.
+///   3. Otherwise → PerAgg (single-agg queries, F64/I64 inputs, etc.).
+///
+/// Caller must have already verified the value columns referenced by the
+/// aggs are present in the HashMap. The signature is built once here and
+/// inspected for support; the same signature is reused at dispatch time.
+fn decide_groupby_dispatch(
+    parsed: &[ParsedAgg],
+    by_name: &HashMap<String, (String, &[u8], &[u8])>,
+) -> GroupByDispatchChoice {
+    let has_expression = parsed
+        .iter()
+        .any(|a| matches!(a, ParsedAgg::Expression { .. }));
+    let n_simple_or_len = parsed
+        .iter()
+        .filter(|a| !matches!(a, ParsedAgg::Expression { .. }))
+        .count();
+
+    // Check that every referenced column is 32-bit-or-narrower (fused-only
+    // supports that). Build a tentative signature inline.
+    let mut col_dtypes: BTreeMap<String, KMetalDtype> = BTreeMap::new();
+    let mut all_fused_supported = true;
+    for a in parsed {
+        match a {
+            ParsedAgg::Simple { input_col, .. } => {
+                let Some((dt_tag, _, _)) = by_name.get(input_col) else {
+                    return GroupByDispatchChoice::PerAgg;
+                };
+                let Some(kdt) = wire_dtype_tag_to_kernel(dt_tag) else {
+                    return GroupByDispatchChoice::PerAgg;
+                };
+                if matches!(kdt, KMetalDtype::F64 | KMetalDtype::I64) {
+                    all_fused_supported = false;
+                }
+                col_dtypes.entry(input_col.clone()).or_insert(kdt);
+            }
+            ParsedAgg::Expression { expr, .. } => {
+                for c in expr.referenced_columns() {
+                    let Some((dt_tag, _, _)) = by_name.get(&c) else {
+                        return GroupByDispatchChoice::PerAgg;
+                    };
+                    let Some(kdt) = wire_dtype_tag_to_kernel(dt_tag) else {
+                        return GroupByDispatchChoice::PerAgg;
+                    };
+                    if matches!(kdt, KMetalDtype::F64 | KMetalDtype::I64) {
+                        all_fused_supported = false;
+                    }
+                    col_dtypes.entry(c).or_insert(kdt);
+                }
+            }
+            ParsedAgg::Length { .. } => {}
+        }
+    }
+
+    if has_expression && all_fused_supported {
+        return GroupByDispatchChoice::Fused;
+    }
+    if !has_expression && n_simple_or_len >= 2 && all_fused_supported {
+        return GroupByDispatchChoice::Fused;
+    }
+    GroupByDispatchChoice::PerAgg
+}
+
+/// Process-wide fused-library cache. Constructed lazily on first dispatch
+/// when the system default Metal device is acquirable.
+static FUSED_CACHE: OnceLock<FusedLibraryCache> = OnceLock::new();
+
+fn get_or_init_fused_cache(device: &MetalDevice) -> &'static FusedLibraryCache {
+    FUSED_CACHE.get_or_init(|| FusedLibraryCache::new(device.clone()))
+}
+
+/// Pre-compile common fused-agg signatures into the process-wide
+/// `FUSED_CACHE` (Task 18). Called from `python/polars_metal/__init__.py`
+/// at import time so the first user query of a common shape
+/// (single-column F32 Sum, Q1-shape 10-agg, etc.) does not pay the MSL
+/// compile cost.
+///
+/// Best-effort: if the Metal device cannot be acquired (no Metal-capable
+/// hardware), or any individual signature fails to compile, the warmup
+/// returns the number of signatures actually queued (0 on device failure).
+/// The Python wrapper swallows exceptions too — warmup is advisory and
+/// must not break engine startup.
+///
+/// Returns the count of signatures the cache was asked to warm; the
+/// Python side uses this for logging and the integration test.
+#[pyfunction]
+pub fn warmup_common_fused_signatures() -> i32 {
+    use polars_metal_kernels::aggregate_fused::cache::common_signatures;
+
+    let Ok(device) = MetalDevice::system_default() else {
+        // No Metal device available — running under a non-Metal harness
+        // (e.g. CI without a GPU). Warmup is a no-op; skip without error.
+        return 0;
+    };
+    let cache = get_or_init_fused_cache(&device);
+    let sigs = common_signatures();
+    let count = sigs.len() as i32;
+    cache.warmup(&sigs);
+    count
+}
 
 /// PyO3 entry point exposed as `polars_metal._native.execute_plan`.
 ///
@@ -384,6 +567,23 @@ fn compact_one_column(
                 "polars_metal: filter compaction for {column_name:?} (I32/F32) not yet implemented"
             )))
         }
+        // M3 capability F: small-integer key dtypes. Not supported in the
+        // filter compaction path — filter is CPU-routed for these and the
+        // walker should never lift a filter over such a column. Surface as
+        // PyNotImplementedError so a router bug is visible.
+        MetalDtype::I8 | MetalDtype::I16 | MetalDtype::U8 | MetalDtype::U16 | MetalDtype::U32 => {
+            Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                "polars_metal: filter compaction for {column_name:?} ({dtype:?}) not supported; filter should route CPU"
+            )))
+        }
+        // M3 Phase 7: Utf8 keys go through the composite-key encoder, but the
+        // filter compaction path has no Utf8 support yet. Filter on Utf8 must
+        // route CPU; reaching this arm is a router bug.
+        MetalDtype::Utf8 => {
+            Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                "polars_metal: filter on Utf8 columns ({column_name:?}): not yet wired"
+            )))
+        }
     }
 }
 
@@ -576,16 +776,11 @@ fn deserialize_predicate(dict: &Bound<PyDict>) -> PyResult<PredicateAst> {
 }
 
 fn parse_dtype(s: &str) -> PyResult<MetalDtype> {
-    match s {
-        "I64" => Ok(MetalDtype::I64),
-        "F64" => Ok(MetalDtype::F64),
-        "Bool" => Ok(MetalDtype::Bool),
-        "I32" => Ok(MetalDtype::I32),
-        "F32" => Ok(MetalDtype::F32),
-        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "polars_metal: unknown MetalDtype tag {other:?}"
-        ))),
-    }
+    MetalDtype::from_wire(s).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "polars_metal: unknown MetalDtype tag {s:?}"
+        ))
+    })
 }
 
 /// Parse the wire-format op tag (matching `CompareOp::Eq/Ne/Lt/Le/Gt/Ge`)
@@ -911,12 +1106,35 @@ pub struct ParsedKey {
     pub dtype: MetalDtype,
 }
 
-/// One aggregation descriptor from the wire plan.
-#[derive(Debug)]
-pub struct ParsedAgg {
-    pub input_col: String,
-    pub op: AggOp,
-    pub output_alias: String,
+/// One aggregation descriptor from the wire plan. Mirrors the
+/// [`crate::plan::AggSpec`] enum (Simple / Expression / Length).
+#[derive(Debug, Clone)]
+pub enum ParsedAgg {
+    Simple {
+        input_col: String,
+        op: AggOp,
+        output_alias: String,
+    },
+    Expression {
+        expr: AggExpr,
+        op: AggOp,
+        output_alias: String,
+    },
+    Length {
+        output_alias: String,
+    },
+}
+
+impl ParsedAgg {
+    /// Convenience: the output alias regardless of variant. Every variant
+    /// carries one; dispatch reads this for result-column naming.
+    pub fn output_alias(&self) -> &str {
+        match self {
+            ParsedAgg::Simple { output_alias, .. }
+            | ParsedAgg::Expression { output_alias, .. }
+            | ParsedAgg::Length { output_alias } => output_alias,
+        }
+    }
 }
 
 /// Errors produced while parsing the Python groupby plan dict.
@@ -930,6 +1148,92 @@ pub enum GroupByParseError {
     UnknownDtype(String),
     #[error("unknown agg op: {0}")]
     UnknownOp(String),
+}
+
+/// Recursively parse one `{"kind": ..., ...}` dict emitted by the Python
+/// walker's expression extractor into an [`AggExpr`].
+///
+/// The accepted shapes mirror `_walk_agg_expr_node` in `_walker.py`:
+/// - `{"kind": "Column", "name": str}` → [`AggExpr::Column`]
+/// - `{"kind": "LiteralF64", "value": float}` → [`AggExpr::LiteralF64`]
+/// - `{"kind": "LiteralI64", "value": int}` → [`AggExpr::LiteralI64`]
+/// - `{"kind": "Binary", "op": "Add"|"Sub"|"Mul"|"Div",
+///       "lhs": <expr dict>, "rhs": <expr dict>}` → [`AggExpr::Binary`]
+///
+/// Unknown kinds or unknown binary ops produce
+/// [`GroupByParseError::UnknownOp`]; missing or wrongly-typed fields
+/// produce [`GroupByParseError::WrongType`].
+fn parse_agg_expr_dict(d: &Bound<PyDict>) -> Result<AggExpr, GroupByParseError> {
+    let kind: String = d
+        .get_item("kind")
+        .ok()
+        .flatten()
+        .and_then(|v| v.extract().ok())
+        .ok_or(GroupByParseError::WrongType("expr.kind"))?;
+    match kind.as_str() {
+        "Column" => {
+            let name: String = d
+                .get_item("name")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract().ok())
+                .ok_or(GroupByParseError::WrongType("expr.name"))?;
+            Ok(AggExpr::Column(name))
+        }
+        "LiteralF64" => {
+            let v: f64 = d
+                .get_item("value")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract().ok())
+                .ok_or(GroupByParseError::WrongType("expr.value(f64)"))?;
+            Ok(AggExpr::LiteralF64(v))
+        }
+        "LiteralI64" => {
+            let v: i64 = d
+                .get_item("value")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract().ok())
+                .ok_or(GroupByParseError::WrongType("expr.value(i64)"))?;
+            Ok(AggExpr::LiteralI64(v))
+        }
+        "Binary" => {
+            let op_str: String = d
+                .get_item("op")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract().ok())
+                .ok_or(GroupByParseError::WrongType("expr.op"))?;
+            let op = match op_str.as_str() {
+                "Add" => BinaryOp::Add,
+                "Sub" => BinaryOp::Sub,
+                "Mul" => BinaryOp::Mul,
+                "Div" => BinaryOp::Div,
+                _ => return Err(GroupByParseError::UnknownOp(format!("binary op {op_str}"))),
+            };
+            let lhs_dict: Bound<PyDict> = d
+                .get_item("lhs")
+                .ok()
+                .flatten()
+                .ok_or(GroupByParseError::WrongType("expr.lhs"))?
+                .downcast_into()
+                .map_err(|_| GroupByParseError::WrongType("expr.lhs(dict)"))?;
+            let rhs_dict: Bound<PyDict> = d
+                .get_item("rhs")
+                .ok()
+                .flatten()
+                .ok_or(GroupByParseError::WrongType("expr.rhs"))?
+                .downcast_into()
+                .map_err(|_| GroupByParseError::WrongType("expr.rhs(dict)"))?;
+            Ok(AggExpr::Binary {
+                op,
+                lhs: Box::new(parse_agg_expr_dict(&lhs_dict)?),
+                rhs: Box::new(parse_agg_expr_dict(&rhs_dict)?),
+            })
+        }
+        other => Err(GroupByParseError::UnknownOp(format!("expr kind={other}"))),
+    }
 }
 
 /// Parse the `plan_dict` PyDict emitted by the Python walker into a
@@ -990,31 +1294,95 @@ pub fn parse_groupby_plan(plan: &Bound<PyDict>) -> Result<ParsedGroupByPlan, Gro
         let entry: Bound<PyDict> = item
             .downcast_into()
             .map_err(|_| GroupByParseError::WrongType("agg entry"))?;
-        // input_col is empty string for Len; default to empty if absent.
-        let input_col: String = entry
-            .get_item("input_col")
+
+        // Backwards-compatible read: missing "kind" means M2-shape Simple/Length
+        // (the existing wire format). Explicit "kind" means M3-shape; the
+        // "Expression" arm requires an "expr" sub-dict whose parser lands
+        // in Task 9 (Phase 2 Task 8 leaves it as a stub error).
+        let kind: String = entry
+            .get_item("kind")
             .ok()
             .flatten()
             .and_then(|v| v.extract().ok())
-            .unwrap_or_default();
-        let op_str: String = entry
-            .get_item("op")
-            .ok()
-            .flatten()
-            .and_then(|v| v.extract().ok())
-            .ok_or(GroupByParseError::WrongType("op"))?;
-        let op = AggOp::from_wire(&op_str).ok_or(GroupByParseError::UnknownOp(op_str))?;
+            .unwrap_or_else(|| {
+                // Legacy shape: infer Length from op=="Len", Simple otherwise.
+                let op_str: String = entry
+                    .get_item("op")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.extract().ok())
+                    .unwrap_or_default();
+                if op_str == "Len" {
+                    "Length".into()
+                } else {
+                    "Simple".into()
+                }
+            });
+
         let output_alias: String = entry
             .get_item("output_alias")
             .ok()
             .flatten()
             .and_then(|v| v.extract().ok())
             .ok_or(GroupByParseError::WrongType("output_alias"))?;
-        aggs.push(ParsedAgg {
-            input_col,
-            op,
-            output_alias,
-        });
+
+        let parsed = match kind.as_str() {
+            "Length" => ParsedAgg::Length { output_alias },
+            "Simple" => {
+                // input_col is empty string for Len legacy; default empty if absent.
+                let input_col: String = entry
+                    .get_item("input_col")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.extract().ok())
+                    .unwrap_or_default();
+                let op_str: String = entry
+                    .get_item("op")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.extract().ok())
+                    .ok_or(GroupByParseError::WrongType("op"))?;
+                let op = AggOp::from_wire(&op_str).ok_or(GroupByParseError::UnknownOp(op_str))?;
+                ParsedAgg::Simple {
+                    input_col,
+                    op,
+                    output_alias,
+                }
+            }
+            "Expression" => {
+                // Capability G (M3 Phase 2): the walker emits a recursive
+                // AggExpr sub-tree under `expr` plus the outer reducer (`op`)
+                // and alias. Parse the sub-tree, then re-validate the depth
+                // cap on the Rust side as defence-in-depth (the walker's
+                // `_AGG_EXPR_MAX_DEPTH` is the primary gate).
+                let op_str: String = entry
+                    .get_item("op")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.extract().ok())
+                    .ok_or(GroupByParseError::WrongType("op"))?;
+                let op = AggOp::from_wire(&op_str).ok_or(GroupByParseError::UnknownOp(op_str))?;
+                let expr_dict: Bound<PyDict> = entry
+                    .get_item("expr")
+                    .ok()
+                    .flatten()
+                    .ok_or(GroupByParseError::WrongType("expr"))?
+                    .downcast_into()
+                    .map_err(|_| GroupByParseError::WrongType("expr(dict)"))?;
+                let expr = parse_agg_expr_dict(&expr_dict)?;
+                expr.validate()
+                    .map_err(|_| GroupByParseError::WrongType("expr(too deep)"))?;
+                ParsedAgg::Expression {
+                    expr,
+                    op,
+                    output_alias,
+                }
+            }
+            other => {
+                return Err(GroupByParseError::UnknownOp(format!("kind={other}")));
+            }
+        };
+        aggs.push(parsed);
     }
 
     Ok(ParsedGroupByPlan { keys, aggs })
@@ -1028,6 +1396,12 @@ fn metal_dtype_to_key_dtype(d: MetalDtype) -> KeyDtype {
         MetalDtype::Bool => KeyDtype::Bool,
         MetalDtype::I32 => KeyDtype::I32,
         MetalDtype::F32 => KeyDtype::F32,
+        MetalDtype::I8 => KeyDtype::I8,
+        MetalDtype::I16 => KeyDtype::I16,
+        MetalDtype::U8 => KeyDtype::U8,
+        MetalDtype::U16 => KeyDtype::U16,
+        MetalDtype::U32 => KeyDtype::U32,
+        MetalDtype::Utf8 => KeyDtype::Utf8,
     }
 }
 
@@ -1038,6 +1412,53 @@ fn metal_dtype_to_key_dtype(d: MetalDtype) -> KeyDtype {
 /// wrapped in `ValueColumn`. We use `unsafe slice::from_raw_parts` here
 /// for the same reason as the filter path: no `bytemuck` dep, and Arrow
 /// buffers are guaranteed to be at least 8-byte aligned.
+/// Construct a typed `ValueColumn` view over raw bytes for the fused
+/// groupby dispatcher.
+///
+/// Unlike [`build_agg_kind_and_vcol`] this does not derive a kernel-side
+/// `AggKind` — the fused dispatcher derives output shape from the
+/// `AggSignature`. Only the 32-bit-or-narrower dtypes the fused emitter
+/// supports are accepted; F64/I64 callers must route through the M2 path.
+fn build_value_column<'a>(
+    dtype_tag: &str,
+    data: &'a [u8],
+    valid: &'a [u8],
+    n_rows: usize,
+) -> Result<ValueColumn<'a>, String> {
+    match dtype_tag {
+        "I32" => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(format!(
+                    "I32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                ));
+            }
+            // SAFETY: i32 has no invalid bit patterns; Arrow buffers are
+            // 64-byte aligned so the reinterpret meets the 4-byte alignment.
+            let typed: &[i32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, n_rows) };
+            Ok(ValueColumn::I32 { data: typed, valid })
+        }
+        "F32" => {
+            let expected = n_rows * 4;
+            if data.len() < expected {
+                return Err(format!(
+                    "F32 data buffer too short: {got} < {expected}",
+                    got = data.len()
+                ));
+            }
+            // SAFETY: f32 has no invalid bit patterns; same alignment as I32.
+            let typed: &[f32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_rows) };
+            Ok(ValueColumn::F32 { data: typed, valid })
+        }
+        other => Err(format!(
+            "dtype {other} not supported by fused groupby (only I32/F32 currently)"
+        )),
+    }
+}
+
 fn build_agg_kind_and_vcol<'a>(
     op: AggOp,
     dtype_tag: &str,
@@ -1366,6 +1787,57 @@ fn encode_decoded_column(
             let v = pack_valid_bitmap(valid);
             ("F32", data, v)
         }
+        DecodedColumn::I8 { values, valid } => {
+            let data: Vec<u8> = values.iter().map(|v| *v as u8).collect();
+            let v = pack_valid_bitmap(valid);
+            ("I8", data, v)
+        }
+        DecodedColumn::I16 { values, valid } => {
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let v = pack_valid_bitmap(valid);
+            ("I16", data, v)
+        }
+        DecodedColumn::U8 { values, valid } => {
+            let data: Vec<u8> = values.to_vec();
+            let v = pack_valid_bitmap(valid);
+            ("U8", data, v)
+        }
+        DecodedColumn::U16 { values, valid } => {
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let v = pack_valid_bitmap(valid);
+            ("U16", data, v)
+        }
+        DecodedColumn::U32 { values, valid } => {
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let v = pack_valid_bitmap(valid);
+            ("U32", data, v)
+        }
+        DecodedColumn::Utf8 { values, valid } => {
+            // Wire format (parsed Python-side in Task 34):
+            //   [n_rows: u32 le]
+            //   [offsets: (n_rows+1) × i32 le]   Arrow Utf8 offset convention
+            //   [concatenated string bytes]
+            let n = values.len() as u32;
+            let mut data: Vec<u8> = Vec::new();
+            data.extend_from_slice(&n.to_le_bytes());
+            let mut offsets: Vec<i32> = Vec::with_capacity(values.len() + 1);
+            let mut acc: i32 = 0;
+            offsets.push(0);
+            let mut bytes_blob: Vec<u8> = Vec::new();
+            for (s, &is_valid) in values.iter().zip(valid.iter()) {
+                if is_valid {
+                    bytes_blob.extend_from_slice(s.as_bytes());
+                    acc = acc.saturating_add(s.len() as i32);
+                }
+                offsets.push(acc);
+            }
+            for o in &offsets {
+                data.extend_from_slice(&o.to_le_bytes());
+            }
+            data.extend_from_slice(&bytes_blob);
+            let v = pack_valid_bitmap(valid);
+            ("Utf8", data, v)
+        }
     }
 }
 
@@ -1495,7 +1967,18 @@ pub fn execute_groupby<'py>(
     //    We collect (data_bytes, valid_bytes) references before constructing
     //    KeyColumn structs so their lifetimes are tied to the PyBytes in
     //    `by_name`, which outlives the dispatch call.
+    //
+    //    Phase 7 Task 34: Utf8 keys need a server-side preprocessing pass.
+    //    The Python walker hands us a packed `[n_rows u32 le | offsets
+    //    (n+1)×i32 le | string bytes]` payload; we parse it into Option<&str>
+    //    rows, build (dict, codes) via `build_dict_nullable`, then transmute
+    //    the Vec<u32> codes to a Vec<u8> that the KeyColumn borrows. Both
+    //    the codes bytes AND the dict must outlive the KeyColumn, so we hold
+    //    them in `utf8_owned_data` here next to `key_byte_refs`.
     let mut key_byte_refs: Vec<(&[u8], &[u8])> = Vec::with_capacity(parsed.keys.len());
+    // Index `parsed.keys` → (codes_bytes, dict). None for non-Utf8 keys.
+    let mut utf8_owned_data: Vec<Option<(Vec<u8>, Vec<String>)>> =
+        Vec::with_capacity(parsed.keys.len());
     for k in &parsed.keys {
         let (_, data_py, valid_py) = by_name.get(&k.name).ok_or_else(|| {
             PyKeyError::new_err(format!(
@@ -1503,86 +1986,184 @@ pub fn execute_groupby<'py>(
                 k.name
             ))
         })?;
-        key_byte_refs.push((data_py.as_bytes(), valid_py.as_bytes()));
+        let data_bytes: &[u8] = data_py.as_bytes();
+        let valid_bytes: &[u8] = valid_py.as_bytes();
+
+        if k.dtype == MetalDtype::Utf8 {
+            // Parse the packed wire payload.
+            if data_bytes.len() < 4 {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Utf8 column {:?} wire payload too short ({} B; \
+                     need >= 4 for header)",
+                    k.name,
+                    data_bytes.len()
+                )));
+            }
+            let header_n =
+                u32::from_le_bytes([data_bytes[0], data_bytes[1], data_bytes[2], data_bytes[3]])
+                    as usize;
+            if header_n != n_rows {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Utf8 column {:?} wire n_rows={header_n} \
+                     disagrees with column n_rows={n_rows}",
+                    k.name
+                )));
+            }
+            let offsets_start = 4usize;
+            let offsets_end = offsets_start + (n_rows + 1) * 4;
+            if data_bytes.len() < offsets_end {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Utf8 column {:?} wire payload truncated in offsets \
+                     ({} B; need >= {})",
+                    k.name,
+                    data_bytes.len(),
+                    offsets_end
+                )));
+            }
+            let mut offsets: Vec<i32> = Vec::with_capacity(n_rows + 1);
+            for i in 0..=n_rows {
+                let off = offsets_start + i * 4;
+                offsets.push(i32::from_le_bytes([
+                    data_bytes[off],
+                    data_bytes[off + 1],
+                    data_bytes[off + 2],
+                    data_bytes[off + 3],
+                ]));
+            }
+            let string_bytes = &data_bytes[offsets_end..];
+
+            // Minimum validity bitmap length.
+            let min_valid = (n_rows + 7) / 8;
+            if valid_bytes.len() < min_valid {
+                return Err(PyValueError::new_err(format!(
+                    "polars_metal: Utf8 column {:?} validity buffer is {} B, \
+                     need at least {} B for {} rows",
+                    k.name,
+                    valid_bytes.len(),
+                    min_valid,
+                    n_rows
+                )));
+            }
+
+            // Build Option<&str> per row, honoring validity. Null rows get
+            // `None` and skip the offset slice entirely (Arrow's null row
+            // typically has offset[i] == offset[i+1], but we don't depend on
+            // that — we simply ignore offsets for null rows).
+            let mut strings_opt: Vec<Option<&str>> = Vec::with_capacity(n_rows);
+            for r in 0..n_rows {
+                let bit_set = (valid_bytes[r >> 3] >> (r & 7)) & 1 == 1;
+                if !bit_set {
+                    strings_opt.push(None);
+                    continue;
+                }
+                let s_off = offsets[r];
+                let e_off = offsets[r + 1];
+                if s_off < 0 || e_off < s_off {
+                    return Err(PyValueError::new_err(format!(
+                        "polars_metal: Utf8 column {:?} row {r} has invalid offsets \
+                         start={s_off} end={e_off}",
+                        k.name
+                    )));
+                }
+                let s_idx = s_off as usize;
+                let e_idx = e_off as usize;
+                if e_idx > string_bytes.len() {
+                    return Err(PyValueError::new_err(format!(
+                        "polars_metal: Utf8 column {:?} row {r} end offset {e_idx} \
+                         exceeds string buffer length {}",
+                        k.name,
+                        string_bytes.len()
+                    )));
+                }
+                let slice = &string_bytes[s_idx..e_idx];
+                let s = std::str::from_utf8(slice).map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "polars_metal: Utf8 column {:?} row {r} is not valid UTF-8: {e}",
+                        k.name
+                    ))
+                })?;
+                strings_opt.push(Some(s));
+            }
+
+            let (dict, codes, _valid_again) =
+                polars_metal_buffer::dict::build_dict_nullable(&strings_opt);
+
+            // Transmute Vec<u32> codes → Vec<u8> bytes for the wire format
+            // that `encode_keys` expects. We can't use a from_raw_parts
+            // reinterpret here because the KeyColumn borrows the slice; the
+            // Vec<u32> itself must live in `utf8_owned_data` and we want a
+            // byte slice over it. Convert via to_le_bytes to keep little-
+            // endian semantics consistent across host endianness (M-series
+            // is little-endian, but be explicit).
+            let mut codes_bytes: Vec<u8> = Vec::with_capacity(codes.len() * 4);
+            for c in &codes {
+                codes_bytes.extend_from_slice(&c.to_le_bytes());
+            }
+
+            utf8_owned_data.push(Some((codes_bytes, dict)));
+            // Push placeholder byte-refs; we'll override in the second pass.
+            key_byte_refs.push((data_bytes, valid_bytes));
+        } else {
+            utf8_owned_data.push(None);
+            key_byte_refs.push((data_bytes, valid_bytes));
+        }
     }
     let key_cols: Vec<KeyColumn<'_>> = parsed
         .keys
         .iter()
         .zip(key_byte_refs.iter())
-        .map(|(k, (data, valid))| KeyColumn {
-            name: k.name.clone(),
-            dtype: metal_dtype_to_key_dtype(k.dtype),
-            data,
-            valid,
-            n_rows,
+        .zip(utf8_owned_data.iter())
+        .map(|((k, (data, valid)), utf8_opt)| {
+            // For Utf8 keys we point `data` at the owned codes bytes and
+            // attach the dict. For all other dtypes we keep the original
+            // Python-side bytes and a None dict.
+            let (data_slice, dict): (&[u8], Option<Vec<String>>) = match utf8_opt {
+                Some((codes_bytes, dict)) => (codes_bytes.as_slice(), Some(dict.clone())),
+                None => (*data, None),
+            };
+            KeyColumn {
+                name: k.name.clone(),
+                dtype: metal_dtype_to_key_dtype(k.dtype),
+                data: data_slice,
+                valid,
+                n_rows,
+                dict,
+            }
         })
         .collect();
 
-    // 4. Build (AggRequest, ValueColumn) pairs.
-    //    Len needs no value column; we use a zero-length I64 placeholder
-    //    because `run_one_agg` for Len ignores the ValueColumn entirely.
-    let empty_data: &[u8] = &[];
-    let empty_valid: &[u8] = &[];
-    // SAFETY: &[] cast to &[i64] is a zero-length slice — no pointer
-    // arithmetic occurs. The slice is valid and the pointer is non-null
-    // (a valid empty slice). This is the established pattern for
-    // zero-length typed slices in this codebase.
-    let empty_i64: &[i64] =
-        unsafe { std::slice::from_raw_parts(empty_data.as_ptr() as *const i64, 0) };
-
-    // Tuple type alias to keep the Vec type readable for clippy.
-    type AggByteRef<'a> = (&'a [u8], &'a [u8], String);
-
-    let mut agg_byte_refs: Vec<Option<AggByteRef<'_>>> = Vec::with_capacity(parsed.aggs.len());
+    // 4. Build the routing-input view: each agg's value-column byte/dtype
+    //    triple, keyed by column name. The fused path consumes a HashMap of
+    //    ValueColumns; the M2 per-agg path consumes (AggRequest, ValueColumn)
+    //    pairs. We build the byte-references first; typed slices materialize
+    //    after the routing decision so we can specialize both paths
+    //    correctly.
+    //
+    // `name_byte_refs` covers EVERY column referenced by any Simple's
+    // `input_col` OR by any Expression's `referenced_columns()`. This is a
+    // superset of the M2 byte_refs because Expression-shape aggs can name
+    // columns no Simple agg touches.
+    let mut name_byte_refs: HashMap<String, (String, &[u8], &[u8])> = HashMap::new();
     for agg in &parsed.aggs {
-        if matches!(agg.op, AggOp::Len) {
-            agg_byte_refs.push(None);
-            continue;
+        let referenced: Vec<String> = match agg {
+            ParsedAgg::Length { .. } => Vec::new(),
+            ParsedAgg::Simple { input_col, .. } => vec![input_col.clone()],
+            ParsedAgg::Expression { expr, .. } => expr.referenced_columns(),
+        };
+        for col_name in referenced {
+            if name_byte_refs.contains_key(&col_name) {
+                continue;
+            }
+            let (dtype_tag, data_py, valid_py) = by_name.get(&col_name).ok_or_else(|| {
+                PyKeyError::new_err(format!(
+                    "polars_metal: agg input column {col_name:?} not found in upstream columns"
+                ))
+            })?;
+            name_byte_refs.insert(
+                col_name,
+                (dtype_tag.clone(), data_py.as_bytes(), valid_py.as_bytes()),
+            );
         }
-        let (dtype_tag, data_py, valid_py) = by_name.get(&agg.input_col).ok_or_else(|| {
-            PyKeyError::new_err(format!(
-                "polars_metal: agg input column {:?} not found in upstream columns",
-                agg.input_col
-            ))
-        })?;
-        agg_byte_refs.push(Some((
-            data_py.as_bytes(),
-            valid_py.as_bytes(),
-            dtype_tag.clone(),
-        )));
-    }
-
-    let mut agg_specs: Vec<(AggRequest, ValueColumn<'_>)> = Vec::with_capacity(parsed.aggs.len());
-    for (i, agg) in parsed.aggs.iter().enumerate() {
-        if matches!(agg.op, AggOp::Len) {
-            agg_specs.push((
-                AggRequest {
-                    kind: AggKind::Len,
-                    input_col_idx: i,
-                },
-                ValueColumn::I64 {
-                    data: empty_i64,
-                    valid: empty_valid,
-                },
-            ));
-            continue;
-        }
-        // This entry was populated in the previous loop (Len was already
-        // handled via `continue`), so `None` here is a logic bug rather than
-        // a runtime condition — surface it as an internal error.
-        let (data, valid, dtype_tag) = agg_byte_refs[i].as_ref().ok_or_else(|| {
-            PyValueError::new_err(
-                "polars_metal: internal error: missing agg byte ref for non-Len agg",
-            )
-        })?;
-        let (kind, vcol) = build_agg_kind_and_vcol(agg.op, dtype_tag, data, valid, n_rows)?;
-        agg_specs.push((
-            AggRequest {
-                kind,
-                input_col_idx: i,
-            },
-            vcol,
-        ));
     }
 
     // 5. Acquire device + queue.
@@ -1591,11 +2172,161 @@ pub fn execute_groupby<'py>(
     let mut queue = CommandQueue::new(&device)
         .map_err(|e| crate::engine_err(crate::EngineError::Other(format!("command queue: {e}"))))?;
 
-    // 6. Dispatch.
-    let result = polars_metal_kernels::groupby::dispatch_groupby(
-        &device, &mut queue, &key_cols, &agg_specs, n_rows,
-    )
-    .map_err(groupby_err)?;
+    // 6. Routing: fused single-kernel vs M2 per-agg.
+    //
+    // The fused kernel caps `n_groups` at 16 (per-thread register array
+    // size in `aggregate_fused::emitter::MAX_GROUPS`). The router can't
+    // know n_groups ahead of time (it's a runtime build output), so when
+    // Fused is selected and the dispatch returns NgroupsExceedsFusedCap
+    // we transparently retry on the per-agg path. Expression aggs can't
+    // go through per-agg, so they surface as a hard error.
+    let initial_choice = decide_groupby_dispatch(&parsed.aggs, &name_byte_refs);
+    let has_expression = parsed
+        .aggs
+        .iter()
+        .any(|a| matches!(a, ParsedAgg::Expression { .. }));
+
+    // First, attempt the chosen path; on NgroupsExceedsFusedCap, fall back.
+    let mut fused_attempt: Option<
+        Result<
+            polars_metal_kernels::groupby::GroupByResult,
+            polars_metal_kernels::groupby::FusedDispatchError,
+        >,
+    > = None;
+    if matches!(initial_choice, GroupByDispatchChoice::Fused) {
+        // Build kernel-layer specs.
+        let kernel_specs: Vec<KAggSpec> = parsed
+            .aggs
+            .iter()
+            .map(|pa| match pa {
+                ParsedAgg::Simple {
+                    input_col,
+                    op,
+                    output_alias,
+                } => KAggSpec::Simple {
+                    input_col: input_col.clone(),
+                    op: convert_agg_op(*op),
+                    output_alias: output_alias.clone(),
+                },
+                ParsedAgg::Expression {
+                    expr,
+                    op,
+                    output_alias,
+                } => KAggSpec::Expression {
+                    expr: convert_agg_expr(expr),
+                    op: convert_agg_op(*op),
+                    output_alias: output_alias.clone(),
+                },
+                ParsedAgg::Length { output_alias } => KAggSpec::Length {
+                    output_alias: output_alias.clone(),
+                },
+            })
+            .collect();
+
+        // Materialize each referenced column as a typed ValueColumn.
+        let mut value_columns: HashMap<String, ValueColumn<'_>> = HashMap::new();
+        for (name, (dt_tag, data, valid)) in name_byte_refs.iter() {
+            let vcol = build_value_column(dt_tag, data, valid, n_rows).map_err(|e| {
+                PyValueError::new_err(format!(
+                    "polars_metal: fused groupby — value column {name:?}: {e}"
+                ))
+            })?;
+            value_columns.insert(name.clone(), vcol);
+        }
+
+        let cache = get_or_init_fused_cache(&device);
+        fused_attempt = Some(dispatch_groupby_fused(
+            &device,
+            &mut queue,
+            cache,
+            &key_cols,
+            &kernel_specs,
+            &value_columns,
+            n_rows,
+        ));
+    }
+
+    // Decide which path's output to use:
+    //   - Fused attempt succeeded → use it directly.
+    //   - Fused attempt rejected with NgroupsExceedsFusedCap and we can
+    //     fall back to per-agg (query has no Expression aggs) → run per-agg.
+    //   - Fused attempt failed irrecoverably → surface the error.
+    //   - We never attempted fused (initial choice was PerAgg) → run per-agg.
+    let early_result: Option<polars_metal_kernels::groupby::GroupByResult> = match fused_attempt {
+        Some(Ok(r)) => Some(r),
+        Some(Err(polars_metal_kernels::groupby::FusedDispatchError::NgroupsExceedsFusedCap {
+            ..
+        })) if !has_expression => None,
+        Some(Err(e)) => {
+            return Err(PyValueError::new_err(format!(
+                "polars_metal: fused groupby dispatch: {e}"
+            )));
+        }
+        None => None,
+    };
+
+    let result = if let Some(r) = early_result {
+        r
+    } else {
+        // M2's per-agg path. Len uses a zero-length I64 placeholder; Simple
+        // looks up its single input column from `name_byte_refs`.
+        let empty_data: &[u8] = &[];
+        let empty_valid: &[u8] = &[];
+        // SAFETY: &[] cast to &[i64] is a zero-length slice — no pointer
+        // arithmetic occurs. The slice is valid and the pointer is
+        // non-null (a valid empty slice). This is the established
+        // pattern for zero-length typed slices in this codebase.
+        let empty_i64: &[i64] =
+            unsafe { std::slice::from_raw_parts(empty_data.as_ptr() as *const i64, 0) };
+
+        let mut agg_specs: Vec<(AggRequest, ValueColumn<'_>)> =
+            Vec::with_capacity(parsed.aggs.len());
+        for (i, agg) in parsed.aggs.iter().enumerate() {
+            match agg {
+                ParsedAgg::Length { .. } => {
+                    agg_specs.push((
+                        AggRequest {
+                            kind: AggKind::Len,
+                            input_col_idx: i,
+                        },
+                        ValueColumn::I64 {
+                            data: empty_i64,
+                            valid: empty_valid,
+                        },
+                    ));
+                }
+                ParsedAgg::Simple { input_col, op, .. } => {
+                    let (dtype_tag, data, valid) =
+                        name_byte_refs.get(input_col).ok_or_else(|| {
+                            PyValueError::new_err(
+                                "polars_metal: internal error: missing byte ref for Simple agg",
+                            )
+                        })?;
+                    let (kind, vcol) =
+                        build_agg_kind_and_vcol(*op, dtype_tag, data, valid, n_rows)?;
+                    agg_specs.push((
+                        AggRequest {
+                            kind,
+                            input_col_idx: i,
+                        },
+                        vcol,
+                    ));
+                }
+                ParsedAgg::Expression { .. } => {
+                    // Expression specs should never route here (the
+                    // router decides Fused above). Defensive guard.
+                    return Err(PyValueError::new_err(
+                            "polars_metal: AggSpec::Expression routed to per-agg path; this is a routing bug",
+                        ));
+                }
+            }
+        }
+
+        polars_metal_kernels::groupby::dispatch_groupby(
+            &device, &mut queue, &key_cols, &agg_specs, n_rows,
+        )
+        .map_err(groupby_err)?
+    };
 
     // 7. Encode result as a list of (name, dtype_tag, data, valid) tuples.
     //    Key columns first, then agg outputs.
@@ -1622,7 +2353,7 @@ pub fn execute_groupby<'py>(
         let tup = PyTuple::new_bound(
             py,
             [
-                agg.output_alias.clone().into_py(py),
+                agg.output_alias().to_string().into_py(py),
                 dtype_tag.into_py(py),
                 PyBytes::new_bound(py, &data).into_py(py),
                 PyBytes::new_bound(py, &valid).into_py(py),
@@ -1745,4 +2476,92 @@ fn dispatch_logical_py<'py>(
         PyBytes::new_bound(py, &out_data),
         PyBytes::new_bound(py, &out_valid),
     ))
+}
+
+// ── M4 Phase 5 Task 21+22: execute_fused_expr ───────────────────────────────
+//
+// PyO3 entry point that takes a PyFusionScope plus a list of input column
+// byte buffers (each F32-typed) and returns the output as a PyBytes byte
+// buffer. The Python wrapper in `_udf.py` converts Polars Series ↔ bytes
+// since we don't carry a `pyo3-polars` dep.
+//
+// Deviation from the plan: the plan called for a `PyMetalPlanNode::FusedExprGraph`
+// wrapper sitting on top of the Rust `MetalPlanNode` enum. We don't have a
+// PyO3 wrapper for that enum - the Python side talks to Rust via wire-plan
+// dicts. We expose the executor directly; the walker stashes the
+// PyFusionScope as a side-channel on the binding and the UDF dispatch
+// (Task 23) invokes this entry point.
+
+/// Execute a fused MLX subgraph with zero-copy I/O.
+///
+/// `inputs` is a list of `(ptr, n_elements)` pairs, one per scope input, where
+/// `ptr` is the address of a live, C-contiguous float32 buffer (a numpy
+/// array's `__array_interface__` data pointer). `out` is `(ptr, capacity)` for
+/// a writable float32 array to receive the single subgraph output. Returns the
+/// number of elements written (1 for a literal-only / scalar output, else the
+/// column length).
+///
+/// The buffer protocol isn't available under the abi3 limited API, so we pass
+/// raw pointers from Python rather than `PyBuffer`. The caller MUST keep every
+/// input array and the output array alive for the duration of this (fully
+/// synchronous) call; `_udf._dispatch_hstack_fused` does so by holding the
+/// arrays in locals across the call.
+#[pyfunction]
+pub fn execute_fused_expr(
+    scope: &crate::fusion::py::PyFusionScope,
+    inputs: Vec<(usize, usize)>,
+    out: (usize, usize),
+) -> PyResult<usize> {
+    use std::sync::Arc;
+    let device = MetalDevice::system_default().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "polars_metal: metal device unavailable: {e}"
+        ))
+    })?;
+
+    // Stage each input float32 buffer into a MetalBuffer. The ingest is
+    // zero-copy when the pointer is page-aligned (numpy-origin / large
+    // allocations), else a single copy — handled inside `from_borrowed_f32`.
+    // The caller keeps the source arrays alive for the whole call, so the
+    // borrowed memory outlives every MetalBuffer and the synchronous eval.
+    let metal_buffers: Vec<Arc<polars_metal_buffer::MetalBuffer>> = inputs
+        .iter()
+        .map(|&(ptr, n)| {
+            let fptr = ptr as *const f32;
+            // SAFETY: `fptr` addresses `n` live, contiguous f32 (caller
+            // contract) for the lifetime of this call; page-aligned pointers
+            // take bytesNoCopy, others copy. See `from_borrowed_f32`.
+            unsafe { polars_metal_buffer::MetalBuffer::from_borrowed_f32(&device, fptr, n) }
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "polars_metal: input buffer staging failed: {e}"
+                    ))
+                })
+                .map(Arc::new)
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+
+    let subgraph = crate::fusion::subgraph::MlxSubgraph::from_fusion_scope_buffers(
+        &scope.inner,
+        &metal_buffers,
+    )
+    .map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("polars_metal: subgraph build: {e}"))
+    })?;
+
+    // Output-zero-copy: eval writes directly into the caller's `out` array.
+    let (out_ptr, out_len) = out;
+    // SAFETY: `out_ptr` addresses `out_len` writable, contiguous f32 (caller
+    // contract), kept alive for the whole call. `eval_into` blocks on
+    // `mlx_array_eval` before copying, so no GPU writes are in-flight on
+    // readback. `mlx_array_copy_to_f32_slice` checks the output fits in `dst`.
+    let dst: &mut [f32] = unsafe { std::slice::from_raw_parts_mut(out_ptr as *mut f32, out_len) };
+    let counts = subgraph.eval_into(&mut [dst]).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: subgraph eval: {e}"))
+    })?;
+    counts.into_iter().next().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(
+            "polars_metal: fused subgraph produced no outputs",
+        )
+    })
 }

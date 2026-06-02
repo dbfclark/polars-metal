@@ -7,7 +7,7 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 use polars_metal_native::plan::{AggOp, MetalDtype};
-use polars_metal_native::{parse_groupby_plan, GroupByParseError, ParsedGroupByPlan};
+use polars_metal_native::{parse_groupby_plan, GroupByParseError, ParsedAgg, ParsedGroupByPlan};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString};
 
@@ -71,9 +71,18 @@ fn parser_extracts_single_key_single_agg() {
         assert_eq!(parsed.keys[0].dtype, MetalDtype::I64);
 
         assert_eq!(parsed.aggs.len(), 1);
-        assert_eq!(parsed.aggs[0].input_col, "v");
-        assert_eq!(parsed.aggs[0].op, AggOp::Sum);
-        assert_eq!(parsed.aggs[0].output_alias, "sum_v");
+        match &parsed.aggs[0] {
+            ParsedAgg::Simple {
+                input_col,
+                op,
+                output_alias,
+            } => {
+                assert_eq!(input_col, "v");
+                assert_eq!(*op, AggOp::Sum);
+                assert_eq!(output_alias, "sum_v");
+            }
+            other => panic!("expected ParsedAgg::Simple, got {other:?}"),
+        }
     });
 }
 
@@ -84,7 +93,10 @@ fn parser_extracts_f64_key_and_mean_agg() {
         let plan = make_plan_dict(py, "price", "F64", "price", "Mean", "avg_price");
         let parsed = parse_groupby_plan(&plan).expect("parse must succeed");
         assert_eq!(parsed.keys[0].dtype, MetalDtype::F64);
-        assert_eq!(parsed.aggs[0].op, AggOp::Mean);
+        match &parsed.aggs[0] {
+            ParsedAgg::Simple { op, .. } => assert_eq!(*op, AggOp::Mean),
+            other => panic!("expected ParsedAgg::Simple, got {other:?}"),
+        }
     });
 }
 
@@ -110,9 +122,11 @@ fn parser_extracts_len_with_empty_input_col() {
 
         let parsed =
             parse_groupby_plan(&plan).expect("parse must succeed for Len with no input_col");
-        assert_eq!(parsed.aggs[0].op, AggOp::Len);
-        assert_eq!(parsed.aggs[0].input_col, "");
-        assert_eq!(parsed.aggs[0].output_alias, "n");
+        // Legacy wire-format shape (no "kind", op="Len") infers Length.
+        match &parsed.aggs[0] {
+            ParsedAgg::Length { output_alias } => assert_eq!(output_alias, "n"),
+            other => panic!("expected ParsedAgg::Length, got {other:?}"),
+        }
     });
 }
 
@@ -148,10 +162,26 @@ fn parser_accepts_all_six_agg_ops() {
 
             let parsed = parse_groupby_plan(&plan)
                 .unwrap_or_else(|e| panic!("parse failed for op {wire}: {e}"));
-            assert_eq!(
-                parsed.aggs[0].op, expected,
-                "op wire string {wire} must parse to {expected:?}"
-            );
+            // Legacy wire-format shape: "Len" infers Length; the others
+            // infer Simple. Both carry the op; Length erases it.
+            match &parsed.aggs[0] {
+                ParsedAgg::Simple { op, .. } => {
+                    assert_eq!(
+                        *op, expected,
+                        "op wire string {wire} must parse to {expected:?}"
+                    );
+                }
+                ParsedAgg::Length { .. } => {
+                    assert_eq!(
+                        expected,
+                        AggOp::Len,
+                        "Length variant should only be inferred for op=Len, got {wire}"
+                    );
+                }
+                ParsedAgg::Expression { .. } => {
+                    panic!("Simple/Length expected for legacy wire format")
+                }
+            }
         }
     });
 }
@@ -194,8 +224,15 @@ fn parser_accepts_multiple_keys_and_aggs() {
         assert_eq!(parsed.aggs.len(), 2);
         assert_eq!(parsed.keys[0].name, "returnflag");
         assert_eq!(parsed.keys[1].name, "linestatus");
-        assert_eq!(parsed.aggs[0].op, AggOp::Sum);
-        assert_eq!(parsed.aggs[1].op, AggOp::Mean);
+        let ops: Vec<AggOp> = parsed
+            .aggs
+            .iter()
+            .map(|a| match a {
+                ParsedAgg::Simple { op, .. } | ParsedAgg::Expression { op, .. } => *op,
+                ParsedAgg::Length { .. } => AggOp::Len,
+            })
+            .collect();
+        assert_eq!(ops, vec![AggOp::Sum, AggOp::Mean]);
     });
 }
 

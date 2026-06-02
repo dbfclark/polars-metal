@@ -45,9 +45,20 @@ def test_project_over_scan_routes_to_cpu_leave() -> None:
 
 
 def test_unknown_kind_yields_fallback() -> None:
+    # Use a genuinely-unsupported IR kind. (Sort moved out of the "unknown"
+    # set in Phase 10 — it's now a CPU-passthrough wrapper that inherits
+    # its child's decision.)
+    plan = {"kind": "UnknownXyz", "input": {"kind": "Scan", "n_rows": 100, "columns": []}}
+    lifting = _native.compute_lifting_plan(plan)
+    decision = lifting["UnknownXyz#1"]
+    assert decision.startswith("fallback:"), f"expected fallback, got {decision!r}"
+
+
+def test_sort_passes_through_child_decision() -> None:
+    """Sort is a CPU-passthrough wrapper since Phase 10; it inherits the
+    decision of its inner subtree. Below the groupby cost-model threshold,
+    that's CpuLeave; above, it's GpuLift via the inner GroupBy."""
     plan = {"kind": "Sort", "input": {"kind": "Scan", "n_rows": 100, "columns": []}}
     lifting = _native.compute_lifting_plan(plan)
-    # Any node we don't recognize yields Fallback at its level; we
-    # encode as "fallback:<reason>".
-    sort_decision = lifting["Sort#1"]
-    assert sort_decision.startswith("fallback:")
+    # Inner Scan is cpu_leave by initial cost; Sort inherits.
+    assert lifting["Sort#1"] == "cpu_leave"

@@ -61,7 +61,15 @@ def execute_with_metal(nt: Any, duration_since_start: int | None, *, config: Met
         if config.debug:
             log.debug("polars_metal: router fallback: %s", lifting)
         return
-    if not any(v == "gpu_lift" for v in lifting.values()):
+
+    # M4 Phase 5: the Rust router doesn't yet know about FusedExprGraph
+    # bindings; it leaves HStacks on CPU by default. If the walker has
+    # attached a fused scope to an HStack binding, we override the router
+    # and install the UDF (the Python `_dispatch_hstack_fused` path
+    # intercepts before any Rust expression eval).
+    has_fused_binding = _plan_has_fused_binding(plan)
+
+    if not has_fused_binding and not any(v == "gpu_lift" for v in lifting.values()):
         if config.debug:
             log.debug("polars_metal: router routes entire query to CPU")
         return
@@ -83,6 +91,25 @@ def execute_with_metal(nt: Any, duration_since_start: int | None, *, config: Met
             plan["kind"],
             lifting,
         )
+
+
+def _plan_has_fused_binding(plan: dict) -> bool:
+    """Recurse into the plan tree looking for any HStack binding that the M4
+    fusion analyzer accepted (carries a `_fused_scope` side-channel)."""
+    if plan.get("kind") == "HStack":
+        for binding in plan.get("exprs", []):
+            if "_fused_scope" in binding:
+                return True
+    # M4 Phase 7: empty-key GroupBy carrying fused reduction bindings.
+    if plan.get("kind") == "GroupBy" and plan.get("_fused_aggs"):
+        return True
+    # M4 Phase 7 (Task 27): single-column F32 Sort routed to MLX.
+    if plan.get("kind") == "Sort" and plan.get("_fused_sort"):
+        return True
+    inner = plan.get("input")
+    if isinstance(inner, dict):
+        return _plan_has_fused_binding(inner)
+    return False
 
 
 def _strip_side_channels(plan: dict) -> dict:
@@ -108,4 +135,12 @@ def _strip_side_channels(plan: dict) -> dict:
         out["input"] = _strip_side_channels(plan["input"])
         out["keys"] = plan.get("keys", [])
         out["aggs"] = plan.get("aggs", [])
+    elif plan["kind"] == "Sort":
+        out["input"] = _strip_side_channels(plan["input"])
+        out["by_columns"] = plan.get("by_columns", [])
+        out["descending"] = plan.get("descending", [])
+        out["nulls_last"] = plan.get("nulls_last", [])
+    elif plan["kind"] == "HStack":
+        out["input"] = _strip_side_channels(plan["input"])
+        out["exprs"] = plan.get("exprs", [])
     return out

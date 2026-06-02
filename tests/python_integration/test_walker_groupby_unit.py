@@ -53,7 +53,9 @@ def test_groupby_single_i64_key_sum_emits_plan() -> None:
     assert plan is not None
     assert plan["kind"] == "GroupBy"
     assert plan["keys"] == [["k", "I64"]]
-    assert plan["aggs"] == [{"input_col": "v", "op": "Sum", "output_alias": "sum_v"}]
+    assert plan["aggs"] == [
+        {"kind": "Simple", "input_col": "v", "op": "Sum", "output_alias": "sum_v"}
+    ]
     assert plan["input"]["kind"] == "Scan"
 
 
@@ -64,7 +66,7 @@ def test_groupby_composite_key_two_i64_keys_emits_plan() -> None:
     assert plan is not None
     assert plan["kind"] == "GroupBy"
     assert plan["keys"] == [["a", "I64"], ["b", "I64"]]
-    assert plan["aggs"] == [{"input_col": "v", "op": "Sum", "output_alias": "s"}]
+    assert plan["aggs"] == [{"kind": "Simple", "input_col": "v", "op": "Sum", "output_alias": "s"}]
 
 
 def test_groupby_multiple_aggs_emits_all() -> None:
@@ -83,26 +85,73 @@ def test_groupby_multiple_aggs_emits_all() -> None:
     )
     assert fallback is None, f"unexpected fallback: {fallback}"
     assert plan is not None
-    ops_seen = [a["op"] for a in plan["aggs"]]
+    # Simple specs carry "op"; Length specs do not (their wire format is
+    # {kind: "Length", output_alias: ...}).
+    ops_seen = [a["op"] if a["kind"] == "Simple" else "Len" for a in plan["aggs"]]
     assert sorted(ops_seen) == sorted(["Sum", "Mean", "Min", "Max", "Count", "Len"])
-    # Len has no input_col.
-    len_spec = next(a for a in plan["aggs"] if a["op"] == "Len")
-    assert len_spec["input_col"] == ""
+    # Len becomes a Length spec — no input_col, no op fields.
+    len_spec = next(a for a in plan["aggs"] if a["kind"] == "Length")
+    assert "input_col" not in len_spec
     assert len_spec["output_alias"] == "rows"
 
 
-def test_groupby_string_key_falls_back() -> None:
+def test_groupby_string_key_lowers_to_utf8() -> None:
+    """M3 Phase 7 Task 34: pl.Utf8 keys now route through the dictionary
+    encoder instead of falling back. The walker emits the Utf8 tag on the
+    key entry; the Rust UDF parses the wire payload and builds a (dict,
+    codes) pair before dispatching the kernel."""
     df = pl.DataFrame({"k": ["a", "b", "a"], "v": [1, 2, 3]})
     plan, fallback = _capture_plan(df.lazy().group_by("k").agg(pl.col("v").sum()))
+    assert plan is not None
+    assert fallback is None
+    assert plan["kind"] == "GroupBy"
+    assert plan["keys"] == [["k", "Utf8"]]
+
+
+def test_groupby_string_agg_falls_back() -> None:
+    """min over a Utf8 column still falls back: Utf8 is a key-only dtype
+    (M3 Phase 7). The walker rejects so the whole query runs on CPU
+    rather than dispatching a non-existent string-min kernel.
+
+    Polars CPU does support ``pl.col(str).min()`` (lexicographic), so this
+    is a clean test of the walker rejecting the agg shape rather than
+    Polars rejecting the LazyFrame at construction.
+    """
+    df = pl.DataFrame({"k": [1, 1, 2], "s": ["a", "b", "c"]})
+    plan, fallback = _capture_plan(df.lazy().group_by("k").agg(pl.col("s").min()))
     assert plan is None
     assert fallback is not None
-    assert "String" in fallback or "unsupported dtype" in fallback
 
 
 def test_groupby_unsupported_agg_expression_falls_back() -> None:
     df = pl.DataFrame({"k": [1, 1, 2], "v": [1.0, 2.0, 3.0]})
-    # ``(pl.col("v") * 2).sum()`` has a BinaryExpr as the agg argument, not a
-    # bare Column — outside the M2 closed set.
-    plan, fallback = _capture_plan(df.lazy().group_by("k").agg((pl.col("v") * 2).sum().alias("s")))
+    # ``abs()`` is a function call (not a BinaryExpr over Add/Sub/Mul/Div),
+    # so even with M3 Phase 2's capability-G extractor it falls outside the
+    # supported closed set.
+    plan, fallback = _capture_plan(df.lazy().group_by("k").agg(pl.col("v").abs().sum().alias("s")))
     assert plan is None
     assert fallback is not None
+
+
+def test_groupby_binary_expression_agg_emits_expression_kind() -> None:
+    """``(pl.col("v") * 2).sum()`` lifts via capability G (M3 Phase 2).
+
+    The walker emits an ``Expression``-kind AggSpec containing the recursive
+    ``expr`` sub-tree, the outer ``op``, and the alias.
+    """
+    df = pl.DataFrame({"k": [1, 1, 2], "v": [1.0, 2.0, 3.0]})
+    plan, fallback = _capture_plan(df.lazy().group_by("k").agg((pl.col("v") * 2).sum().alias("s")))
+    assert fallback is None
+    assert plan is not None
+    aggs = plan["aggs"]
+    assert len(aggs) == 1
+    spec = aggs[0]
+    assert spec["kind"] == "Expression"
+    assert spec["op"] == "Sum"
+    assert spec["output_alias"] == "s"
+    expr = spec["expr"]
+    assert expr["kind"] == "Binary"
+    assert expr["op"] == "Mul"
+    assert expr["lhs"] == {"kind": "Column", "name": "v"}
+    # ``pl.col("v") * 2`` on an F64 column has its literal cast to F64.
+    assert expr["rhs"]["kind"] in ("LiteralF64", "LiteralI64")

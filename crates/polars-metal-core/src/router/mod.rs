@@ -136,13 +136,37 @@ fn walk(node: &MetalPlanNode, plan: &mut LiftingPlan, next_seq: &mut u32) -> Nod
         }
         MetalPlanNode::GroupBy { input, keys, aggs } => {
             let n_rows = input_row_count(input);
+            let input_schema = input_schema_lookup(input);
             let _ = walk(input, plan, next_seq);
             let id = NodeId::new("GroupBy", *next_seq);
             *next_seq += 1;
-            plan.set(
-                id.clone(),
-                cost::decide_groupby_with_keys(n_rows, keys, aggs),
-            );
+            // Phase 3 / Task 15: the fused-aggregation kernel only supports
+            // 32-bit-or-narrower value-column dtypes. If any Expression agg
+            // references a 64-bit-wide column, fall back to CPU at plan
+            // time — there is no per-agg twin for Expression specs, so the
+            // dispatcher cannot recover.
+            let expression_falls_back = aggs.iter().any(|a| {
+                if let crate::plan::AggSpec::Expression { expr, .. } = a {
+                    expr.referenced_columns().iter().any(|c| {
+                        matches!(
+                            input_schema.get(c),
+                            Some(crate::plan::MetalDtype::F64) | Some(crate::plan::MetalDtype::I64)
+                        )
+                    })
+                } else {
+                    false
+                }
+            });
+            let decision = if expression_falls_back {
+                NodeDecision::Fallback(
+                    "Expression agg references 64-bit-wide column; fused kernel requires \
+                     32-bit-or-narrower inputs (Apple Silicon Metal lacks 64-bit atomics)"
+                        .into(),
+                )
+            } else {
+                cost::decide_groupby_with_keys(n_rows, keys, aggs)
+            };
+            plan.set(id.clone(), decision);
             id
         }
     }
@@ -165,5 +189,25 @@ fn input_row_count(node: &MetalPlanNode) -> usize {
             // to CPU by reporting 0 rows.
             0
         }
+    }
+}
+
+/// Walk past `Project` / `Filter` to find the underlying `Scan`, returning
+/// a `name → MetalDtype` lookup over its columns. Used by GroupBy routing
+/// to decide whether an Expression agg's referenced columns fit the fused
+/// kernel's 32-bit-or-narrower constraint. Returns an empty map for trees
+/// that don't terminate in a Scan (e.g. GroupBy-of-GroupBy, where we
+/// already route the outer node conservatively via `input_row_count`).
+fn input_schema_lookup(
+    node: &MetalPlanNode,
+) -> std::collections::HashMap<String, crate::plan::MetalDtype> {
+    match node {
+        MetalPlanNode::Scan { columns, .. } => columns
+            .iter()
+            .map(|(n, d)| (n.clone(), *d))
+            .collect::<std::collections::HashMap<_, _>>(),
+        MetalPlanNode::Project { input, .. } => input_schema_lookup(input),
+        MetalPlanNode::Filter { input, .. } => input_schema_lookup(input),
+        MetalPlanNode::GroupBy { .. } => std::collections::HashMap::new(),
     }
 }

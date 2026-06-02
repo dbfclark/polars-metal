@@ -4,9 +4,9 @@
 // (op_kind, n_rows) → NodeDecision. The thresholds here are M2's
 // starting point per the spec § "Routing decisions (cost model)"; PRs
 // that re-tune them update both the constants and the tests.
-#![allow(clippy::expect_used)]
+#![allow(clippy::expect_used, clippy::panic)]
 
-use polars_metal_native::plan::{AggSpec, MetalDtype};
+use polars_metal_native::plan::{AggExpr, AggOp, AggSpec, BinaryOp, MetalDtype};
 use polars_metal_native::router::cost;
 use polars_metal_native::router::NodeDecision;
 
@@ -96,4 +96,53 @@ fn groupby_with_oversized_composite_key_falls_back_at_plan_time() {
             "reason should mention total bits 195: {reason}"
         );
     }
+}
+
+#[test]
+fn router_lifts_expression_aggs_to_gpu_after_task15() {
+    // Phase 3 / Task 15 wired the fused-kernel consumer. Expression aggs
+    // now route to GPU at the dispatch boundary (selection between fused
+    // and per-agg paths is invisible to the cost model). The Phase 2
+    // plan-time fallback for Expression specs is removed.
+    let keys = vec![("k".to_string(), MetalDtype::I64)];
+    let aggs = vec![
+        AggSpec::Simple {
+            input_col: "v".into(),
+            op: AggOp::Sum,
+            output_alias: "v_sum".into(),
+        },
+        AggSpec::Expression {
+            expr: AggExpr::Binary {
+                op: BinaryOp::Mul,
+                lhs: Box::new(AggExpr::Column("a".into())),
+                rhs: Box::new(AggExpr::Column("b".into())),
+            },
+            op: AggOp::Sum,
+            output_alias: "sum_ab".into(),
+        },
+    ];
+    let decision = cost::decide_groupby_with_keys(1_000_000, &keys, &aggs);
+    assert!(
+        matches!(decision, NodeDecision::GpuLift),
+        "expected GpuLift for Expression aggs after Task 15, got: {decision:?}"
+    );
+}
+
+#[test]
+fn router_passes_when_only_simple_and_length_aggs() {
+    // Counter-test: with no Expression specs, the router still lifts
+    // GroupBy to GPU at large row counts (M2-shape queries unchanged).
+    let keys = vec![("k".to_string(), MetalDtype::I64)];
+    let aggs = vec![
+        AggSpec::Simple {
+            input_col: "v".into(),
+            op: AggOp::Sum,
+            output_alias: "v_sum".into(),
+        },
+        AggSpec::Length {
+            output_alias: "n".into(),
+        },
+    ];
+    let decision = cost::decide_groupby_with_keys(1_000_000, &keys, &aggs);
+    assert!(matches!(decision, NodeDecision::GpuLift));
 }

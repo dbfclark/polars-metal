@@ -317,3 +317,185 @@ kernels" — it's:**
 Recorded as an explicit M3 design input. The empirical evidence is in
 `tests/bench/baseline.json` (entries `tpch_q1_modified`,
 `tpch_q1_modified_32bit`, `tpch_q1_modified_32bit_high_card`).
+
+### M3 Phase 5b spike — Single-pass global-atomic GPU hash table doesn't work on Apple Silicon yet (M3, 2026-05-26)
+
+After Phase 4 (A1 partitioned-hash) and Phase 5 (A2 sort-then-segment)
+shipped, profiling showed A2 is strictly worse than CPU at every tested
+cardinality (10M × 65K: A2 2.09s vs CPU 211ms). The Phase 5b spike asked
+whether a single-pass global-atomic GPU hash table — different algorithm
+from A1's partitioned design — might fill the gap.
+
+**Result: the spike's negative finding.** The kernel
+(`shaders/groupby_global_hash.metal`) and dispatch
+(`crates/polars-metal-kernels/src/groupby_global_hash/`) compile and run
+on Apple Silicon, **don't deadlock** (Phase 4's spin-wait risk was
+mitigated by the global hash spreading collisions across the entire
+table rather than a small TGSM), but **produce wrong results**: the test
+`ten_thousand_unique_keys_in_hundred_thousand_rows` observed 20,697
+groups for 10,000 unique keys (~2× inflation).
+
+**Root cause:** the MSL toolchain (32023.883) only accepts
+`memory_order_relaxed` on atomic ops; `acquire`/`release`/`acq_rel` are
+rejected at compile time. The kernel needs to write the non-atomic
+`slot_key` between CAS-claim and state-publish, but without acquire/
+release the slot_key write isn't reliably visible to peer threads when
+they observe the state publish — peers read stale zeros, fail the key
+match, and probe to the next slot, where they also write their key. Same
+key ends up in multiple slots, inflating the group count.
+
+**Mitigations tried (none work on this toolchain):**
+- `acquire` / `release` orderings on individual ops → MSL compile error
+- `__atomic_thread_fence` exists but only accepts `memory_order_relaxed`
+- `threadgroup_barrier(mem_flags::mem_device)` requires non-divergent
+  control flow; our threads return at different points (no go)
+- 128-bit atomic key+gid pack → MSL has no `atomic_ulong2`
+- 64-bit hash summary in state → 32-bit collisions at high cardinality
+  (~100 false-positives per 1M keys) are unacceptable
+
+**Kept in tree as a documented experiment.** The kernel + smoke tests
+(`#[ignore]`'d so CI stays green) serve as the regression-detection
+signal: re-run with `--ignored` after any MSL toolchain bump. When Apple
+ships acquire/release, the failing test will start passing and A3 can
+be productionized.
+
+**Implications for M3:**
+- A1 (post-Phase 4.5 optimization) is the only viable GPU build path
+  shipping in M3. Phase 6 router uses A1 in its narrow win band
+  (≥ 1M rows, est_cardinality ≤ A1's overflow ceiling) and CPU
+  everywhere else.
+- A2 stays in tree but is not wired into the router.
+- The "different algorithm for high cardinality" question (>16K groups
+  where A1 overflows) is *unresolved* on this toolchain. The Phase 6
+  router falls back to CPU for that range.
+
+*Owner:* M4 (revisit when Apple ships better atomics) or earlier if a
+fundamentally different algorithm avoids the memory-ordering trap.
+
+---
+
+## Correlation matrix has no engine hook (M4 Task 29) — RESOLVED: defer to Phase 10 (2026-06-01)
+
+**Question:** How do we expose the matmul-shaped correlation-matrix win
+(survey: 7.8×) through the engine, given the engine's only opt-in is
+`collect(engine=MetalEngine())`?
+
+**Findings:**
+- `df.corr()` is **eager** — returns a `DataFrame` with no `collect` and no
+  `engine=` parameter. Nothing to intercept the way we intercept `collect`.
+- `pl.corr(a, b)` is **invisible to the NodeTraverser**: `view_expression` on
+  a `corr` node raises `NotImplementedError: corr` (py-1.40.1). So even
+  `df.lazy().select(pl.corr(...)).collect(engine="metal")` can't be walked.
+- The corr **matrix** (standardize → X^T X) is a DataFrame→NxN-matrix op, not
+  expressible as a Polars expression at all.
+
+**Options weighed:** (1) monkey-patch eager `df.corr()` behind an explicit
+`enable_corr()`/context-manager; (2) new public `polars_metal.corr_matrix(df)`
+function; (3) defer, capture the matmul win via Phase 10; (4) upstream a
+Polars change exposing `corr` to the visitor.
+
+**Decision (dbfclark):** **(3) Defer Task 29.** #2 violates CLAUDE.md's
+"engine plugin is the only user-facing surface / no new public API"; #1 adds
+always-on/context magic to a core eager method (a real departure from the
+per-call `engine=` model); #4 depends on upstream. The matmul lever moves to
+**Phase 10** (`Array[F32, D].dot(lit)` → MLX matmul), a walkable expression
+that fits the plugin — so the matmul FFI/kernel work is not wasted. Revisit
+only if a headline `df.corr()` number is later required (then prefer #1 with
+explicit activation) or upstream makes `corr` walkable (#4).
+
+---
+
+## NodeTraverser opacity blocks list/array/corr/FFT recognition (M4 Phase 10/11) — DEFERRED (2026-06-01)
+
+**Finding (py-1.40.1).** The engine-plugin `NodeTraverser` — the walker's only
+window at the post-optimization callback — exposes only a fixed "core"
+expression set via `view_expression`: `Column`, `Literal`, `BinaryExpr`,
+`Function` with a viewable `function_data` tuple (sin/cos/log/.../cum_sum/
+`as_struct`), `Cast`, `Agg`, `Ternary`, `Sort`. Everything else raises:
+- list-namespace exprs  -> `"list expr"`
+- array-namespace exprs -> `"array expr"`
+- `pl.corr`             -> `"corr"`
+- `map_batches`/`map_elements` -> `"anonymousfunction"`
+- `reshape`             -> `"reshape"`
+- top_k/bottom_k null-drop -> dynamic predicate (unviewable; see Task 27)
+
+`PyExprIR` carries only `.node`/`.output_name` (no serialize). So the walker
+**cannot recognize** the expressions Phase 10 (list/array `.dot`) and the
+plan's Phase 11 FFT (`map_batches` placeholder) depend on. Under
+`engine="metal"` these **fall back to CPU cleanly today** (correct results, no
+GPU win). Also: the plan's `pl.col(...).arr.dot(lit)` API does not exist in
+this Polars version (real dot shapes are `list.eval(element()*lit).list.sum()`
+and `(arr * arr_lit).arr.sum()`, both unviewable).
+
+**Escape hatches that exist (not where the walker is):**
+- `expr.meta.serialize(format="json")` and `lf.serialize(...)` DO expose
+  list/array/corr/eval — but only at the **pre-optimization LazyFrame**, not at
+  the post-opt NodeTraverser the engine callback receives.
+- `nt.get_dtype(node)` works even on opaque nodes (returns the output dtype).
+
+**FFT-specific unlock (discovered, not yet built):** `pl.struct([...])` IS
+viewable (`Function('as_struct')`, viewable field inputs). A *hybrid* sentinel
+`pl.struct([col("x").alias("real"), col("x").map_batches(_raise).alias("imag")])`
+is walker-routable (view `as_struct`, read field[0]=`Column(x)` for the input,
+field[1] opaque marker, confirm via output dtype `Struct{real,imag}`) AND
+raises cleanly on CPU (the `map_batches` field). This makes a custom
+`.metal.fft()` recognizable. It only works for **struct-output** ops, so it
+unblocks FFT but NOT scalar-output dot or the corr matrix.
+
+**Decision (dbfclark): record + defer.** M4 is treated as complete on the
+walker-visible compute class (haversine, Black-Scholes, std/var/sum/mean
+reductions, sort/top-k, cumsum, and on-GPU null handling — all shipped). The
+remaining matmul (Phase 10) and FFT (Phase 11) phases are deferred. When picked
+up:
+- **FFT** has a clear path: viewable `as_struct` sentinel + walker recognition +
+  new Rust/FFI for MLX complex -> two F32 arrays -> Polars `Struct` readback
+  (the `Fft` op is already wired in `fusion/subgraph.rs`; only the complex
+  readback + Struct assembly is missing).
+- **list/array dot + corr** need a different mechanism: a pre-optimization
+  plan-capture recognizer (`lf.serialize` exposes them), a viewable data layout
+  (D separate F32 columns -> MAC chain through the existing fused path), or an
+  upstream polars-python change exposing these exprs to the visitor.
+
+---
+
+## Null-bearing chain reductions: GPU not worth it (measured 2026-06-02)
+
+**Question:** a chain reduction over a null column (e.g. `(x.log().exp()).sum()`
+with nulls) can't be replayed from the wire plan (the fused scope is GPU-only;
+no CPU-evaluable AST). Should we compute it on the GPU instead of falling back?
+
+**Tried two builds:**
+1. *Naive* (chain → null-correct Polars Series via the HStack path → host
+   reduce): **65 ms vs 44 ms CPU** at 10M for `log().exp().sum()` — a loss. The
+   cost is null marshalling: `to_numpy()` on a null F32 column NaN-injects
+   (~27 ms), `pa.array(out, mask=...)` builds the masked Series (~20 ms).
+2. *Optimized* (raw Arrow F32 buffer in, skipping NaN-inject; numpy `where=`
+   reduction, skipping the Series build): `log().exp().sum()` 28 ms (**1.5×**,
+   a win), but `(x*3).min()` 27 ms vs 5 ms CPU (**0.2×**) and `(x*2+1).std()`
+   46 ms vs 16 ms (**0.4×**) — still losses. Irreducible overhead: `is_null`
+   mask (~8 ms) + the host reduction itself (numpy min ~5 ms, std two-pass
+   ~20 ms). Only **heavy chain + cheap reduction** clears it. Worse, raw
+   buffers are **incorrect for `where` chains**: a null cond keeps the `else`
+   branch *valid* (value 0.0), but the GPU chain over garbage computes the
+   `then` branch there → wrong result. `where` chains need the NaN-inject
+   path, which erases the win.
+
+**Decision (dbfclark): fall back null chains to CPU** (the behavior shipped in
+b2ae73a). Capturing only the winning slice (heavy elementwise chain + sum/min/
+max) would need an elementwise-only + compute-density gate + a `where` carve-
+out — too much machinery for a ~1.5× win on one shape. Null-*free* chains keep
+their big GPU wins (Increment 2). If revisited, the lever is reducing the ~8 ms
+`is_null` cost and host-reduction cost, or a density gate.
+
+**Resolved (2026-06-02): do the null handling in Polars via `drop_nulls`.** The
+masked attempts paid to *preserve null positions* (NaN-inject + masked-Series
+build). But a reduction *skips* nulls — positions are irrelevant and there's
+nothing to rejoin (output is a scalar). So for an **elementwise** null chain,
+let Polars `drop_nulls(subset=cols)` compact the nulls away (~4.5 ms native),
+hand the GPU the dense survivors (zero-copy, no NaN-inject), reduce → scalar.
+Measured: `log().exp().sum()` **4.6×**, `(x*2+1).std()` **1.6×** (trivial chains
+like `x*3 → min` ~0.6×, a small rare loss — could density-gate later). All match
+CPU. `where` chains still fall back (a null cond keeps the else branch valid, so
+dropping the row is wrong). The key realization: `drop_nulls` rescues
+*reductions* (no rejoin) but not HStack (row-shaped output must preserve null
+positions — that's the genuine "rejoin" cost).

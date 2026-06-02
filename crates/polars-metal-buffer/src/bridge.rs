@@ -21,7 +21,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice as _, MTLResource as _, MTLResourceOptions};
 
-use crate::{is_page_aligned, BufferError, MetalDevice};
+use crate::{is_page_aligned, is_ptr_page_aligned, BufferError, MetalDevice};
 
 /// A wrapper around an `MTLBuffer` in Shared storage mode.
 ///
@@ -144,6 +144,77 @@ impl MetalBuffer {
             _owner: None,
             _view_parent: None,
         })
+    }
+
+    /// Wrap a borrowed F32 region as a Metal buffer for the fused-expr input
+    /// path.
+    ///
+    /// Zero-copy via `newBufferWithBytesNoCopy` when `ptr` is page-aligned,
+    /// otherwise copies into a fresh Metal allocation. Unlike [`from_arrow`],
+    /// the length need not be page-aligned — only the pointer (Metal maps whole
+    /// pages but reads only `n_elements`, and a page-aligned allocation's
+    /// trailing partial page is committed; verified against the live driver).
+    /// Callers get the zero-copy path opportunistically: numpy-origin / large
+    /// allocations are page-aligned in practice, while Polars-allocated columns
+    /// (64-byte Arrow alignment) take the copy path transparently.
+    ///
+    /// # Safety
+    /// `ptr` must be non-null and valid for `n_elements * 4` bytes for the
+    /// entire lifetime of the returned `MetalBuffer`. On the zero-copy path the
+    /// buffer holds **no** keep-alive (`_owner` is `None`) — the caller owns the
+    /// memory and must outlive the buffer (e.g. by holding the source Python
+    /// array across a synchronous eval). On the copy path the data is read once
+    /// during construction and the borrow ends when this function returns.
+    pub unsafe fn from_borrowed_f32(
+        device: &MetalDevice,
+        ptr: *const f32,
+        n_elements: usize,
+    ) -> Result<Self, BufferError> {
+        let len = n_elements * std::mem::size_of::<f32>();
+        if len == 0 {
+            // Metal rejects zero-byte buffers (mirrors the copy path).
+            return Err(BufferError::AllocationFailed { bytes: 0 });
+        }
+        let nn = NonNull::new(ptr as *mut std::ffi::c_void)
+            .ok_or(BufferError::AllocationFailed { bytes: len })?;
+
+        if is_ptr_page_aligned(ptr as usize) {
+            // Zero-copy: no-op deallocator; the caller owns the backing memory
+            // (see the Safety contract). Metal only refcounts the block.
+            let deallocator: RcBlock<dyn Fn(NonNull<std::ffi::c_void>, usize)> =
+                RcBlock::new(move |_ptr, _len| {});
+            // SAFETY: `ptr` is valid for `len` bytes for the buffer's lifetime
+            // (caller-guaranteed); page-aligned pointer satisfies bytesNoCopy.
+            let inner = device
+                .raw()
+                .newBufferWithBytesNoCopy_length_options_deallocator(
+                    nn,
+                    len,
+                    MTLResourceOptions::MTLResourceStorageModeShared,
+                    Some(&deallocator),
+                )
+                .ok_or(BufferError::AllocationFailed { bytes: len })?;
+            Ok(Self {
+                inner,
+                _owner: None,
+                _view_parent: None,
+            })
+        } else {
+            // SAFETY: `ptr` is valid for `len` bytes; Metal copies them in now.
+            let inner = device
+                .raw()
+                .newBufferWithBytes_length_options(
+                    nn,
+                    len,
+                    MTLResourceOptions::MTLResourceStorageModeShared,
+                )
+                .ok_or(BufferError::AllocationFailed { bytes: len })?;
+            Ok(Self {
+                inner,
+                _owner: None,
+                _view_parent: None,
+            })
+        }
     }
 
     /// Byte length of the buffer.
@@ -286,6 +357,72 @@ impl MetalBuffer {
         })
     }
 
+    /// Construct a `MetalBuffer` from an `f32` slice.
+    ///
+    /// The input values are copied into a new Metal allocation via
+    /// [`MetalDevice::new_buffer_from_bytes`]. This is the standard way to
+    /// stage F32 host data for use as an MLX array input.
+    ///
+    /// Returns `BufferError::AllocationFailed` when `data` is empty (Metal
+    /// rejects zero-byte allocations) or when Metal otherwise refuses the
+    /// allocation.
+    pub fn from_f32_slice(device: &MetalDevice, data: &[f32]) -> Result<Self, BufferError> {
+        // SAFETY: Reinterpreting &[f32] as &[u8] is valid. f32 has no padding,
+        // alignment of [u8] (1) is ≤ alignment of [f32] (4), and the resulting
+        // byte length (data.len() * 4) is exact. This is a read-only view with
+        // lifetime bounded by `data`.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
+        };
+        device.new_buffer_from_bytes(bytes)
+    }
+
+    /// Return a raw ObjC pointer to the underlying `MTL::Buffer` object.
+    ///
+    /// This is the address that metal-cpp sees as `MTL::Buffer*`. The caller
+    /// can pass it to C++ code that wraps it in `mlx::core::allocator::Buffer`
+    /// for zero-copy MLX array construction.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer is valid as long as `self` is alive. The caller
+    /// is responsible for ensuring that any C++ use of the pointer (including
+    /// MLX operations that retain it) is completed before `self` drops. When
+    /// used with `mlx_array_view_metal_buffer`, the `Arc<MetalBuffer>` stored
+    /// inside `MlxArrayHandle::_input_refs` enforces this invariant.
+    pub fn as_mtl_buffer_raw_ptr(&self) -> *const std::ffi::c_void {
+        // SAFETY: `Retained<ProtocolObject<dyn MTLBuffer>>` internally holds a
+        // `NonNull<ProtocolObject<...>>` pointing at the underlying ObjC instance.
+        // Calling `Deref` on the `Retained` (i.e. `&self.inner`) materializes a
+        // reference at that instance address — NOT at the stack address of the
+        // Retained struct itself. The subsequent cast to `*const c_void` hands
+        // back the same ObjC `id` pointer that metal-cpp sees as `MTL::Buffer*`,
+        // so the C++ side's `static_cast<MTL::Buffer*>` recovers a valid object
+        // reference. Caller must ensure `self` outlives any use of the returned
+        // pointer.
+        let proto_ref: &ProtocolObject<dyn MTLBuffer> = &self.inner;
+        proto_ref as *const ProtocolObject<dyn MTLBuffer> as *const std::ffi::c_void
+    }
+
+    /// Copy the buffer's contents out as an `f32` Vec.
+    ///
+    /// Assumes the buffer is laid out as F32 values (length must be a
+    /// multiple of 4 bytes). Use after evaluating an MLX subgraph whose
+    /// output was written into this buffer.
+    pub fn to_f32_vec(&self) -> Vec<f32> {
+        let bytes = self.as_slice();
+        let n = bytes.len() / 4;
+        let mut out = Vec::with_capacity(n);
+        // SAFETY: bytes is valid for n*4 bytes; we read n f32 values from it.
+        // Reading misaligned f32 from a u8 buffer is allowed via copy.
+        unsafe {
+            let src = bytes.as_ptr().cast::<f32>();
+            out.set_len(n);
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), n);
+        }
+        out
+    }
+
     /// View the buffer's contents as a byte slice.
     ///
     /// Valid as long as `self` is alive and no GPU writes are in-flight.
@@ -301,6 +438,25 @@ impl MetalBuffer {
         // - StorageModeShared guarantees CPU reads are coherent with GPU writes
         //   once any in-flight command buffer has completed.
         unsafe { std::slice::from_raw_parts(ptr.as_ptr(), len) }
+    }
+
+    /// View the buffer's contents as a mutable byte slice.
+    ///
+    /// Caller must guarantee no GPU command buffer is in-flight against
+    /// this buffer; mutating bytes while the GPU is reading them is a
+    /// data race. Used for scratch-arena patterns where the host re-seeds
+    /// the buffer between dispatches (counts, cursors, scalar params,
+    /// etc.).
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        let ptr = self.inner.contents().cast::<u8>();
+        let len = self.len();
+        // SAFETY:
+        // - Same address validity as `as_slice`.
+        // - `&mut self` (not `&self`) statically excludes concurrent
+        //   reads through Rust references. Concurrent GPU access is the
+        //   caller's responsibility (see doc comment).
+        // - StorageModeShared backs the address; the CPU can write to it.
+        unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), len) }
     }
 }
 
@@ -346,6 +502,111 @@ mod tests {
             result.is_err(),
             "zero-length buffer should fail with AllocationFailed"
         );
+    }
+
+    // ── Borrowed-F32 ingest path (input zero-copy) ───────────────────────────
+
+    /// A page-aligned pointer with a NON-page-aligned length (the real shape
+    /// of a 10M F32 column: ptr aligned, byte length 40_000_000 % page != 0)
+    /// takes the zero-copy path: mutating the source after wrapping is visible
+    /// through the Metal buffer (shared storage, no copy).
+    #[test]
+    fn from_borrowed_f32_zero_copy_when_page_aligned() {
+        use crate::page_size;
+        let page = page_size();
+        // SAFETY: standard anonymous mmap; munmap'd at end of test.
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED, "mmap must succeed");
+        assert_eq!(raw as usize % page, 0, "mmap pointer is page-aligned");
+
+        // 1000 F32 = 4000 bytes, well under one page and NOT a page multiple.
+        let n = 1000usize;
+        let fptr = raw as *mut f32;
+        // SAFETY: fptr valid for n f32 within the page.
+        let src = unsafe { std::slice::from_raw_parts_mut(fptr, n) };
+        for (i, v) in src.iter_mut().enumerate() {
+            *v = i as f32;
+        }
+
+        let device = device();
+        // SAFETY: fptr valid for n*4 bytes for the buffer's lifetime (until munmap below).
+        let metal = unsafe { MetalBuffer::from_borrowed_f32(&device, fptr, n) }
+            .expect("borrowed allocation");
+        assert_eq!(metal.len(), n * 4);
+        assert_eq!(metal.to_f32_vec()[..5], [0.0, 1.0, 2.0, 3.0, 4.0]);
+
+        // Mutate the SOURCE after wrapping — a zero-copy view must observe it.
+        src[7] = 999.0;
+        assert_eq!(
+            metal.to_f32_vec()[7],
+            999.0,
+            "page-aligned ptr must be zero-copy (source mutation visible)"
+        );
+
+        // SAFETY: raw/page came from mmap; metal is dropped after this scope but
+        // its no-op deallocator means the munmap is the real free.
+        drop(metal);
+        unsafe { libc::munmap(raw, page) };
+    }
+
+    /// An unaligned pointer falls back to the copy path: a post-wrap source
+    /// mutation is NOT visible through the Metal buffer.
+    #[test]
+    fn from_borrowed_f32_copies_when_unaligned() {
+        use crate::page_size;
+        let page = page_size();
+        // SAFETY: mmap two pages so an offset pointer is still valid memory.
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                2 * page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED, "mmap must succeed");
+
+        // Offset by 4 bytes → guaranteed NOT page-aligned, still 4-byte aligned
+        // (valid for f32 access).
+        let fptr = unsafe { (raw as *mut u8).add(4) }.cast::<f32>();
+        assert_ne!(
+            fptr as usize % page,
+            0,
+            "offset pointer is not page-aligned"
+        );
+        let n = 1000usize;
+        let src = unsafe { std::slice::from_raw_parts_mut(fptr, n) };
+        for (i, v) in src.iter_mut().enumerate() {
+            *v = i as f32;
+        }
+
+        let device = device();
+        // SAFETY: fptr valid for n*4 bytes (within the 2-page mapping).
+        let metal = unsafe { MetalBuffer::from_borrowed_f32(&device, fptr, n) }
+            .expect("borrowed allocation");
+        assert_eq!(metal.to_f32_vec()[..5], [0.0, 1.0, 2.0, 3.0, 4.0]);
+
+        // Mutate the source — a COPY must not observe it.
+        src[7] = 999.0;
+        assert_eq!(
+            metal.to_f32_vec()[7],
+            7.0,
+            "unaligned ptr must take the copy path (source mutation invisible)"
+        );
+
+        drop(metal);
+        unsafe { libc::munmap(raw, 2 * page) };
     }
 
     // ── Zero-copy path ───────────────────────────────────────────────────────

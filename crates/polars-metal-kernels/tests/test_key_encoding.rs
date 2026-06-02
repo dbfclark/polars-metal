@@ -30,6 +30,7 @@ fn single_i64_key_encodes_to_u128_per_row() {
         data: &data,
         valid: &valid,
         n_rows: 4,
+        dict: None,
     };
     let (encoded, schema) = encode_keys(&[col]).expect("encode_keys");
     assert_eq!(encoded.len(), 4);
@@ -57,6 +58,7 @@ fn two_bool_keys_pack_into_first_4_bits() {
             data: &a,
             valid: &v,
             n_rows: 2,
+            dict: None,
         },
         KeyColumn {
             name: "b".into(),
@@ -64,6 +66,7 @@ fn two_bool_keys_pack_into_first_4_bits() {
             data: &b,
             valid: &v,
             n_rows: 2,
+            dict: None,
         },
     ];
     let (encoded, schema) = encode_keys(&cols).expect("encode_keys");
@@ -98,6 +101,7 @@ fn one_i64_plus_one_bool_packs_below_128_bits() {
             data: &i64_data,
             valid: &v,
             n_rows: 2,
+            dict: None,
         },
         KeyColumn {
             name: "b".into(),
@@ -105,6 +109,7 @@ fn one_i64_plus_one_bool_packs_below_128_bits() {
             data: &bool_data,
             valid: &v,
             n_rows: 2,
+            dict: None,
         },
     ];
     let (encoded, schema) = encode_keys(&cols).expect("encode_keys");
@@ -123,6 +128,7 @@ fn null_value_clears_data_bits_in_decoded_output() {
         data: &data,
         valid: &valid,
         n_rows: 2,
+        dict: None,
     }];
     let (encoded, schema) = encode_keys(&cols).expect("encode_keys");
     let decoded = decode_keys(&encoded, &schema);
@@ -146,6 +152,7 @@ fn three_i64_keys_overflow_128_bits_returns_error() {
             data: &d,
             valid: &v,
             n_rows: 2,
+            dict: None,
         },
         KeyColumn {
             name: "b".into(),
@@ -153,6 +160,7 @@ fn three_i64_keys_overflow_128_bits_returns_error() {
             data: &d,
             valid: &v,
             n_rows: 2,
+            dict: None,
         },
     ];
     let err = encode_keys(&cols).expect_err("expected TooWide");
@@ -178,6 +186,7 @@ fn f64_key_encodes_via_raw_bits() {
         data: &data,
         valid: &v,
         n_rows: 3,
+        dict: None,
     }];
     let (encoded, schema) = encode_keys(&cols).expect("encode_keys");
     assert_eq!(schema.total_bits(), 65);
@@ -261,6 +270,7 @@ proptest! {
             data: &data,
             valid: &valid,
             n_rows: n,
+            dict: None,
         };
         let (encoded, schema) = encode_keys(&[kc]).expect("encode_keys");
         let decoded = decode_keys(&encoded, &schema);
@@ -298,8 +308,8 @@ proptest! {
         let bool_valid_packed = pack_valid(&bool_valid);
 
         let cols = vec![
-            KeyColumn { name: "i".into(), dtype: KeyDtype::I64, data: &i64_data, valid: &i64_valid_packed, n_rows: n },
-            KeyColumn { name: "b".into(), dtype: KeyDtype::Bool, data: &bool_data, valid: &bool_valid_packed, n_rows: n },
+            KeyColumn { name: "i".into(), dtype: KeyDtype::I64, data: &i64_data, valid: &i64_valid_packed, n_rows: n, dict: None },
+            KeyColumn { name: "b".into(), dtype: KeyDtype::Bool, data: &bool_data, valid: &bool_valid_packed, n_rows: n, dict: None },
         ];
         let (encoded, schema) = encode_keys(&cols).expect("encode_keys");
         prop_assert_eq!(schema.total_bits(), 1 + 64 + 1 + 1);
@@ -339,6 +349,7 @@ proptest! {
             data: &data,
             valid: &valid,
             n_rows: n,
+            dict: None,
         };
         let (encoded, _) = encode_keys(&[kc]).expect("encode_keys");
         prop_assert_eq!(encoded[0], encoded[2]);

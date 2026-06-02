@@ -1,8 +1,40 @@
 // crates/polars-metal-mlx-sys/build.rs
 use std::path::PathBuf;
 
+const REQUIRED_MLX_VERSION: &str = "0.22.0";
+
+fn check_mlx_version(cmake_lists: &std::path::Path) {
+    let contents = match std::fs::read_to_string(cmake_lists) {
+        Ok(s) => s,
+        Err(_) => {
+            println!(
+                "cargo:warning=could not read vendor/mlx/CMakeLists.txt to verify MLX version"
+            );
+            return;
+        }
+    };
+    // Look for `set(MLX_VERSION X.Y.Z)`
+    for line in contents.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("set(MLX_VERSION ") {
+            let found = rest.trim_end_matches(|c: char| c == ')' || c.is_whitespace());
+            if found != REQUIRED_MLX_VERSION {
+                println!(
+                    "cargo:warning=vendor/mlx MLX_VERSION={found} but polars-metal-mlx-sys pins {REQUIRED_MLX_VERSION}; bump deliberately"
+                );
+            }
+            return;
+        }
+    }
+    println!("cargo:warning=could not parse MLX_VERSION from vendor/mlx/CMakeLists.txt");
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cmake_lists = manifest_dir.join("../../vendor/mlx/CMakeLists.txt");
+    check_mlx_version(&cmake_lists);
+    println!("cargo:rerun-if-changed={}", cmake_lists.display());
+
     // vendor/mlx is at <repo-root>/vendor/mlx; this crate is at
     // <repo-root>/crates/polars-metal-mlx-sys, so go up two levels.
     let mlx_root = manifest_dir.join("../../vendor/mlx");
