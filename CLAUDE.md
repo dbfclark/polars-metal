@@ -148,23 +148,28 @@ make refresh-refs
 6. **Radix sort on fixed-width keys.** Shipped partial in M3. Maintained as **conformance only**.
 7. **Walker for canonical TPC-H Q1, Q6, modified Q1.** Shipped in M3 (Phases 0–14). Used for conformance gates only; not a perf bar.
 
-### Now (M4) — the compute-intensity pivot
+### M4 — the compute-intensity pivot (delivered on `m4-fusion-and-fft`; landing in progress)
 
-Build the walker and MLX-subgraph-fusion infrastructure that delivers wins on the compute-shaped workload class identified in `docs/m4-benchmark-survey.md`. The architectural principles in **Mission → Architectural principles** govern this work: fuse whole subtrees, not per-op; require CPU parity for surrounding ops; route based on compute intensity, not op identity.
+The MLX-subgraph-fusion engine for compute-shaped F32 expression trees, per **Mission → Architectural principles** (fuse whole subtrees, not per-op; CPU parity for surrounding ops; route on compute intensity, not op identity). M4 delivered **roadmap item 8 and its family**; items 9–13 hit the NodeTraverser-opacity wall (below) and move to **M5**.
 
-Phases below are not strictly ordered — they share a single subtree-recognition + MLX-fusion infrastructure that all of them benefit from. Pick the order that hits a runnable, demoable example earliest.
+8. **MLX subgraph fusion for F32 expression chains — DELIVERED.** The walker recognizes element-wise F32 trees (transcendentals, arithmetic, `when/then`, comparisons, casts) optionally terminated by a reduction (`sum/mean/std/var`), a sort / top-k, or a cumulative scan; builds one `mlx::core::array` graph, evals once, folds back into a Polars Series. Measured (engine path, M2 Ultra, 10M F32): **haversine 22×, Black-Scholes 28×, std/var 6–7×, sort 4.3×, top-k / bottom-k ~13×, cum_sum 4.5×** (+ cum_prod / cum_max / cum_min). Plus, beyond the original scope: **on-GPU null handling** (elementwise null-mask + `where` validity subgraph for HStack; `drop_nulls`-then-GPU for null-bearing chain reductions) and **compute-intensity routing** (bandwidth-bound bare `sum`/`min`/`max`/`mean` stay on CPU; only compute-bound bare ops and compute chains route to MLX). Engine numbers + findings: [[m4-phase5-shipped]], `docs/open-questions.md`; survey-ceiling targets: `docs/m4-benchmark-survey.md`. **Remaining to land M4:** Phase 11 (CPU-parity gate, full `make gate`, finalize `baseline.json`, merge).
 
-8. **MLX subgraph fusion for F32 expression chains.** Recognize Polars expression trees of element-wise F32 ops (transcendentals, arithmetic, `when/then`, comparisons, casts) optionally terminated by a reduction (`sum/mean/std/var/argmax`), a sort, a top-k, or a cumulative scan. Build one `mlx::core::array` graph, eval once, fold back into a Polars Series. **This step is the foundation for nearly every M4 win.** Targets: Black-Scholes (63× measured), haversine (52×), variance/std (6–8×), conditional cascade (10×), sort (4×), top-k (12×), cumsum (6.6×).
-9. **Cumsum-diff family.** Rolling mean / sum / variance via the `mean[i..i+W] = (cumsum[i+W] − cumsum[i]) / W` identity. Reuses the Phase 8 infrastructure. Target: 18–20× measured at all window sizes.
-10. **List / Array dot-product → MLX matmul.** Pattern-match `List[F32].dot(lit)` / `Array[F32, D].dot(lit)` / equivalent `list.eval(...).list.sum()` shapes; emit a single matmul. Target: cosine top-k (29× vs NumPy, ~10,000× vs Polars-native) and L2 k-NN (23× vs NumPy). First custom Polars-expression-shape recognizer.
-11. **`Expr.fft()` exposing MLX FFT.** New Polars vocabulary item (Polars has no native FFT). 77× vs NumPy. Unique selling point — DataFrame-native signal processing.
-12. **Custom MSL gregorian-calendar kernel** for `dt.year` / `dt.month` / `dt.day`. Estimated 30–40× over Polars (`dt.year` is currently 178 ms at 10M rows). First brand-new MSL kernel of the M4 direction.
-13. **Speculative: pairwise distance kernels** (Levenshtein, DTW). Fills a real Polars vocabulary gap; high compute density per pair. Custom MSL.
+**The NodeTraverser-opacity wall (why 9–13 move to M5).** The py-1.40.1 engine-plugin `NodeTraverser` exposes only a "core" expression set via `view_expression` (Column, Literal, BinaryExpr, viewable Function, Cast, Agg, Ternary, Sort). **list, array, `corr`, `rolling_*`, `map_batches`, and dynamic-predicate nodes all raise** — so the walker cannot *recognize* the expressions items 9–11 depend on. Full finding + candidate unlocks (pre-optimization `lf.serialize` plan-capture / upstream polars-python visitor change / viewable `as_struct` sentinels) in [[m4-nodetraverser-opacity]] and `docs/open-questions.md`.
+
+### Next (M5) — opacity unlock + the deferred compute features (to be planned)
+
+These were M4 items 9–13, deferred. **All gated on a recognition mechanism** that can see the blocked expressions; that mechanism is itself the open question (`lf.serialize` pre-opt capture vs. upstream visitor support vs. viewable sentinels). **Plan M5 deliberately (brainstorm → spec) before starting** — the opacity unlock is a net-new subsystem, not a task.
+
+9. **Cumsum-diff rolling** — `rolling_mean` / `sum` / `var` via the `mean[i..i+W] = (cumsum[i+W] − cumsum[i]) / W` identity. 18–20× target. *Blocked:* `rolling_*` is opaque to the walker.
+10. **List / Array dot-product → MLX matmul** — `Array[F32, D].dot` / `list.eval(...).list.sum()` shapes → one matmul (cosine top-k 29×, L2 k-NN 23×). Includes the **correlation matrix** (`df.corr()`, survey 7.8×) — eager + opaque, see the Task 29 deferral. *Blocked:* list / array / `corr` are opaque. (Note: `.arr.dot(lit)` doesn't exist in py-1.40.1 — real shapes are list-eval / arr-sum.)
+11. **`Expr.fft()` exposing MLX FFT** — 77× vs NumPy; DataFrame-native signal processing. The `.metal.fft()` viewable `as_struct` sentinel makes recognition feasible *without* the general unlock; remaining work is the complex → `Struct[real, imag]` FFI readback (the `Fft` op is already wired in `fusion/subgraph.rs`).
+12. **Custom MSL gregorian-calendar kernel** for `dt.year` / `dt.month` / `dt.day` (~30–40×). New MSL kernel; `dt.*` recognition is likely also opacity-bound.
+13. **Speculative: pairwise-distance MSL kernels** (Levenshtein, DTW). Real Polars vocabulary gap; high compute density per pair.
 
 ### Explicitly demoted / dropped
 
 - ~~Hash join.~~ Bandwidth-shaped on M-series; deferred indefinitely unless a non-TPC-H workload demands it.
-- ~~Window functions via partition-then-per-partition kernels.~~ Replaced by cumsum-diff (Phase 9) for the shapes that matter (rolling mean / sum / std / EMA). Skip the per-partition kernel design; it was sized for TPC-H Q4-shaped queries that aren't the target anymore.
+- ~~Window functions via partition-then-per-partition kernels.~~ Replaced by cumsum-diff (M5 item 9) for the shapes that matter (rolling mean / sum / std / EMA). Skip the per-partition kernel design; it was sized for TPC-H Q4-shaped queries that aren't the target anymore.
 - ~~Strings.~~ Dropped. CPU is fast; GPU loses on variable-length data.
 
 ## Conventions
