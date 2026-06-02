@@ -1,4 +1,4 @@
-//! M4 Phase 4 Task 18: build + eval a small MLX subgraph from a FusionScope.
+//! M4 Phase 4 Task 18 + M5 Task 3: build + eval a small MLX subgraph from a FusionScope.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use polars_metal_native::fusion::scope::{FusionScope, InputDtype};
@@ -136,4 +136,19 @@ fn build_is_fast_for_large_chains() {
     // (which copies 10M F32s into MLX-owned memory). Pure graph construction is
     // sub-ms; we assert <500ms to account for the input materialization cost.
     assert!(elapsed.as_millis() < 500, "build took {elapsed:?}");
+}
+
+#[test]
+fn subgraph_shift_zero_pads() {
+    // [1,2,3,4] shift-by-2 → [0,0,1,2]
+    let mut scope = FusionScope::new();
+    let a = scope.add_input("x", InputDtype::F32);
+    let sh = scope.push_op_param(OpId::Shift, vec![a], Some(2));
+    scope.mark_output(sh);
+
+    let inputs = vec![f32_input(vec![1.0, 2.0, 3.0, 4.0])];
+    let subgraph = MlxSubgraph::from_fusion_scope(&scope, &inputs).expect("build");
+    let outputs = subgraph.eval().expect("eval");
+    let got = outputs[0].to_f32_vec().unwrap();
+    assert_eq!(got, vec![0.0, 0.0, 1.0, 2.0], "got {got:?}");
 }

@@ -28,7 +28,7 @@ use polars_metal_mlx_sys::matmul::mlx_matmul;
 use polars_metal_mlx_sys::reduce::{
     mlx_argmax, mlx_argmin, mlx_max, mlx_mean, mlx_min, mlx_std, mlx_sum, mlx_var,
 };
-use polars_metal_mlx_sys::scan::{mlx_cummax, mlx_cummin, mlx_cumprod, mlx_cumsum};
+use polars_metal_mlx_sys::scan::{mlx_cummax, mlx_cummin, mlx_cumprod, mlx_cumsum, mlx_shift};
 use polars_metal_mlx_sys::sort::mlx_sort;
 use thiserror::Error;
 
@@ -394,7 +394,14 @@ fn build_op(node: &OpNode, handles: &[MlxArrayHandle]) -> Result<MlxArrayHandle,
         Fft => ffi(mlx_fft(args[0])),
         Ifft => ffi(mlx_ifft(args[0])),
 
-        // Shift (M5 rolling Task 3): wired in Task 3 below.
-        Shift => Err(BuildError::UnsupportedOp(node.op)),
+        // Shift (M5 rolling): forward shift with zero-fill; requires a scalar
+        // param carrying the shift amount.
+        Shift => {
+            arg_count(node.op, 1, &args)?;
+            let w = node
+                .param
+                .ok_or(BuildError::UnsupportedOp(node.op))?;
+            ffi(mlx_shift(args[0], w))
+        }
     }
 }
