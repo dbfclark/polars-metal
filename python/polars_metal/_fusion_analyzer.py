@@ -382,6 +382,83 @@ def _is_reverse_cumulative(fn_name: str, fd: tuple) -> bool:
     return _IR_FUNCTION_MAP.get(fn_name) in _CUMULATIVE_OPS and len(fd) > 1 and bool(fd[1])
 
 
+# ── shift / int_range special-cased recognition (M5 rolling Task 5) ─────────
+#
+# Empirically pinned IR shapes (py-1.40.1; verified via nt.view_expression):
+#
+#   shift:  Function function_data=('shift',) with
+#           input=[value_child, Literal(offset: Int32)].  The offset is a
+#           *child Literal*, not a kwarg / not in function_data. A forward
+#           shift fills the leading `offset` rows with null (structural).
+#           `shift_and_fill` is a DISTINCT function name (3-input: value,
+#           offset, fill) — it is not in any map and aborts on its own, so
+#           plain `shift` never carries a fill_value to reject here.
+#
+#   int_range(len()):  OPAQUE. nt.view_expression raises
+#           NotImplementedError('range'), so the walkers cannot recognize it
+#           at all (they hit `except Exception: raise _Aborted`). The RowIndex
+#           code paths below exist for faithfulness / future unlock but are
+#           currently unreachable through the walker. RowIndex is a 0-input
+#           generator (iota); it never contributes a null.
+#
+# Neither `shift` nor `int_range` is added to _IR_FUNCTION_MAP: the generic
+# path there would (wrongly) recurse the offset literal as a value input and
+# push with no scalar param.
+
+_SHIFT_FN = "shift"
+_INT_RANGE_FN = "int_range"
+
+
+def _shift_offset(nt: Any, fn_inputs: list) -> int:
+    """Extract and validate a forward `shift`'s integer offset.
+
+    Aborts (CPU fallback) unless the offset is a compile-time, non-negative
+    integer Literal — the MLX Shift binding is forward-only and a non-literal
+    / negative / expression offset can't be reproduced. A `shift` node has
+    exactly 2 inputs: [value_child, offset_literal]; a 3-input node is
+    `shift_and_fill` (different function name) and never reaches here."""
+    if len(fn_inputs) != 2:
+        raise _Aborted
+    try:
+        off_node = nt.view_expression(fn_inputs[1])
+    except Exception as e:
+        raise _Aborted from e
+    if type(off_node).__name__ != "Literal":
+        raise _Aborted
+    val = getattr(off_node, "value", None)
+    if not isinstance(val, int) or isinstance(val, bool):
+        raise _Aborted
+    if val < 0:
+        # Forward-only binding; negative (look-ahead) shift must go to CPU.
+        raise _Aborted
+    return val
+
+
+def has_structural_null_op(nt: Any, node_id: int, schema: dict[str, Any]) -> bool:
+    """True iff the IR subtree at ``node_id`` contains a ``shift`` — a
+    structural-null op whose leading rows are null EVEN on null-free input.
+
+    The walker uses this to decide whether to build a validity subgraph for an
+    otherwise-null-free binding (the fast path skips the null subgraph when
+    inputs are null-free, but Shift's head-nulls are present regardless). Best
+    effort: any unviewable node (opaque IR) simply reports no structural op for
+    that branch — such a binding falls back to CPU elsewhere anyway."""
+    try:
+        node = nt.view_expression(node_id)
+    except Exception:
+        return False
+    cls = type(node).__name__
+    if cls == "Function":
+        fd = getattr(node, "function_data", ())
+        if fd and str(fd[0]).lower() == _SHIFT_FN:
+            return True
+    for attr in ("left", "right", "expr", "predicate", "truthy", "falsy"):
+        cid = getattr(node, attr, None)
+        if isinstance(cid, int) and has_structural_null_op(nt, cid, schema):
+            return True
+    return any(has_structural_null_op(nt, cid, schema) for cid in list(getattr(node, "input", [])))
+
+
 def analyze_ir_expression(nt: Any, node_id: int, schema: dict[str, Any]) -> PyFusionScope | None:
     """Walk a Polars IR expression by arena ID and build a PyFusionScope.
 
@@ -587,6 +664,19 @@ def _classify_null_ir(nt: Any, node_id: int, schema: dict[str, Any], state: dict
         if not fd:
             raise _Aborted
         fn_name = str(fd[0]).lower()
+        if fn_name == _SHIFT_FN:
+            # Shift has STRUCTURAL leading nulls (the front `w` rows become
+            # null even on null-free input). Force the validity-subgraph path
+            # so the dispatch reproduces them. Recurse only the value child;
+            # the offset literal carries no null.
+            fn_inputs = list(getattr(node, "input", []))
+            _shift_offset(nt, fn_inputs)  # validate (negative/expr offset -> CPU)
+            state["where"] = True
+            _classify_null_ir(nt, fn_inputs[0], schema, state)
+            return
+        if fn_name == _INT_RANGE_FN:
+            # Terminal iota generator — never null, no children.
+            return
         if _is_reverse_cumulative(fn_name, fd):
             raise _Aborted
         if fn_name not in ("log", "pow") and fn_name not in _IR_FUNCTION_MAP:
@@ -638,17 +728,24 @@ def _is_nan_safe_predicate(nt: Any, pred_id: int) -> bool:
 
 
 def analyze_ir_validity(
-    nt: Any, node_id: int, schema: dict[str, Any]
+    nt: Any, node_id: int, schema: dict[str, Any], structural_only: bool = False
 ) -> tuple[PyFusionScope, list[tuple[str, str | float]]] | None:
     """Build a PyFusionScope whose single output is the row null mask (F32:
     1.0 = valid, 0.0 = null) for a fused HStack expression whose null
-    propagation is data-dependent (contains a ``Where``).
+    propagation is data-dependent (contains a ``Where``) OR structural
+    (contains a ``Shift``, whose leading ``w`` rows are null even on a
+    null-free input).
 
     The validity transform ``V(node)`` (1.0 valid / 0.0 null):
       - ``V(col)``            = the column's is-valid (a per-row F32 input)
       - ``V(lit)``            = 1.0 (the shared constant)
       - ``V(f(args...))``     = AND of the args' validity (= product; a unary
                                 op is the identity on validity)
+      - ``V(shift(c, w))``    = ``Shift(V(c), w)`` — the front ``w`` validity
+                                positions become 0.0 (Shift zero-fills),
+                                reproducing Polars' structural head-nulls for
+                                ANY input. This holds regardless of
+                                ``structural_only``.
       - ``V(a <op> b)``       = ``V(a) * V(b)``  (arithmetic / comparison)
       - ``V(when c then t else e)`` = ``V(c) * where(value(c), V(t), V(e))``
 
@@ -656,12 +753,19 @@ def analyze_ir_validity(
     selection is computed with the SAME ops as the output graph — the null
     mask agrees with which branch the value dispatch actually took.
 
+    ``structural_only`` (default False): set True when the caller has
+    confirmed every input column is null-free, so the ONLY nulls are
+    structural ones introduced by ``Shift``. In that regime cumulative scans
+    (``cum_sum`` etc.) are validity-preserving (a null-free scan input yields
+    no nulls), so they pass as validity-identity instead of aborting. When
+    False (general input-null case) the conservative behavior is kept: scans
+    abort, because Polars' cum_sum null propagation isn't the AND rule.
+
     Returns ``(scope, descriptors)`` or ``None`` if the expression is not
-    validity-computable (matches `null_mode_ir`'s ``None`` set). Descriptor
-    kinds: ``("valid", col)`` (pass the column's is-valid as F32),
-    ``("col", col)`` / ``("lit", v)`` (pass column values / a scalar, for the
-    ``value(c)`` sub-graphs). Inputs are added in two passes BEFORE any op, per
-    the PyFusionScope synthesis invariant.
+    validity-computable. Descriptor kinds: ``("valid", col)`` (pass the
+    column's is-valid as F32), ``("col", col)`` / ``("lit", v)`` (column
+    values / a scalar, for the ``value(c)`` sub-graphs). Inputs are added in
+    two passes BEFORE any op, per the PyFusionScope synthesis invariant.
     """
     try:
         scope = PyFusionScope()
@@ -675,13 +779,23 @@ def analyze_ir_validity(
         descriptors.append(("lit", 1.0))
         lit_dedup[1.0] = one_idx
         # Pass 1a: a validity input per column leaf (output null if any leaf null).
-        _gather_valid_leaves(nt, node_id, schema, scope, descriptors, valid_idx)
+        _gather_valid_leaves(nt, node_id, schema, scope, descriptors, valid_idx, structural_only)
         # Pass 1b: value inputs for the columns/literals inside Where predicates.
         _gather_cond_value_leaves(
-            nt, node_id, schema, scope, descriptors, val_leaf_idx, col_dedup, lit_dedup
+            nt,
+            node_id,
+            schema,
+            scope,
+            descriptors,
+            val_leaf_idx,
+            col_dedup,
+            lit_dedup,
+            structural_only,
         )
         # Pass 2: build the validity op graph.
-        out_idx = _visit_validity(nt, node_id, schema, scope, valid_idx, val_leaf_idx, one_idx)
+        out_idx = _visit_validity(
+            nt, node_id, schema, scope, valid_idx, val_leaf_idx, one_idx, structural_only
+        )
         scope.mark_output(out_idx)
         return scope, descriptors
     except _Aborted:
@@ -695,6 +809,7 @@ def _gather_valid_leaves(
     scope: PyFusionScope,
     descriptors: list[tuple[str, str | float]],
     valid_idx: dict[str, int],
+    structural_only: bool = False,
 ) -> None:
     """Pass 1a: add one ``("valid", col)`` input per distinct column leaf."""
     try:
@@ -716,20 +831,35 @@ def _gather_valid_leaves(
     if cls == "Literal":
         return
     if cls == "BinaryExpr":
-        _gather_valid_leaves(nt, node.left, schema, scope, descriptors, valid_idx)
-        _gather_valid_leaves(nt, node.right, schema, scope, descriptors, valid_idx)
+        _gather_valid_leaves(nt, node.left, schema, scope, descriptors, valid_idx, structural_only)
+        _gather_valid_leaves(nt, node.right, schema, scope, descriptors, valid_idx, structural_only)
         return
     if cls == "Cast":
-        _gather_valid_leaves(nt, node.expr, schema, scope, descriptors, valid_idx)
+        _gather_valid_leaves(nt, node.expr, schema, scope, descriptors, valid_idx, structural_only)
         return
     if cls == "Function":
+        fd = getattr(node, "function_data", ())
+        fn_name = str(fd[0]).lower() if fd else ""
+        if fn_name == _SHIFT_FN:
+            # Recurse only the value child (the offset literal has no leaf).
+            fn_inputs = list(getattr(node, "input", []))
+            _gather_valid_leaves(
+                nt, fn_inputs[0], schema, scope, descriptors, valid_idx, structural_only
+            )
+            return
+        if fn_name == _INT_RANGE_FN:
+            return  # iota generator — no leaves, never null
         for cid in list(getattr(node, "input", [])):
-            _gather_valid_leaves(nt, cid, schema, scope, descriptors, valid_idx)
+            _gather_valid_leaves(nt, cid, schema, scope, descriptors, valid_idx, structural_only)
         return
     if cls == "Ternary":
-        _gather_valid_leaves(nt, node.predicate, schema, scope, descriptors, valid_idx)
-        _gather_valid_leaves(nt, node.truthy, schema, scope, descriptors, valid_idx)
-        _gather_valid_leaves(nt, node.falsy, schema, scope, descriptors, valid_idx)
+        _gather_valid_leaves(
+            nt, node.predicate, schema, scope, descriptors, valid_idx, structural_only
+        )
+        _gather_valid_leaves(
+            nt, node.truthy, schema, scope, descriptors, valid_idx, structural_only
+        )
+        _gather_valid_leaves(nt, node.falsy, schema, scope, descriptors, valid_idx, structural_only)
         return
     raise _Aborted
 
@@ -743,6 +873,7 @@ def _gather_cond_value_leaves(
     val_leaf_idx: dict[int, int],
     col_dedup: dict[str, int],
     lit_dedup: dict[float, int],
+    structural_only: bool = False,
 ) -> None:
     """Pass 1b: add value inputs for leaves reachable inside a Where predicate
     (needed to recompute ``value(c)`` for branch selection). Non-predicate
@@ -757,21 +888,73 @@ def _gather_cond_value_leaves(
         return
     if cls == "BinaryExpr":
         _gather_cond_value_leaves(
-            nt, node.left, schema, scope, descriptors, val_leaf_idx, col_dedup, lit_dedup
+            nt,
+            node.left,
+            schema,
+            scope,
+            descriptors,
+            val_leaf_idx,
+            col_dedup,
+            lit_dedup,
+            structural_only,
         )
         _gather_cond_value_leaves(
-            nt, node.right, schema, scope, descriptors, val_leaf_idx, col_dedup, lit_dedup
+            nt,
+            node.right,
+            schema,
+            scope,
+            descriptors,
+            val_leaf_idx,
+            col_dedup,
+            lit_dedup,
+            structural_only,
         )
         return
     if cls == "Cast":
         _gather_cond_value_leaves(
-            nt, node.expr, schema, scope, descriptors, val_leaf_idx, col_dedup, lit_dedup
+            nt,
+            node.expr,
+            schema,
+            scope,
+            descriptors,
+            val_leaf_idx,
+            col_dedup,
+            lit_dedup,
+            structural_only,
         )
         return
     if cls == "Function":
+        fd = getattr(node, "function_data", ())
+        fn_name = str(fd[0]).lower() if fd else ""
+        if fn_name == _SHIFT_FN:
+            # Recurse only the value child; the offset literal contributes no
+            # cond value leaf.
+            fn_inputs = list(getattr(node, "input", []))
+            _gather_cond_value_leaves(
+                nt,
+                fn_inputs[0],
+                schema,
+                scope,
+                descriptors,
+                val_leaf_idx,
+                col_dedup,
+                lit_dedup,
+                structural_only,
+            )
+            return
+        if fn_name == _INT_RANGE_FN:
+            return  # iota generator — no leaves
         for cid in list(getattr(node, "input", [])):
             _gather_cond_value_leaves(
-                nt, cid, schema, scope, descriptors, val_leaf_idx, col_dedup, lit_dedup
+                nt,
+                cid,
+                schema,
+                scope,
+                descriptors,
+                val_leaf_idx,
+                col_dedup,
+                lit_dedup,
+                structural_only,
             )
         return
     if cls == "Ternary":
@@ -780,10 +963,26 @@ def _gather_cond_value_leaves(
             nt, node.predicate, schema, scope, descriptors, val_leaf_idx, col_dedup, lit_dedup
         )
         _gather_cond_value_leaves(
-            nt, node.truthy, schema, scope, descriptors, val_leaf_idx, col_dedup, lit_dedup
+            nt,
+            node.truthy,
+            schema,
+            scope,
+            descriptors,
+            val_leaf_idx,
+            col_dedup,
+            lit_dedup,
+            structural_only,
         )
         _gather_cond_value_leaves(
-            nt, node.falsy, schema, scope, descriptors, val_leaf_idx, col_dedup, lit_dedup
+            nt,
+            node.falsy,
+            schema,
+            scope,
+            descriptors,
+            val_leaf_idx,
+            col_dedup,
+            lit_dedup,
+            structural_only,
         )
         return
     raise _Aborted
@@ -797,6 +996,7 @@ def _visit_validity(
     valid_idx: dict[str, int],
     val_leaf_idx: dict[int, int],
     one_idx: int,
+    structural_only: bool = False,
 ) -> int:
     """Pass 2: push the validity (null-mask) op graph; return its NodeIdx."""
     try:
@@ -804,6 +1004,11 @@ def _visit_validity(
     except Exception as e:
         raise _Aborted from e
     cls = type(node).__name__
+
+    def recurse(cid: int) -> int:
+        return _visit_validity(
+            nt, cid, schema, scope, valid_idx, val_leaf_idx, one_idx, structural_only
+        )
 
     if cls == "Column":
         return valid_idx[str(node.name)]
@@ -815,26 +1020,44 @@ def _visit_validity(
         op_id = _BINOP_MAP.get(op_name)
         if op_id is None or op_id in ("LogicalAnd", "LogicalOr"):
             raise _Aborted
-        left = _visit_validity(nt, node.left, schema, scope, valid_idx, val_leaf_idx, one_idx)
-        right = _visit_validity(nt, node.right, schema, scope, valid_idx, val_leaf_idx, one_idx)
+        left = recurse(node.left)
+        right = recurse(node.right)
         return _validity_and(scope, [left, right], one_idx)
     if cls == "Cast":
         if getattr(node, "dtype", None) != pl.Float32:
             raise _Aborted
-        return _visit_validity(nt, node.expr, schema, scope, valid_idx, val_leaf_idx, one_idx)
+        return recurse(node.expr)
     if cls == "Function":
         fd = getattr(node, "function_data", ())
         if not fd:
             raise _Aborted
         fn_name = str(fd[0]).lower()
-        if _is_reverse_cumulative(fn_name, fd) or _IR_FUNCTION_MAP.get(fn_name) in _CUMULATIVE_OPS:
+        fn_inputs = list(getattr(node, "input", []))
+        if fn_name == _SHIFT_FN:
+            # V(shift(c, w)) = Shift(V(c), w): the front `w` validity slots
+            # become 0.0 (Shift zero-fills), so the output is structurally
+            # null there. Faithful for ANY input — applies even when
+            # structural_only is False. The offset literal is the scalar param.
+            w = _shift_offset(nt, fn_inputs)
+            child_v = recurse(fn_inputs[0])
+            return scope.push_op("Shift", [child_v], w)
+        if fn_name == _INT_RANGE_FN:
+            # iota — never contributes a null (always-valid identity).
+            return one_idx
+        if _is_reverse_cumulative(fn_name, fd):
             raise _Aborted
+        if _IR_FUNCTION_MAP.get(fn_name) in _CUMULATIVE_OPS:
+            # Cumulative scans don't follow the elementwise AND rule under
+            # arbitrary input nulls, so abort in the general case. But when
+            # structural_only (inputs confirmed null-free), a scan introduces
+            # no nulls and is validity-preserving — treat as validity-identity.
+            if not structural_only:
+                raise _Aborted
+            child_vs = [recurse(cid) for cid in fn_inputs]
+            return _validity_and(scope, child_vs, one_idx)
         if fn_name not in ("log", "pow") and fn_name not in _IR_FUNCTION_MAP:
             raise _Aborted
-        child_vs = [
-            _visit_validity(nt, cid, schema, scope, valid_idx, val_leaf_idx, one_idx)
-            for cid in list(getattr(node, "input", []))
-        ]
+        child_vs = [recurse(cid) for cid in fn_inputs]
         return _validity_and(scope, child_vs, one_idx)
     if cls == "Agg":
         raise _Aborted
@@ -846,8 +1069,8 @@ def _visit_validity(
         # (Eq/Lt/Le/Gt/Ge), where MLX's `NaN <op> k -> false` collapses a null
         # cond to the else branch exactly like Polars.
         cond_val = _visit_ir_ops(nt, node.predicate, schema, scope, val_leaf_idx)
-        then_v = _visit_validity(nt, node.truthy, schema, scope, valid_idx, val_leaf_idx, one_idx)
-        else_v = _visit_validity(nt, node.falsy, schema, scope, valid_idx, val_leaf_idx, one_idx)
+        then_v = recurse(node.truthy)
+        else_v = recurse(node.falsy)
         return scope.push_op("Where", [cond_val, then_v, else_v])
     raise _Aborted
 
@@ -946,6 +1169,18 @@ def _gather_leaves_ir(
             raise _Aborted
         fn_name = str(fd[0]).lower()
         fn_inputs = list(getattr(node, "input", []))
+        if fn_name == _SHIFT_FN:
+            # Recurse leaves of ONLY the value child; the offset Literal is a
+            # compile-time param (validated in pass 2), not an input leaf.
+            _shift_offset(nt, fn_inputs)  # validate now so pass 1/2 agree
+            _gather_leaves_ir(
+                nt, fn_inputs[0], schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup
+            )
+            return
+        if fn_name == _INT_RANGE_FN:
+            # Terminal generator (RowIndex, 0 inputs): adds NO leaves. (Note:
+            # currently unreachable — int_range is opaque to view_expression.)
+            return
         if fn_name != "log" and fn_name != "pow" and fn_name not in _IR_FUNCTION_MAP:
             raise _Aborted
         if _is_reverse_cumulative(fn_name, fd):
@@ -1027,6 +1262,15 @@ def _visit_ir_ops(
         fn_inputs = list(getattr(node, "input", []))
         if _is_reverse_cumulative(fn_name, fd):
             raise _Aborted
+        if fn_name == _SHIFT_FN:
+            # Forward shift with a non-negative integer offset param. Recurse
+            # ONLY the value child; the offset Literal is the scalar param.
+            w = _shift_offset(nt, fn_inputs)
+            child = _visit_ir_ops(nt, fn_inputs[0], schema, scope, leaf_idx)
+            return scope.push_op("Shift", [child], w)
+        if fn_name == _INT_RANGE_FN:
+            # 0-input iota generator (currently unreachable; opaque IR).
+            return scope.push_op("RowIndex", [])
         if fn_name == "log":
             return _visit_ir_log_ops(nt, fn_inputs, schema, scope, leaf_idx)
         if fn_name == "pow":
