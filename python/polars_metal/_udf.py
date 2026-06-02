@@ -586,22 +586,32 @@ def _build_select_reduction_fused(plan: dict) -> Any:
                     out_series.append(pl.Series(name, [value], dtype=series.dtype))
                     continue
                 input_arrays = [np.ascontiguousarray(series.to_numpy(), dtype=np.float32)]
+                count = n
             else:
-                # Chain reduction: input columns are null-free (the walker
-                # guarded). Degenerate-n semantics can't be replayed on a chain,
-                # so handle them directly: empty -> sum is 0.0, else null;
-                # std/var of <2 rows -> null (sample variance undefined).
-                if n == 0:
+                # Chain reduction. For an elementwise chain over a null column
+                # the walker stamped `_drop_nulls`: drop the null rows in Polars
+                # (native, one pass) and reduce the dense survivors on the GPU —
+                # lossless because a reduction skips nulls and positions don't
+                # matter (the output is a scalar, nothing to rejoin). Null-free
+                # chains keep `frame = upstream`. Degenerate-n is handled here
+                # (a chain can't be replayed on a source column).
+                if agg.get("_drop_nulls"):
+                    cols = [c for k, c in descriptors if k == "col"]
+                    frame = upstream.drop_nulls(subset=cols)
+                else:
+                    frame = upstream
+                count = frame.height
+                if count == 0:
                     val0 = 0.0 if kind == "sum" else None
                     out_series.append(pl.Series(name, [val0], dtype=pl.Float32))
                     continue
-                if kind in ("std", "var") and n < 2:
+                if kind in ("std", "var") and count < 2:
                     out_series.append(pl.Series(name, [None], dtype=pl.Float32))
                     continue
                 input_arrays = []
                 for d_kind, payload in descriptors:
                     if d_kind == "col":
-                        col = upstream.get_column(payload)
+                        col = frame.get_column(payload)
                         input_arrays.append(np.ascontiguousarray(col.to_numpy(), dtype=np.float32))
                     elif d_kind == "lit":
                         input_arrays.append(np.asarray([payload], dtype=np.float32))
@@ -617,11 +627,12 @@ def _build_select_reduction_fused(plan: dict) -> Any:
             )
             val = float(out_arr[0])
             # Bessel: MLX uses population variance (ddof=0); Polars defaults to
-            # sample (ddof=1). Only std/var need the correction.
+            # sample (ddof=1). `count` is the non-null row count. Only std/var
+            # need the correction.
             if kind == "var":
-                val *= n / (n - 1)
+                val *= count / (count - 1)
             elif kind == "std":
-                val *= math.sqrt(n / (n - 1))
+                val *= math.sqrt(count / (count - 1))
             out_series.append(pl.Series(name, [val], dtype=pl.Float32))
 
         result = pl.DataFrame(out_series)

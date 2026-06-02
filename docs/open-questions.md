@@ -486,3 +486,16 @@ max) would need an elementwise-only + compute-density gate + a `where` carve-
 out — too much machinery for a ~1.5× win on one shape. Null-*free* chains keep
 their big GPU wins (Increment 2). If revisited, the lever is reducing the ~8 ms
 `is_null` cost and host-reduction cost, or a density gate.
+
+**Resolved (2026-06-02): do the null handling in Polars via `drop_nulls`.** The
+masked attempts paid to *preserve null positions* (NaN-inject + masked-Series
+build). But a reduction *skips* nulls — positions are irrelevant and there's
+nothing to rejoin (output is a scalar). So for an **elementwise** null chain,
+let Polars `drop_nulls(subset=cols)` compact the nulls away (~4.5 ms native),
+hand the GPU the dense survivors (zero-copy, no NaN-inject), reduce → scalar.
+Measured: `log().exp().sum()` **4.6×**, `(x*2+1).std()` **1.6×** (trivial chains
+like `x*3 → min` ~0.6×, a small rare loss — could density-gate later). All match
+CPU. `where` chains still fall back (a null cond keeps the else branch valid, so
+dropping the row is wrong). The key realization: `drop_nulls` rescues
+*reductions* (no rejoin) but not HStack (row-shaped output must preserve null
+positions — that's the genuine "rejoin" cost).

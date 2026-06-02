@@ -336,7 +336,7 @@ def _walk_select_reduction(nt: Any, exprs: list[Any]) -> WalkResult:
     if fused_aggs is not None:
         nt.set_node(inputs[0])
         inner = _walk_at_current(nt)
-        if not isinstance(inner, FallBack) and _fused_reduction_nulls_ok(fused_aggs, inner.plan):
+        if not isinstance(inner, FallBack) and _route_fused_reduction(fused_aggs, inner.plan):
             return Handled(
                 plan={
                     "kind": "GroupBy",
@@ -406,7 +406,7 @@ def _try_fused_select_reduction(
         result = analyze_ir_reduction(nt, node_id, in_schema)
         if result is None:
             return None
-        scope, columns, agg_kind, is_chain = result
+        scope, columns, agg_kind, is_chain, arg_id = result
         _fusion_log.info(
             "FusedReduction candidate column=%r kind=%s n_inputs=%d n_ops=%d chain=%s",
             output_name,
@@ -422,6 +422,11 @@ def _try_fused_select_reduction(
                 "_fused_columns": columns,
                 "_agg_kind": agg_kind,
                 "_is_chain": is_chain,
+                # Null mode of the chain argument (None for bare). An
+                # "elementwise" chain over a null column can reduce on the GPU
+                # after dropping nulls (positions don't matter for a reduction);
+                # "where" can't (a null cond keeps the else branch valid).
+                "_null_mode": null_mode_ir(nt, arg_id, in_schema) if is_chain else None,
             }
         )
     if not bindings:
@@ -435,23 +440,32 @@ def _try_fused_select_reduction(
     return bindings
 
 
-def _fused_reduction_nulls_ok(fused_aggs: list[dict], inner_plan: dict) -> bool:
-    """True iff every chain reduction's input columns are confirmed null-free.
+def _route_fused_reduction(fused_aggs: list[dict], inner_plan: dict) -> bool:
+    """Decide each chain reduction's null strategy; return False to send the
+    whole select to CPU.
 
     A bare reduction handles nulls in the dispatch (replaying the reduction on
-    the source column). A *chain* reduction can't be replayed from the wire
-    plan, and running it on the GPU for null data doesn't pay off — the null
-    marshalling (NaN-injecting `to_numpy` + mask + host reduction) costs more
-    than it saves except for heavy chains, and is incorrect to shortcut for
-    `where` chains (a null cond keeps the else branch valid). So a chain over a
-    possibly-null column falls back to CPU. Reuses the Scan-leaf null check
-    from the HStack path. (Measured 2026-06-02 — see docs/open-questions.md.)
+    the source column). For a *chain* reduction whose inputs may have nulls:
+      - **elementwise** chain → stamp ``_drop_nulls``: drop the null rows in
+        Polars (native, ~one SIMD pass), then reduce the dense survivors on the
+        GPU. Lossless because a reduction skips nulls and doesn't care about row
+        positions — there's nothing to rejoin (the output is a scalar).
+      - **where** chain (or any other null mode) → CPU: a null cond keeps the
+        else branch *valid*, so dropping the row is wrong, and the chain can't
+        be replayed from the wire plan.
+    Confirmed-null-free chains keep the zero-`drop_nulls` fast path.
     """
-    chain_cols: set[str] = set()
-    for b in fused_aggs:
-        if b.get("_is_chain"):
-            chain_cols.update(name for kind, name in b["_fused_columns"] if kind == "col")
-    return not chain_cols or _fused_inputs_null_free(inner_plan, chain_cols)
+    for agg in fused_aggs:
+        if not agg.get("_is_chain"):
+            continue
+        cols = {name for kind, name in agg["_fused_columns"] if kind == "col"}
+        if _fused_inputs_null_free(inner_plan, cols):
+            agg["_drop_nulls"] = False
+        elif agg.get("_null_mode") == "elementwise":
+            agg["_drop_nulls"] = True
+        else:
+            return False
+    return True
 
 
 def _probe_fusion_analyzer(

@@ -434,13 +434,16 @@ _REDUCTION_OP: dict[str, str] = {
 
 def analyze_ir_reduction(
     nt: Any, agg_node_id: int, schema: dict[str, Any]
-) -> tuple[PyFusionScope, list[tuple[str, str | float]], str, bool] | None:
+) -> tuple[PyFusionScope, list[tuple[str, str | float]], str, bool, int] | None:
     """Analyze a full-column reduction `agg(expr)` (the terminus of a
     `select(pl.col(...).std())`-shaped node) into a fused scope whose single
     output is the scalar reduction.
 
-    Returns `(scope, descriptors, agg_kind, is_chain)` or None if not
-    fusion-eligible. `agg_kind` (lowercase) lets the dispatch apply the Bessel
+    Returns `(scope, descriptors, agg_kind, is_chain, arg_id)` or None if not
+    fusion-eligible. `arg_id` is the reduction argument's arena id, so the
+    walker can classify the chain's null mode (a null-bearing *elementwise*
+    chain reduces on the GPU after `drop_nulls` — positions don't matter for a
+    reduction). `agg_kind` (lowercase) lets the dispatch apply the Bessel
     correction — MLX uses population variance (ddof=0); Polars defaults to
     sample (ddof=1). `is_chain` is True when the reduction's argument is a
     compute chain (≥1 op), False for a bare column.
@@ -495,7 +498,7 @@ def analyze_ir_reduction(
             raise _Aborted
         red_idx = scope.push_op(op_id, [inner_idx])
         scope.mark_output(red_idx)
-        return scope, descriptors, kind, is_chain
+        return scope, descriptors, kind, is_chain, arg_id
     except _Aborted:
         return None
 
