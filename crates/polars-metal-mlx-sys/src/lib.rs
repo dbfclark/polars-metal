@@ -229,6 +229,15 @@ mod ffi {
         fn mlx_op_sort(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
         fn mlx_op_argpartition(a: &SharedPtr<MlxArray>, kth: i32) -> Result<SharedPtr<MlxArray>>;
 
+        // M5 rolling Task 1: forward shift (zero-fill).
+        //
+        // Shifts array `a` forward by `shift` positions along axis 0, prepending
+        // zeros. Output length == input length. `shift` is clamped to [0, n] on
+        // the C++ side. Infallible by construction; Result<> is kept for
+        // consistency with the rest of the bridge so callers use the same `?`
+        // idiom.
+        fn mlx_shift(a: &SharedPtr<MlxArray>, shift: i64) -> Result<SharedPtr<MlxArray>>;
+
         // M4 Phase 1 Task 10: cumulative scans + matmul + fft.
 
         fn mlx_op_cumsum(a: &SharedPtr<MlxArray>, axis: i32) -> Result<SharedPtr<MlxArray>>;
