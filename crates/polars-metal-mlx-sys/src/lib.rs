@@ -238,6 +238,13 @@ mod ffi {
         // idiom.
         fn mlx_shift(a: &SharedPtr<MlxArray>, shift: i64) -> Result<SharedPtr<MlxArray>>;
 
+        // M5 rolling Task 4b: row-index (iota) generator.
+        //
+        // Produces a 1-D F32 array [0.0, 1.0, …, n-1.0] via
+        // mlx::core::arange. n <= 0 yields an empty array. Takes no input
+        // MlxArray; Result<> kept for `?`-idiom consistency.
+        fn mlx_iota_f32(n: i64) -> Result<SharedPtr<MlxArray>>;
+
         // M4 Phase 1 Task 10: cumulative scans + matmul + fft.
 
         fn mlx_op_cumsum(a: &SharedPtr<MlxArray>, axis: i32) -> Result<SharedPtr<MlxArray>>;

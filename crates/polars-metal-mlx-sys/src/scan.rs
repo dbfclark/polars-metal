@@ -26,6 +26,23 @@ scan_op!(mlx_cumprod, mlx_op_cumprod);
 scan_op!(mlx_cummax, mlx_op_cummax);
 scan_op!(mlx_cummin, mlx_op_cummin);
 
+/// Produce a 1-D F32 array `[0.0, 1.0, …, n-1.0]` — the row-index (iota)
+/// generator used by the rolling rewrite to build index arrays on-GPU.
+///
+/// Backed by `mlx::core::arange(0.0, n, float32)`. `n <= 0` yields an empty
+/// array (arange with start == stop). No input `MlxArray` is consumed, so
+/// `_input_refs` is empty.
+///
+/// Returns `Err` only if the C++ side throws unexpectedly (e.g. allocation
+/// failure); for all normal inputs this succeeds.
+pub fn mlx_iota_f32(n: i64) -> Result<MlxArrayHandle, FfiError> {
+    let ptr = ffi::mlx_iota_f32(n).map_err(FfiError::from)?;
+    Ok(MlxArrayHandle {
+        ptr,
+        _input_refs: Vec::new(),
+    })
+}
+
 /// Forward-shift a 1-D F32 array along axis 0 by `shift` positions,
 /// zero-filling the vacated front positions.
 ///

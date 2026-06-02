@@ -406,6 +406,23 @@ std::shared_ptr<MlxArray> mlx_shift(const std::shared_ptr<MlxArray>& a, int64_t 
     return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
 }
 
+// ── M5 rolling Task 4b: mlx_iota_f32 ─────────────────────────────────────────
+//
+// Produce a 1-D F32 array [0.0, 1.0, …, n-1.0] using mlx::core::arange.
+// Uses the (double start, double stop, Dtype, StreamOrDevice) overload:
+//   arange(0.0, n, mlx::core::float32)
+// API verified against vendor/mlx/mlx/ops.h. n <= 0 yields an empty array
+// (arange with start == stop is defined to return an empty result).
+
+std::shared_ptr<MlxArray> mlx_iota_f32(int64_t n) {
+    auto out = mlx::core::arange(
+        static_cast<double>(0),
+        static_cast<double>(n),
+        mlx::core::float32);
+    auto base = std::make_shared<mlx::core::array>(out);
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
 // ── M4 Phase 1 Task 10: cumulative scans + matmul + fft + real/imag ─────────
 
 #define MLX_WRAP_SCAN(rust_name, mlx_op)                                                   \

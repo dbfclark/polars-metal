@@ -227,6 +227,16 @@ std::shared_ptr<MlxArray> mlx_op_argpartition(
 // pad_value) and slice(array, Shape start, Shape stop).
 std::shared_ptr<MlxArray> mlx_shift(const std::shared_ptr<MlxArray>& a, int64_t shift);
 
+// ── M5 rolling Task 4b: mlx_iota_f32 ────────────────────────────────────────
+//
+// Produce a 1-D F32 array [0.0, 1.0, …, n-1.0] — the row-index (iota)
+// generator used by the rolling rewrite to build index arrays on-GPU.
+//
+// Implementation: mlx::core::arange(0.0, n, float32) using the
+// (double start, double stop, Dtype, StreamOrDevice) overload verified against
+// vendor/mlx/mlx/ops.h. n <= 0 yields an empty array (arange start==stop).
+std::shared_ptr<MlxArray> mlx_iota_f32(int64_t n);
+
 std::shared_ptr<MlxArray> mlx_op_cumsum(const std::shared_ptr<MlxArray>& a, int32_t axis);
 std::shared_ptr<MlxArray> mlx_op_cumprod(const std::shared_ptr<MlxArray>& a, int32_t axis);
 std::shared_ptr<MlxArray> mlx_op_cummax(const std::shared_ptr<MlxArray>& a, int32_t axis);
