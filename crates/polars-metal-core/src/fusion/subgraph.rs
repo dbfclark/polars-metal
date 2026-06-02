@@ -408,6 +408,12 @@ fn build_op(node: &OpNode, handles: &[MlxArrayHandle]) -> Result<MlxArrayHandle,
         // taken from the first input handle — inputs are always bound into
         // `handles` before the op loop, so handles[0] is the first scope input
         // and its length is the row count shared by all inputs.
+        // The `.ok_or(UnsupportedOp)` below fires only if `handles` is empty,
+        // i.e. a RowIndex op with zero scope inputs — a caller-contract violation
+        // that the FusionScope analyzer never produces for a valid rolling scope.
+        // This path is effectively unreachable; `UnsupportedOp` is reused purely
+        // as a defensive fallback rather than adding a bespoke error variant for
+        // an unreachable condition.
         RowIndex => {
             arg_count(node.op, 0, &args)?;
             let n_rows = handles
