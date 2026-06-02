@@ -55,7 +55,11 @@ impl FusionScope {
 
     pub fn push_op(&mut self, op: OpId, args: Vec<NodeIdx>) -> NodeIdx {
         let idx = NodeIdx(self.inputs.len() as u32 + self.ops.len() as u32);
-        self.ops.push(OpNode { op, args, param: None });
+        self.ops.push(OpNode {
+            op,
+            args,
+            param: None,
+        });
         idx
     }
 

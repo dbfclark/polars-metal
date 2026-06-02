@@ -398,9 +398,7 @@ fn build_op(node: &OpNode, handles: &[MlxArrayHandle]) -> Result<MlxArrayHandle,
         // param carrying the shift amount.
         Shift => {
             arg_count(node.op, 1, &args)?;
-            let w = node
-                .param
-                .ok_or(BuildError::UnsupportedOp(node.op))?;
+            let w = node.param.ok_or(BuildError::UnsupportedOp(node.op))?;
             ffi(mlx_shift(args[0], w))
         }
     }
