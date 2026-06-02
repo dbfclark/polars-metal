@@ -28,6 +28,8 @@ pub struct NodeIdx(pub u32);
 pub struct OpNode {
     pub op: OpId,
     pub args: Vec<NodeIdx>,
+    /// Optional scalar parameter (e.g. shift amount for `OpId::Shift`).
+    pub param: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -53,7 +55,15 @@ impl FusionScope {
 
     pub fn push_op(&mut self, op: OpId, args: Vec<NodeIdx>) -> NodeIdx {
         let idx = NodeIdx(self.inputs.len() as u32 + self.ops.len() as u32);
-        self.ops.push(OpNode { op, args });
+        self.ops.push(OpNode { op, args, param: None });
+        idx
+    }
+
+    /// Like [`push_op`] but carries an optional scalar parameter (e.g. the
+    /// shift amount for `OpId::Shift`).
+    pub fn push_op_param(&mut self, op: OpId, args: Vec<NodeIdx>, param: Option<i64>) -> NodeIdx {
+        let idx = NodeIdx(self.inputs.len() as u32 + self.ops.len() as u32);
+        self.ops.push(OpNode { op, args, param });
         idx
     }
 
@@ -91,5 +101,24 @@ impl FusionScope {
                     | Ifft
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::supported_ops::OpId;
+    use super::{FusionScope, InputDtype};
+
+    #[test]
+    fn shift_op_carries_window_param() {
+        let mut s = FusionScope::new();
+        let a = s.add_input("x", InputDtype::F32);
+        // push_op_param with param=Some(3); a is NodeIdx(0), first op is at
+        // ops-index 0 (NodeIdx = n_inputs + ops.len() before push = 1).
+        let sh = s.push_op_param(OpId::Shift, vec![a], Some(3));
+        // sh.0 == 1 (1 input + 0 prior ops); op is at self.ops[sh.0 - n_inputs]
+        let n_inputs = s.inputs.len() as u32;
+        let op_idx = (sh.0 - n_inputs) as usize;
+        assert_eq!(s.ops[op_idx].param, Some(3));
     }
 }

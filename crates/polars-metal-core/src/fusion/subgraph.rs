@@ -393,5 +393,8 @@ fn build_op(node: &OpNode, handles: &[MlxArrayHandle]) -> Result<MlxArrayHandle,
         // reachable from the analyzer, but the dispatch is wired now).
         Fft => ffi(mlx_fft(args[0])),
         Ifft => ffi(mlx_ifft(args[0])),
+
+        // Shift (M5 rolling Task 3): wired in Task 3 below.
+        Shift => Err(BuildError::UnsupportedOp(node.op)),
     }
 }

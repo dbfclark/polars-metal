@@ -88,6 +88,8 @@ pub enum OpId {
     // FFT (unary, F32 -> complex; Phase 11)
     Fft,
     Ifft,
+    // Shift (forward, zero-fill) — for rolling cumsum-diff (M5)
+    Shift,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -342,6 +344,15 @@ pub fn op_spec(op: OpId) -> OpSpec {
             dynamic_flops: true,
             allows_null: false,
         },
+        // Shift (forward zero-fill) — 1 element move per row, same dtype
+        Shift => OpSpec {
+            n_args: 1,
+            flops_per_row: 1,
+            input_dtype: I::F32OrF64,
+            output_dtype: O::SameAsInput,
+            dynamic_flops: false,
+            allows_null: false,
+        },
     }
 }
 
@@ -409,6 +420,7 @@ pub fn all_op_ids() -> impl Iterator<Item = OpId> {
         MatMul,
         Fft,
         Ifft,
+        Shift,
     ]
     .into_iter()
 }
