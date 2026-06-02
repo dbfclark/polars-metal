@@ -90,6 +90,8 @@ pub enum OpId {
     Ifft,
     // Shift (forward, zero-fill) — for rolling cumsum-diff (M5)
     Shift,
+    // RowIndex (0-arg iota: [0,1,…,n-1] as F32) — for rolling off-by-one fix (M5)
+    RowIndex,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -353,6 +355,17 @@ pub fn op_spec(op: OpId) -> OpSpec {
             dynamic_flops: false,
             allows_null: false,
         },
+        // RowIndex (0-arg iota generator) — no input, F32 output of length n_rows.
+        // input_dtype is unused (n_args=0) but must be a valid variant; F32 is a
+        // safe placeholder.
+        RowIndex => OpSpec {
+            n_args: 0,
+            flops_per_row: 0,
+            input_dtype: I::F32,
+            output_dtype: O::F32,
+            dynamic_flops: false,
+            allows_null: false,
+        },
     }
 }
 
@@ -421,6 +434,7 @@ pub fn all_op_ids() -> impl Iterator<Item = OpId> {
         Fft,
         Ifft,
         Shift,
+        RowIndex,
     ]
     .into_iter()
 }

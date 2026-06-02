@@ -28,7 +28,9 @@ use polars_metal_mlx_sys::matmul::mlx_matmul;
 use polars_metal_mlx_sys::reduce::{
     mlx_argmax, mlx_argmin, mlx_max, mlx_mean, mlx_min, mlx_std, mlx_sum, mlx_var,
 };
-use polars_metal_mlx_sys::scan::{mlx_cummax, mlx_cummin, mlx_cumprod, mlx_cumsum, mlx_shift};
+use polars_metal_mlx_sys::scan::{
+    mlx_cummax, mlx_cummin, mlx_cumprod, mlx_cumsum, mlx_iota_f32, mlx_shift,
+};
 use polars_metal_mlx_sys::sort::mlx_sort;
 use thiserror::Error;
 
@@ -400,6 +402,19 @@ fn build_op(node: &OpNode, handles: &[MlxArrayHandle]) -> Result<MlxArrayHandle,
             arg_count(node.op, 1, &args)?;
             let w = node.param.ok_or(BuildError::UnsupportedOp(node.op))?;
             ffi(mlx_shift(args[0], w))
+        }
+
+        // RowIndex (M5 rolling): 0-arg iota [0,1,…,n_rows-1] as F32. n_rows is
+        // taken from the first input handle — inputs are always bound into
+        // `handles` before the op loop, so handles[0] is the first scope input
+        // and its length is the row count shared by all inputs.
+        RowIndex => {
+            arg_count(node.op, 0, &args)?;
+            let n_rows = handles
+                .first()
+                .and_then(|h| h.shape().first().copied())
+                .ok_or(BuildError::UnsupportedOp(node.op))?;
+            ffi(mlx_iota_f32(n_rows as i64))
         }
     }
 }

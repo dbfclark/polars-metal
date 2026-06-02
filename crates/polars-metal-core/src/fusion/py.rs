@@ -153,6 +153,7 @@ fn op_id_from_str(s: &str) -> Option<OpId> {
         "Fft" => Fft,
         "Ifft" => Ifft,
         "Shift" => Shift,
+        "RowIndex" => RowIndex,
         _ => return None,
     })
 }

@@ -152,3 +152,18 @@ fn subgraph_shift_zero_pads() {
     let got = outputs[0].to_f32_vec().unwrap();
     assert_eq!(got, vec![0.0, 0.0, 1.0, 2.0], "got {got:?}");
 }
+
+#[test]
+fn subgraph_row_index_counts() {
+    // RowIndex emits [0,1,2] for a 3-row input (input present so n_rows is known).
+    let mut scope = FusionScope::new();
+    let _a = scope.add_input("x", InputDtype::F32);
+    let idx = scope.push_op(OpId::RowIndex, vec![]);
+    scope.mark_output(idx);
+
+    let inputs = vec![f32_input(vec![5.0, 6.0, 7.0])];
+    let subgraph = MlxSubgraph::from_fusion_scope(&scope, &inputs).expect("build");
+    let outputs = subgraph.eval().expect("eval");
+    let got = outputs[0].to_f32_vec().unwrap();
+    assert_eq!(got, vec![0.0, 1.0, 2.0], "got {got:?}");
+}
