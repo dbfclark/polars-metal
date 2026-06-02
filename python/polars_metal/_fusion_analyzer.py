@@ -358,19 +358,28 @@ _IR_FUNCTION_MAP: dict[str, str] = {
     "floor": "Floor",
     "ceil": "Ceil",
     "round": "Round",
-    # Cumulative scan (Phase 7 Task 28). Polars encodes `cum_sum` as a
-    # Function whose function_data is ('cum_sum', reverse: bool). MLX's binding
-    # is forward-only, so reverse=True falls back to CPU (see the guards in
-    # `_gather_leaves_ir` / `_visit_ir_ops`).
+    # Cumulative scans (Phase 7 Task 28 + cum_prod/max/min). Polars encodes
+    # each as a Function whose function_data is (name, reverse: bool). The MLX
+    # bindings (CumSum/CumProd/CumMax/CumMin, wired in fusion/subgraph.rs) are
+    # forward-only, so reverse=True falls back to CPU (see the guards in
+    # `_gather_leaves_ir` / `_visit_ir_ops`). Null-bearing scans also fall back
+    # (their null propagation isn't the elementwise AND rule — see `null_mode_ir`).
     "cum_sum": "CumSum",
+    "cum_prod": "CumProd",
+    "cum_max": "CumMax",
+    "cum_min": "CumMin",
 }
+
+# OpId strings for the cumulative scans (forward-only MLX bindings; null
+# propagation isn't the elementwise AND rule).
+_CUMULATIVE_OPS: frozenset[str] = frozenset({"CumSum", "CumProd", "CumMax", "CumMin"})
 
 
 def _is_reverse_cumulative(fn_name: str, fd: tuple) -> bool:
     """True for a reverse cumulative scan, which has no MLX forward-only
     binding and must fall back to CPU. `fd` is the Function.function_data
     tuple, e.g. ('cum_sum', True)."""
-    return fn_name == "cum_sum" and len(fd) > 1 and bool(fd[1])
+    return _IR_FUNCTION_MAP.get(fn_name) in _CUMULATIVE_OPS and len(fd) > 1 and bool(fd[1])
 
 
 def analyze_ir_expression(nt: Any, node_id: int, schema: dict[str, Any]) -> PyFusionScope | None:
@@ -582,7 +591,7 @@ def _classify_null_ir(nt: Any, node_id: int, schema: dict[str, Any], state: dict
             raise _Aborted
         if fn_name not in ("log", "pow") and fn_name not in _IR_FUNCTION_MAP:
             raise _Aborted
-        if _IR_FUNCTION_MAP.get(fn_name) == "CumSum":
+        if _IR_FUNCTION_MAP.get(fn_name) in _CUMULATIVE_OPS:
             # Scan: Polars cum_sum null propagation isn't the AND rule.
             raise _Aborted
         for cid in list(getattr(node, "input", [])):
@@ -818,7 +827,7 @@ def _visit_validity(
         if not fd:
             raise _Aborted
         fn_name = str(fd[0]).lower()
-        if _is_reverse_cumulative(fn_name, fd) or _IR_FUNCTION_MAP.get(fn_name) == "CumSum":
+        if _is_reverse_cumulative(fn_name, fd) or _IR_FUNCTION_MAP.get(fn_name) in _CUMULATIVE_OPS:
             raise _Aborted
         if fn_name not in ("log", "pow") and fn_name not in _IR_FUNCTION_MAP:
             raise _Aborted
