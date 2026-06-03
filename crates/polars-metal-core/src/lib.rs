@@ -18,8 +18,9 @@ pub use arena::{BumpArena, ScratchArena, StubArena};
 pub use error::EngineError;
 pub use udf::{
     bool_and_dispatch, bool_or_dispatch, cmp_f64_col_col, cmp_f64_col_scalar, cmp_i64_col_col,
-    cmp_i64_col_scalar, execute_filter_compact, execute_groupby, execute_plan, parse_groupby_plan,
-    warmup_common_fused_signatures, GroupByParseError, ParsedAgg, ParsedGroupByPlan, ParsedKey,
+    cmp_i64_col_scalar, execute_filter_compact, execute_groupby, execute_plan, execute_rolling,
+    parse_groupby_plan, warmup_common_fused_signatures, GroupByParseError, ParsedAgg,
+    ParsedGroupByPlan, ParsedKey,
 };
 
 use polars_metal_buffer::MetalDevice;
@@ -69,6 +70,7 @@ fn polars_metal_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add_function(wrap_pyfunction!(udf::execute_groupby, m)?)?;
     m.add_function(wrap_pyfunction!(udf::warmup_common_fused_signatures, m)?)?;
     m.add_function(wrap_pyfunction!(udf::execute_fused_expr, m)?)?;
+    m.add_function(wrap_pyfunction!(udf::execute_rolling, m)?)?;
     fusion::py::register(m)?;
     Ok(())
 }
