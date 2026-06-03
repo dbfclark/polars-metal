@@ -52,6 +52,11 @@ pub enum RollingError {
     /// truncating silently.
     #[error("n_rows {n_rows} exceeds u32::MAX")]
     RowCountOverflow { n_rows: usize },
+    /// `w <= ddof` — the kernel computes `ss / (w - ddof)`; a zero or
+    /// negative denominator produces silent `Inf`/`NaN`. The caller must
+    /// ensure `w > ddof` (typically `ddof=1` requires `w >= 2`).
+    #[error("rolling variance requires window > ddof, got w={w} ddof={ddof}")]
+    InvalidDdof { w: u32, ddof: u32 },
 }
 
 /// Core dispatch over pre-staged MetalBuffers (zero-copy when the caller
@@ -241,8 +246,8 @@ pub fn dispatch_rolling_sum_f32(
 /// - `1 <= w <= MAX_W` (4096). Larger windows must use CPU; this function
 ///   returns [`RollingError::WindowOutOfRange`].
 /// - `w > ddof` — the kernel computes `ss / (w - ddof)`; `w <= ddof` would
-///   divide by zero or produce nonsensical results. Detection / rejection of
-///   that case is the caller's responsibility.
+///   divide by zero or produce nonsensical results. This function enforces
+///   the invariant and returns [`RollingError::InvalidDdof`] if violated.
 /// - `n <= u32::MAX` (enforced).
 ///
 /// ## n == 0
@@ -260,6 +265,9 @@ pub fn dispatch_rolling_var_f32_buf(
     let w_usize = w as usize;
     if w == 0 || w_usize > MAX_W {
         return Err(RollingError::WindowOutOfRange { w: w_usize });
+    }
+    if w <= ddof {
+        return Err(RollingError::InvalidDdof { w, ddof });
     }
     if n == 0 {
         return Ok(());
@@ -315,7 +323,7 @@ pub fn dispatch_rolling_var_f32_buf(
 /// - `output.len() == input.len()`.
 /// - `1 <= w <= MAX_W` (4096). Larger windows must use CPU; returns
 ///   [`RollingError::WindowOutOfRange`].
-/// - `w > ddof` (caller's responsibility; typically `ddof=1`, so `w >= 2`).
+/// - `w > ddof` (enforced; typically `ddof=1`, so `w >= 2`; returns [`RollingError::InvalidDdof`] otherwise).
 /// - `n <= u32::MAX` (enforced).
 ///
 /// ## n == 0
@@ -331,7 +339,7 @@ pub fn dispatch_rolling_var_f32(
     input: &[f32],
     output: &mut [f32],
     w: usize,
-    ddof: usize,
+    ddof: u32,
     is_std: bool,
 ) -> Result<(), RollingError> {
     let n = input.len();
@@ -352,8 +360,8 @@ pub fn dispatch_rolling_var_f32(
     let n_u32 = u32::try_from(n).map_err(|_| RollingError::RowCountOverflow { n_rows: n })?;
     // w <= MAX_W <= 4096 <= u32::MAX, so this conversion always succeeds.
     let w_u32 = u32::try_from(w).map_err(|_| RollingError::WindowOutOfRange { w })?;
-    // ddof is typically 1; bounded by w which is <= u32::MAX.
-    let ddof_u32 = u32::try_from(ddof).map_err(|_| RollingError::WindowOutOfRange { w: ddof })?;
+    // ddof is already u32; no conversion needed.
+    let ddof_u32 = ddof;
 
     // Stage the input into a Metal buffer (copy; the slice may not be
     // page-aligned, and this wrapper is for test ergonomics only).

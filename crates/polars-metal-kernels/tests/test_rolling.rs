@@ -18,7 +18,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use polars_metal_buffer::MetalDevice;
-use polars_metal_kernels::rolling::{dispatch_rolling_sum_f32, dispatch_rolling_var_f32};
+use polars_metal_kernels::rolling::{
+    dispatch_rolling_sum_f32, dispatch_rolling_var_f32, RollingError,
+};
 use std::sync::Mutex;
 
 static METAL_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -115,12 +117,8 @@ fn rolling_mean_small_constant_series() {
     // All same value: mean == value for every valid output.
     let x = vec![3.0f32; 50];
     let got = run_sum(&x, 7, true);
-    for i in 6..50 {
-        assert!(
-            (got[i] - 3.0).abs() < 1e-5,
-            "i={i} mean got={} want=3.0",
-            got[i]
-        );
+    for (i, &g) in got.iter().enumerate().skip(6) {
+        assert!((g - 3.0).abs() < 1e-5, "i={i} mean got={g} want=3.0");
     }
 }
 
@@ -163,17 +161,32 @@ fn rolling_var_std_match_reference() {
         let rv = ref_rolling_var(&x, w, 1);
         for i in (w - 1)..n {
             assert!(
-                (var[i] as f64 - rv[i]).abs() < 1e-2,
+                (var[i] as f64 - rv[i]).abs() < 1e-3,
                 "var w={w} i={i} got={} want={}",
                 var[i],
                 rv[i]
             );
             assert!(
-                (std[i] as f64 - rv[i].sqrt()).abs() < 1e-2,
+                (std[i] as f64 - rv[i].sqrt()).abs() < 1e-3,
                 "std w={w} i={i} got={} want={}",
                 std[i],
                 rv[i].sqrt()
             );
         }
     }
+}
+
+#[test]
+fn rolling_var_w_eq_ddof_returns_invalid_ddof_error() {
+    // w=1, ddof=1 → w <= ddof; must return InvalidDdof, not divide by zero.
+    let _lock = METAL_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let device = MetalDevice::system_default().expect("Metal-capable hardware required");
+    let x = vec![1.0f32, 2.0, 3.0];
+    let mut out = vec![0.0f32; 3];
+    let err = dispatch_rolling_var_f32(&device, &x, &mut out, 1, 1, false)
+        .expect_err("w=1 ddof=1 must fail");
+    assert!(
+        matches!(err, RollingError::InvalidDdof { w: 1, ddof: 1 }),
+        "unexpected error variant: {err}"
+    );
 }
