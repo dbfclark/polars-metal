@@ -2628,7 +2628,17 @@ pub fn execute_rolling(
         ));
     }
 
-    let n = in_n as u32;
+    // Fix 1: n=0 is a no-op — staging a 0-byte MTLBuffer would error.
+    if in_n == 0 {
+        return Ok(());
+    }
+
+    // Fix 2: guard against silent truncation on pathological inputs.
+    let n = u32::try_from(in_n).map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err(
+            "polars_metal: rolling column exceeds u32::MAX rows",
+        )
+    })?;
 
     // Stage input buffer. Zero-copy when page-aligned (numpy arrays are),
     // single copy otherwise. The source array is kept alive by the caller
@@ -2699,6 +2709,10 @@ pub fn execute_rolling(
         // We just dispatched into `outb` and the GPU is idle; the result bytes
         // are stable. `f32` has no invalid bit patterns.
         let dst: &mut [f32] = unsafe { std::slice::from_raw_parts_mut(out_ptr as *mut f32, out_n) };
+        // SAFETY: `out_ptr` is valid for `out_n * 4` bytes (caller contract).
+        // Metal `StorageModeShared` allocations are page-aligned, satisfying
+        // f32's 4-byte alignment requirement; `out_n` f32 occupy exactly
+        // `out_bytes.len()` bytes.
         let src_f32: &[f32] =
             unsafe { std::slice::from_raw_parts(out_bytes.as_ptr() as *const f32, out_n) };
         dst.copy_from_slice(src_f32);

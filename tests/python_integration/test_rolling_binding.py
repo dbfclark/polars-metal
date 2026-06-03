@@ -56,3 +56,16 @@ def test_execute_rolling_mean_var_std():
             ddof=1,
         )
         assert abs(out[9] - 1.0) < 1e-4, f"op={op} (var/std) at index 9: expected 1.0, got {out[9]}"
+
+
+def test_execute_rolling_empty_is_noop():
+    x = np.zeros(0, dtype=np.float32)
+    out = np.zeros(0, dtype=np.float32)
+    _native.execute_rolling(
+        inp=(x.ctypes.data, x.size),
+        out=(out.ctypes.data, out.size),
+        w=3,
+        op=0,
+        ddof=1,
+    )
+    # no error, nothing to check
