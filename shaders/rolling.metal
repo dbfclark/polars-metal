@@ -98,3 +98,85 @@ kernel void rolling_sum_f32(
 
     output[gid] = (is_mean != 0u) ? (s / float(w)) : s;
 }
+
+// Rolling windowed variance/std over a 1-D F32 column — centered two-pass
+// variant.
+//
+// ## Numerical stability
+//
+// A single-pass variance accumulation over a window whose values have a large
+// common offset (e.g. all values near 1000.0) suffers catastrophic
+// cancellation when the squared-mean term is nearly as large as the
+// sum-of-squares term. The centered two-pass approach avoids this: pass 1
+// computes the window mean; pass 2 accumulates (x_k - mu)^2 over the same
+// tile window. The subtracted residuals are small regardless of the absolute
+// magnitude of the input, so F32 precision is preserved.
+//
+// ## Algorithm
+//
+// Identical tile-load preamble to `rolling_sum_f32`. After the barrier:
+//   Pass 1: sum tile[t0..t0+w] → mu = sum / w
+//   Pass 2: sum (tile[t0+k] - mu)^2 for k in [0,w) → ss
+//   Output: ss / (w - ddof), or sqrt(that) when is_std != 0
+//
+// ## Scalar parameters
+//
+//   buffer(2): n      — row count
+//   buffer(3): w      — window width
+//   buffer(4): ddof   — degrees-of-freedom correction (1 = sample variance)
+//   buffer(5): is_std — nonzero → output sqrt(var)
+
+kernel void rolling_var_f32(
+    device const float* input   [[buffer(0)]],
+    device       float* output  [[buffer(1)]],
+    constant     uint&  n       [[buffer(2)]],
+    constant     uint&  w       [[buffer(3)]],
+    constant     uint&  ddof    [[buffer(4)]],
+    constant     uint&  is_std  [[buffer(5)]],
+    uint gid  [[thread_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]])
+{
+    // Tile: TG_SIZE outputs + (w-1) left-halo elements.
+    // Same compile-time sizing as rolling_sum_f32; 17 408 bytes < 32 KB limit.
+    threadgroup float tile[TG_SIZE + MAX_W];
+
+    uint halo       = w - 1u;
+    uint base       = tgid * TG_SIZE;
+    uint load_count = TG_SIZE + halo;
+
+    // Cooperative tile load — identical to rolling_sum_f32.
+    for (uint j = lid; j < load_count; j += TG_SIZE) {
+        long src = (long)base - (long)halo + (long)j;
+        tile[j] = (src >= 0L && src < (long)n) ? input[src] : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (gid >= n) return;
+
+    // `t0`: index into tile[] for the first element of this thread's window.
+    // Thread `lid` within threadgroup `tgid` owns global output at `gid =
+    // tgid*TG_SIZE + lid`; its window is input[gid-halo .. gid+1), which maps
+    // to tile[lid .. lid+w).
+    uint t0 = lid;
+
+    // Pass 1: window mean (keeps all arithmetic in the centered frame).
+    float s = 0.0f;
+    for (uint k = 0u; k < w; ++k) {
+        s += tile[t0 + k];
+    }
+    float mu = s / float(w);
+
+    // Pass 2: sum of centered squares — cancellation-free because each term
+    // (tile[t0+k] - mu) is at most ~max_range of the input, not ~mean.
+    float ss = 0.0f;
+    for (uint k = 0u; k < w; ++k) {
+        float d = tile[t0 + k] - mu;
+        ss += d * d;
+    }
+
+    // Caller guarantees w > ddof; denom is strictly positive.
+    float denom = float(w - ddof);
+    float var   = ss / denom;
+    output[gid] = (is_std != 0u) ? sqrt(var) : var;
+}
