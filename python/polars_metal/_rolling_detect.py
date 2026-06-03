@@ -265,6 +265,14 @@ def find_rolling_bindings(lf: pl.LazyFrame) -> list[RollingBinding]:
             except Exception:
                 continue
 
+        # Reject if any output name shadows a source column we must read: the split
+        # (lf.drop(out_names)) would remove a column the kernel needs, and an
+        # in-place rolling (out_name == column) can't be expressed as orig-source
+        # + rolled-output from one plan. Fall back to CPU for the whole query.
+        sources = {b.column for b in results}
+        if any(b.out_name in sources for b in results):
+            return []
+
         return results
 
     except Exception:

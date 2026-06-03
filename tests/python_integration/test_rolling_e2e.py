@@ -23,3 +23,20 @@ def test_rolling_mean_sum_e2e_match_cpu():
         got = lf.collect(engine=eng)
         assert_frame_equal(got, lf.collect(), check_exact=False, rel_tol=1e-4, abs_tol=1e-4)
         assert got["r"][: w - 1].null_count() == w - 1  # first w-1 structurally null
+
+
+def test_rolling_inplace_overwrite_falls_back_to_cpu():
+    df = pl.DataFrame({"x": np.arange(8, dtype=np.float32)})
+    eng = polars_metal.MetalEngine()
+    lf = df.lazy().with_columns(x=pl.col("x").rolling_mean(3))  # out_name == source
+    assert_frame_equal(lf.collect(engine=eng), lf.collect())  # no crash; matches CPU
+
+
+def test_rolling_null_input_matches_cpu():
+    df = pl.DataFrame(
+        {"x": pl.Series([1.0, None, 3.0, 4.0, None, 6.0, 7.0, 8.0], dtype=pl.Float32)}
+    )
+    eng = polars_metal.MetalEngine()
+    for op in ("mean", "sum"):
+        lf = df.lazy().with_columns(r=getattr(pl.col("x"), f"rolling_{op}")(3))
+        assert_frame_equal(lf.collect(engine=eng), lf.collect())

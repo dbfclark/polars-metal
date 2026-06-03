@@ -25,6 +25,13 @@ def _rolling_series(src: pl.Series, b: RollingBinding) -> pl.Series:
     values are null (structurally, matching Polars' own rolling semantics) and
     the remainder are the kernel output.
     """
+    # Null-bearing input: the Metal kernel can't reproduce Polars' null-skipping
+    # rolling semantics (it would propagate NaN). Fall back to Polars CPU for
+    # this column — exact match, just unaccelerated.
+    if src.null_count() > 0:
+        expr = getattr(pl.col(b.column), f"rolling_{b.op}")(b.window)
+        return src.rename(b.column).to_frame().select(expr.alias(b.out_name)).to_series()
+
     s = src.rechunk()  # contiguous F32 buffer (zero-copy contract)
     x = np.ascontiguousarray(s.to_numpy(), dtype=np.float32)
     out = np.empty(x.shape[0], dtype=np.float32)
