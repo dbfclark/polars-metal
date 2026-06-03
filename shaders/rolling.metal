@@ -63,40 +63,154 @@ kernel void rolling_sum_f32(
     uint lid  [[thread_position_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]])
 {
-    // Tile: TG_SIZE outputs + (w-1) left-halo elements.
-    // Stack-allocated; size is compile-time constant (TG_SIZE + MAX_W
-    // = 4352 floats = 17 408 bytes, well within the 32 KB threadgroup limit).
+    // ## Tile-local cooperative inclusive prefix-scan, O(N) rolling sum.
+    //
+    // The old O(N·w) serial loop summed `w` values per output element. This
+    // rewrite builds a tile-local inclusive prefix sum P[] over the L-element
+    // tile in three cooperative phases (A/B/C), then each output does one O(1)
+    // difference: window_sum = P[lid+w-1] - (lid==0 ? 0 : P[lid-1]).
+    //
+    // Magnitudes stay tile-scale (~L·mean, not N·mean) — same F32-stability
+    // property as before; we just avoid the per-thread w-iteration.
+    //
+    // ## Threadgroup memory budget
+    //   tile      : TG_SIZE + MAX_W = 4352 floats = 17 408 B
+    //   seg_a/b   : TG_SIZE = 256 floats each      =  2 048 B  (×2 = 4 096 B)
+    //   Total                                       = 21 504 B < 32 KB limit
+    //
+    // ## Grid
+    //   Dispatched with n_padded threads (n rounded up to TG_SIZE multiple).
+    //   Surplus threads (gid >= n) participate in ALL cooperative phases so
+    //   every barrier is reached by every thread in the group.
+    //   Only the final output store is guarded by `if (gid < n)`.
+
+    // Shared tile: L = TG_SIZE + (w-1) elements.
     threadgroup float tile[TG_SIZE + MAX_W];
+
+    // Two scratch buffers for the Hillis-Steele ping-pong scan in Phase B.
+    // seg_a is the "read" buffer; seg_b is the "write" buffer. We swap roles
+    // each pass to avoid read/write races across threads.
+    threadgroup float seg_a[TG_SIZE];
+    threadgroup float seg_b[TG_SIZE];
 
     uint halo       = w - 1u;
     uint base       = tgid * TG_SIZE;         // first output index of this group
-    uint load_count = TG_SIZE + halo;         // inputs needed: [base-halo, base+TG_SIZE)
+    uint load_count = TG_SIZE + halo;         // L = inputs needed
 
-    // Cooperative load into threadgroup memory: each thread loads a stripe
-    // of elements spaced TG_SIZE apart. For the first halo elements, the
-    // global source index may be negative (i.e. before the start of the
-    // array); those positions are zero-filled (reflecting the "the window
-    // doesn't exist yet" contract — the host marks those outputs as null).
+    // ── Cooperative tile load ────────────────────────────────────────────────
+    // Each thread loads a stripe of tile slots spaced TG_SIZE apart.
+    // Slots that map before index 0 or beyond n are zero-filled.
     for (uint j = lid; j < load_count; j += TG_SIZE) {
         long src = (long)base - (long)halo + (long)j;
         tile[j] = (src >= 0L && src < (long)n) ? input[src] : 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (gid >= n) return;
+    // ── Phase A: per-thread serial inclusive prefix over each thread's segment ─
+    //
+    // Divide the L-element tile among TG_SIZE threads.
+    // Thread `lid` owns tile indices [lid*seg, min((lid+1)*seg, L)).
+    // Running the serial prefix in-place transforms that segment so that each
+    // element holds the cumulative sum of all preceding elements in the segment.
+    // seg_a[lid] = total of the segment (for the Phase B scan).
+    //
+    // `seg` = ceil(L / TG_SIZE) — constant across the group for a given w.
+    uint seg = (load_count + TG_SIZE - 1u) / TG_SIZE;   // ceil(L / TG_SIZE)
+    uint seg_start = lid * seg;
+    uint seg_end   = min(seg_start + seg, load_count);   // exclusive
 
-    // Each thread sums tile[lid .. lid+w) — its w-element window within the
-    // shared tile. `lid` = lid of this thread within its threadgroup, so
-    // tile[lid] corresponds to input[base], and tile[lid + k] to
-    // input[base + k] for k in [0, TG_SIZE). The left halo occupies
-    // tile[0..halo], so thread 0 reads tile[0..w) which is
-    // input[base-halo .. base+1).
-    float s = 0.0f;
-    for (uint k = 0u; k < w; ++k) {
-        s += tile[lid + k];
+    if (seg_start < load_count) {
+        // In-place inclusive prefix over tile[seg_start..seg_end).
+        for (uint j = seg_start + 1u; j < seg_end; ++j) {
+            tile[j] += tile[j - 1u];
+        }
+        seg_a[lid] = tile[seg_end - 1u];   // segment total
+    } else {
+        // This thread's segment is empty (trailing threads when L < TG_SIZE*seg).
+        seg_a[lid] = 0.0f;
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    output[gid] = (is_mean != 0u) ? (s / float(w)) : s;
+    // ── Phase B: Hillis-Steele inclusive scan of seg_a → compute exclusive offsets
+    //
+    // After Phase A, seg_a[k] holds the total of segment k. We need the
+    // exclusive prefix of these totals: off[k] = sum(seg_a[0..k)).
+    // We use Hillis-Steele (log2(TG_SIZE) = 8 passes) on TG_SIZE elements.
+    // Double-buffering between seg_a and seg_b prevents read/write races.
+    //
+    // After this phase, seg_a holds the INCLUSIVE scan of the original
+    // segment totals. The exclusive offset for thread lid is then:
+    //   off = seg_a[lid] - (original) seg_a[lid]
+    // We save the original totals into seg_b first, then compute.
+
+    // Save original segment totals into seg_b (used to derive exclusive offset).
+    seg_b[lid] = seg_a[lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Hillis-Steele inclusive scan: at each pass p, every element reads
+    // from the element `stride` positions to its left and adds it.
+    // We ping-pong: even passes read seg_a, write seg_b (and vice versa),
+    // except that after saving originals we need a clear scheme.
+    // Cleaner: use seg_a as the "current" scan buffer (starts as the totals),
+    // and seg_b as the scratch (ping-pong), carrying the result back to seg_a.
+    //
+    // Pass structure (8 passes for TG_SIZE=256):
+    //   stride = 1, 2, 4, 8, 16, 32, 64, 128
+    //   read from seg_a, write to seg_b; then swap.
+    // After all passes seg_a holds the inclusive scan of the original totals.
+    // The exclusive offset for thread `lid` is: off = (lid == 0) ? 0 : seg_a[lid-1].
+    //
+    // We need to restore the original totals so we can compute the exclusive
+    // offset correctly. They were saved in seg_b at the top of Phase B.
+    // Reload seg_a from the saved originals so seg_a starts as totals again.
+    seg_a[lid] = seg_b[lid];   // seg_b still holds originals at this point
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Hillis-Steele inclusive scan over seg_a (8 passes).
+    for (uint stride = 1u; stride < TG_SIZE; stride <<= 1u) {
+        float val = (lid >= stride) ? seg_a[lid - stride] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        seg_b[lid] = seg_a[lid] + val;   // write to seg_b
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        seg_a[lid] = seg_b[lid];         // copy back to seg_a
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // seg_a[lid] now holds the inclusive prefix sum of original segment totals.
+    // Exclusive offset for thread lid: off = (lid == 0) ? 0.0 : seg_a[lid-1].
+    float off = (lid == 0u) ? 0.0f : seg_a[lid - 1u];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Phase C: add each thread's segment offset to its local prefixes ──────
+    //
+    // After Phase A, tile[seg_start..seg_end) holds the LOCAL inclusive prefix
+    // of that segment. Adding `off` (= sum of all earlier segments) converts
+    // each element to the GLOBAL tile-local inclusive prefix P[j].
+    if (seg_start < load_count) {
+        for (uint j = seg_start; j < seg_end; ++j) {
+            tile[j] += off;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Output (one thread per output, O(1) window sum via prefix difference) ─
+    //
+    // Thread `lid` owns global output index `gid = tgid*TG_SIZE + lid`.
+    // Its window covers input[gid-halo .. gid], which maps to
+    // tile[lid .. lid+halo], i.e. tile indices [lid, lid+w-1].
+    //
+    // With the inclusive prefix P now in tile[0..L):
+    //   window_sum = P[lid+w-1] - (lid == 0 ? 0 : P[lid-1])
+    //             = P[hi] - P_prev
+    // where hi = lid + halo = lid + w - 1.
+    //
+    // Guard: surplus threads (gid >= n) skip the write but reach this point
+    // AFTER all barriers — no hang risk.
+    if (gid < n) {
+        uint hi = lid + halo;        // == lid + w - 1; always < L (= TG_SIZE + halo)
+        float p_prev = (lid == 0u) ? 0.0f : tile[lid - 1u];
+        float window_sum = tile[hi] - p_prev;
+        output[gid] = (is_mean != 0u) ? (window_sum / float(w)) : window_sum;
+    }
 }
 
 // Rolling windowed variance/std over a 1-D F32 column — centered two-pass

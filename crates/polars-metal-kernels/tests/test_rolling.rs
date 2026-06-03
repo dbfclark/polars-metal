@@ -177,6 +177,25 @@ fn rolling_var_std_match_reference() {
 }
 
 #[test]
+fn rolling_sum_large_window_on_n() {
+    // O(N) prefix-scan path must match the f64 reference at a large window
+    // spanning many tiles (w=1000, n=20000). This is the perf-target shape.
+    let n = 20000usize;
+    let x: Vec<f32> = (0..n).map(|i| ((i % 97) as f32) * 0.25 - 12.0).collect();
+    let w = 1000usize;
+    let got = run_sum(&x, w, false);
+    let want = ref_rolling_sum(&x, w);
+    for i in (w - 1)..n {
+        assert!(
+            (got[i] as f64 - want[i]).abs() < 1e-1,
+            "w={w} i={i} got={} want={}",
+            got[i],
+            want[i]
+        );
+    }
+}
+
+#[test]
 fn rolling_var_w_eq_ddof_returns_invalid_ddof_error() {
     // w=1, ddof=1 → w <= ddof; must return InvalidDdof, not divide by zero.
     let _lock = METAL_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());

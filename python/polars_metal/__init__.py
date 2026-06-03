@@ -10,6 +10,7 @@ from typing import Any
 import polars.lazyframe.frame as _plf
 
 from polars_metal import _native
+from polars_metal import _rolling_detect as _rolling_detect_module  # noqa: F401
 from polars_metal._callback import execute_with_metal
 from polars_metal._engine import MetalEngine
 
