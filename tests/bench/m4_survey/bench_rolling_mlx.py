@@ -15,7 +15,36 @@ import mlx.core as mx
 import numpy as np
 import polars as pl
 
+import polars_metal
 from tests.bench.m4_survey._timing import time_callable
+
+
+def bench_engine_path(N: int = 10_000_000, W: int = 1000) -> None:
+    """Benchmark the engine-path rolling_mean vs CPU (reproducibility for baseline.json).
+
+    Times ``df.lazy().with_columns(r=pl.col('x').rolling_mean(W)).collect(engine=eng)``
+    against the equivalent CPU collect.  A fresh LazyFrame is constructed per
+    iteration so the detection fast-path applies exactly as in real usage.
+    """
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal(N).astype(np.float32)
+    eng = polars_metal.MetalEngine()
+
+    def make():
+        return pl.DataFrame({"x": x}).lazy().with_columns(r=pl.col("x").rolling_mean(W))
+
+    cpu_res = time_callable(f"cpu.rolling_mean[W={W}, N={N:,}]", make().collect)
+    metal_res = time_callable(
+        f"metal.rolling_mean[W={W}, N={N:,}]",
+        lambda: make().collect(engine=eng),
+    )
+    ratio = metal_res.median_ms / cpu_res.median_ms
+    print(
+        f"  cpu_ms={cpu_res.median_ms:.2f}"
+        f"  metal_ms={metal_res.median_ms:.2f}"
+        f"  ratio={ratio:.4f}"
+        f"  speedup={1 / ratio:.1f}x\n"
+    )
 
 
 def main() -> None:
@@ -47,6 +76,9 @@ def main() -> None:
 
         mlx_res = time_callable(f"mlx.rolling_mean_via_cumsum[W={W}]", mlx_rolling_mean)
         print(f"  ratio Polars/MLX = {polars_res.median_ms / mlx_res.median_ms:.2f}x\n")
+
+    print("=== engine path (baseline.json: phase9_rolling_mean_w1000_10m) ===\n")
+    bench_engine_path(N=N, W=1000)
 
 
 if __name__ == "__main__":
