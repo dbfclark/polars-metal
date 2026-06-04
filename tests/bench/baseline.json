@@ -217,14 +217,16 @@
       "_target_ms": 22.0
     },
     "phase9_rolling_mean_w1000_10m": {
-      "cpu_ms": null,
-      "metal_ms": null,
-      "ratio_metal_over_cpu": null,
+      "cpu_ms": 116.34,
+      "metal_ms": 4.72,
+      "ratio_metal_over_cpu": 0.0406,
       "n_rows": 10000000,
       "hardware": "M2 Ultra",
-      "_notes": "M4 placeholder: rolling_mean W=1000 via cumsum-diff. Target wall-clock < 8.0 ms; ratio gate set at landing.",
-      "_pending": true,
-      "_target_ms": 8.0
+      "_notes": "rolling_mean W=1000 over 10M F32 via M5 cumsum-diff engine path (Shift op + mlx_shift FFI). Measured 4.72 ms metal vs 116.34 ms CPU = 24.7x on M2 Ultra. Gate: metal must stay >10x faster (ratio < 0.1) to catch a fusion-path regression.",
+      "_pending": false,
+      "_gate": {
+        "ratio_lt": 0.1
+      }
     },
     "phase10_cosine_topk_q100_n100k": {
       "cpu_ms": null,

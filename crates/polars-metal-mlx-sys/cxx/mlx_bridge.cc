@@ -379,6 +379,50 @@ std::shared_ptr<MlxArray> mlx_op_argpartition(
     return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
 }
 
+// ── M5 rolling Task 1: mlx_shift ─────────────────────────────────────────────
+//
+// Forward-shift a 1-D array by `shift` positions along axis 0, zero-filling
+// the front. Implementation:
+//   1. mlx::core::pad(a, {s, 0}, array(0.0f)) — prepend s zeros along axis 0.
+//      Uses the pair<int,int> overload: pad(array, pair<int,int>, pad_value).
+//      This prepends `s` zeros at the front and 0 at the back.
+//   2. mlx::core::slice(padded, {0}, {n}) — take the first n elements.
+//      Uses the stride-1 slice(array, Shape start, Shape stop) overload.
+// Both API names verified against vendor/mlx/mlx/ops.h.
+
+std::shared_ptr<MlxArray> mlx_shift(const std::shared_ptr<MlxArray>& a, int64_t shift) {
+    int32_t n = (*a).shape(0);
+    // Clamp shift to [0, n].
+    int32_t s = static_cast<int32_t>(
+        std::max<int64_t>(0, std::min<int64_t>(shift, static_cast<int64_t>(n))));
+    // Pad `s` zeros at the front of axis 0, 0 at the back.
+    auto padded = mlx::core::pad(
+        static_cast<const mlx::core::array&>(*a),
+        std::make_pair(s, 0),
+        mlx::core::array(0.0f));
+    // Slice back to length n (drop the last s elements that were the original tail).
+    auto out = mlx::core::slice(padded, {0}, {n});
+    auto base = std::make_shared<mlx::core::array>(out);
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
+// ── M5 rolling Task 4b: mlx_iota_f32 ─────────────────────────────────────────
+//
+// Produce a 1-D F32 array [0.0, 1.0, …, n-1.0] using mlx::core::arange.
+// Uses the (double start, double stop, Dtype, StreamOrDevice) overload:
+//   arange(0.0, n, mlx::core::float32)
+// API verified against vendor/mlx/mlx/ops.h. n <= 0 yields an empty array
+// (arange with start == stop is defined to return an empty result).
+
+std::shared_ptr<MlxArray> mlx_iota_f32(int64_t n) {
+    auto out = mlx::core::arange(
+        static_cast<double>(0),
+        static_cast<double>(n),
+        mlx::core::float32);
+    auto base = std::make_shared<mlx::core::array>(out);
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
 // ── M4 Phase 1 Task 10: cumulative scans + matmul + fft + real/imag ─────────
 
 #define MLX_WRAP_SCAN(rust_name, mlx_op)                                                   \

@@ -215,6 +215,28 @@ std::shared_ptr<MlxArray> mlx_op_argpartition(
 // FFT output is complex64 (interleaved real / imag F32 pairs). Use real/imag
 // to extract F32 streams for readback.
 
+// ── M5 rolling Task 1: mlx_shift ─────────────────────────────────────────────
+//
+// Forward-shift a 1-D array along axis 0 by `shift` positions, zero-filling
+// the vacated front positions. Output shape equals input shape.
+// `shift` is clamped to [0, n] so that shift >= n produces an all-zero result.
+//
+// Implementation: mlx::core::pad(a, {s, 0}, 0.0f) prepends s zeros to the
+// front, then mlx::core::slice(..., {0}, {n}) discards the last s elements.
+// API verified against vendor/mlx/mlx/ops.h: pad(array, pair<int,int>,
+// pad_value) and slice(array, Shape start, Shape stop).
+std::shared_ptr<MlxArray> mlx_shift(const std::shared_ptr<MlxArray>& a, int64_t shift);
+
+// ── M5 rolling Task 4b: mlx_iota_f32 ────────────────────────────────────────
+//
+// Produce a 1-D F32 array [0.0, 1.0, …, n-1.0] — the row-index (iota)
+// generator used by the rolling rewrite to build index arrays on-GPU.
+//
+// Implementation: mlx::core::arange(0.0, n, float32) using the
+// (double start, double stop, Dtype, StreamOrDevice) overload verified against
+// vendor/mlx/mlx/ops.h. n <= 0 yields an empty array (arange start==stop).
+std::shared_ptr<MlxArray> mlx_iota_f32(int64_t n);
+
 std::shared_ptr<MlxArray> mlx_op_cumsum(const std::shared_ptr<MlxArray>& a, int32_t axis);
 std::shared_ptr<MlxArray> mlx_op_cumprod(const std::shared_ptr<MlxArray>& a, int32_t axis);
 std::shared_ptr<MlxArray> mlx_op_cummax(const std::shared_ptr<MlxArray>& a, int32_t axis);

@@ -69,6 +69,7 @@ fn polars_metal_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add_function(wrap_pyfunction!(udf::execute_groupby, m)?)?;
     m.add_function(wrap_pyfunction!(udf::warmup_common_fused_signatures, m)?)?;
     m.add_function(wrap_pyfunction!(udf::execute_fused_expr, m)?)?;
+    m.add_function(wrap_pyfunction!(udf::execute_rolling, m)?)?;
     fusion::py::register(m)?;
     Ok(())
 }

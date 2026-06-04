@@ -48,7 +48,8 @@ impl PyFusionScope {
         Ok(self.inner.add_input(name, d).0)
     }
 
-    fn push_op(&mut self, op_str: &str, args: Vec<u32>) -> PyResult<u32> {
+    #[pyo3(signature = (op_str, args, param = None))]
+    fn push_op(&mut self, op_str: &str, args: Vec<u32>, param: Option<i64>) -> PyResult<u32> {
         let op = op_id_from_str(op_str)
             .ok_or_else(|| PyValueError::new_err(format!("unknown OpId: {op_str}")))?;
         let spec = op_spec(op);
@@ -60,7 +61,7 @@ impl PyFusionScope {
             )));
         }
         let args_idx: Vec<NodeIdx> = args.into_iter().map(NodeIdx).collect();
-        Ok(self.inner.push_op(op, args_idx).0)
+        Ok(self.inner.push_op_param(op, args_idx, param).0)
     }
 
     fn mark_output(&mut self, idx: u32) {
@@ -151,6 +152,8 @@ fn op_id_from_str(s: &str) -> Option<OpId> {
         "MatMul" => MatMul,
         "Fft" => Fft,
         "Ifft" => Ifft,
+        "Shift" => Shift,
+        "RowIndex" => RowIndex,
         _ => return None,
     })
 }

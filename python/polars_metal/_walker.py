@@ -85,6 +85,7 @@ from polars_metal._fusion_analyzer import (
     analyze_ir_reduction,
     analyze_ir_validity,
     analyze_ir_with_columns,
+    has_structural_null_op,
     null_mode_ir,
 )
 from polars_metal._fusion_analyzer import (
@@ -598,16 +599,43 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
     # mode (stamped as `_fused_null_mode`); modes we can't reproduce
     # (Kleene And/Or, null-skipping reductions, scans) fall the subtree to CPU.
     for binding, binding_cols, null_mode, node_id in fused_records:
-        if not binding_cols or _fused_inputs_null_free(inner.plan, binding_cols):
+        inputs_null_free = bool(binding_cols) and _fused_inputs_null_free(inner.plan, binding_cols)
+        # A binding with no real column inputs, or whose inputs are confirmed
+        # null-free, normally skips the null path entirely. BUT a structural-
+        # null op (Shift) introduces leading nulls even on null-free input, so
+        # such a binding must still build a validity subgraph.
+        has_structural = has_structural_null_op(nt, node_id, in_schema)
+        inputs_clean = inputs_null_free or not binding_cols
+        if inputs_clean and not has_structural:
             continue
-        if null_mode == "elementwise":
+        if inputs_clean and has_structural:
+            # Inputs are null-free, but a Shift introduces structural head-
+            # nulls — build the validity subgraph in the structural_only
+            # regime (validity-preserving ops like cum_sum pass instead of
+            # aborting; the only nulls come from Shift). `null_mode_ir` may
+            # return None here (e.g. a cum_sum upstream of the shift makes the
+            # general classifier abort), so we drive the validity path off
+            # `has_structural`, not `null_mode`.
+            validity = analyze_ir_validity(nt, node_id, in_schema, structural_only=True)
+            if validity is None:
+                return FallBack(
+                    reason="fused HStack has a structural-null op (shift) whose "
+                    "validity graph is not constructible; CPU preserves nulls"
+                )
+            v_scope, v_columns = validity
+            binding["_fused_null_mode"] = "where"
+            binding["_fused_validity_scope"] = v_scope
+            binding["_fused_validity_columns"] = v_columns
+        elif null_mode == "elementwise":
             # Output null iff any input column null — dispatch ORs the input
             # null masks. No extra graph.
             binding["_fused_null_mode"] = "elementwise"
         elif null_mode == "where":
-            # Data-dependent null mask — build a validity subgraph the dispatch
-            # evaluates (one extra MLX dispatch) to derive the null mask.
-            validity = analyze_ir_validity(nt, node_id, in_schema)
+            # Data-dependent and/or structural null mask — build a validity
+            # subgraph the dispatch evaluates (one extra MLX dispatch) to
+            # derive the null mask. Inputs may have nulls here, so use the
+            # general (conservative) regime: structural_only=False.
+            validity = analyze_ir_validity(nt, node_id, in_schema, structural_only=False)
             if validity is None:
                 return FallBack(
                     reason="fused HStack Where has nulls but its validity graph "

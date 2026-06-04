@@ -10,6 +10,7 @@ from typing import Any
 import polars.lazyframe.frame as _plf
 
 from polars_metal import _native
+from polars_metal import _rolling_detect as _rolling_detect_module  # noqa: F401
 from polars_metal._callback import execute_with_metal
 from polars_metal._engine import MetalEngine
 
@@ -180,6 +181,18 @@ def _patch_gpu_engine_callback() -> None:
             # we override CSE regardless of what the caller requested.
             kwargs.pop("comm_subexpr_elim", None)
             kwargs["optimizations"] = _opt_flags_without_cse(kwargs.pop("optimizations", None))
+            # M5 rolling: serialize-detected rolling_* run on a custom Metal kernel.
+            # Skip under streaming (adapter is in-memory only) and when nothing matches.
+            from polars_metal import _rolling_detect, _rolling_dispatch
+
+            streaming = bool(kwargs.get("streaming") or kwargs.get("new_streaming"))
+            rolling_bindings = [] if streaming else _rolling_detect.find_rolling_bindings(self)
+            if rolling_bindings:
+
+                def _collect_rest(rest_lf: Any) -> Any:
+                    return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
+
+                return _rolling_dispatch.apply_rolling(self, rolling_bindings, _collect_rest)
             # post_opt_callback is an internal bypass that injects a callback
             # directly, skipping _gpu_engine_callback. We run the query on
             # the CPU engine; in M0 our callback falls through, so the result
