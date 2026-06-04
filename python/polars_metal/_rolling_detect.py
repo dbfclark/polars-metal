@@ -122,10 +122,15 @@ _ROLLING_EXPLAIN_TAGS = (
 #
 # WeakValueDictionary would be ideal but LazyFrames are not weakly
 # referenceable in the current PyO3 binding (no __weakref__ slot). We use a
-# plain dict and rely on Python's reference counting: when the calling frame
-# drops the LazyFrame (after collect), the id is eligible for reuse, but by
-# then find_rolling_bindings has already consumed and we've evicted the entry.
-# The dict stays small in practice (one entry per in-flight collect).
+# plain dict with EVICT-ON-CONSUME semantics: find_rolling_bindings calls
+# pop() instead of get(), so the entry is removed as soon as detection runs.
+# This keeps the dict bounded (at most one entry per in-flight collect) and
+# eliminates the stale-id hazard: Python may reuse a GC'd object's id() for
+# a new, unrelated LazyFrame; pop() ensures the old entry is never seen by
+# that new frame's detection call. The schema-validation guard in
+# _parse_rolling_expr remains as defense-in-depth. Collecting the SAME
+# LazyFrame object twice re-pays detection via the slow path on the 2nd call
+# (rare; correct either way — the slow path is always the safe fallback).
 _lf_exprs_cache: dict[int, list[pl.Expr]] = {}
 
 _PATCH_WITH_COLUMNS_ATTR = "_polars_metal_original_with_columns"
@@ -348,15 +353,12 @@ def find_rolling_bindings(lf: pl.LazyFrame) -> list[RollingBinding]:
     """
     try:
         # ── Fast path: expression objects captured at with_columns() time ─────
-        # Use get() (not pop()) so that repeated collect() calls on the same
-        # LazyFrame object all benefit from the fast path. The dict stays small:
-        # each entry is a few Polars Expr objects (~KB), and entries are naturally
-        # evicted when the user's LazyFrame is garbage-collected (the id() key
-        # becomes stale; Python's GC may reuse the id(), but that is harmless
-        # because the old entry will simply be overwritten by the new with_columns
-        # call, or the stale entry will produce a schema mismatch that falls back
-        # gracefully via _parse_rolling_expr returning None).
-        cached_exprs = _lf_exprs_cache.get(id(lf))
+        # Evict on consume (pop): the entry lives only from with_columns() to
+        # the consuming collect(), so the dict stays bounded (≤ one entry per
+        # in-flight collect) and a reused id() cannot produce a stale hit.
+        # Collecting the SAME LazyFrame object twice re-pays detection via the
+        # slow path on the 2nd call — rare in practice, correct either way.
+        cached_exprs = _lf_exprs_cache.pop(id(lf), None)
         if cached_exprs is not None:
             # Collect schema (fast — already resolved by the time detect runs).
             schema: dict[str, pl.DataType] = dict(lf.collect_schema())

@@ -40,3 +40,30 @@ def test_rolling_null_input_matches_cpu():
     for op in ("mean", "sum"):
         lf = df.lazy().with_columns(r=getattr(pl.col("x"), f"rolling_{op}")(3))
         assert_frame_equal(lf.collect(engine=eng), lf.collect())
+
+
+def test_repeated_collect_same_lf_correct():
+    # 2nd collect of the SAME lf object hits the slow path (cache evicted by
+    # the 1st collect via pop()) and is still correct.
+    rng = np.random.default_rng(42)
+    df = pl.DataFrame({"x": rng.standard_normal(20).astype(np.float32)})
+    eng = polars_metal.MetalEngine()
+    lf = df.lazy().with_columns(r=pl.col("x").rolling_mean(3))
+    first = lf.collect(engine=eng)
+    second = lf.collect(engine=eng)  # cache already evicted by first collect
+    cpu = lf.collect()
+    assert_frame_equal(first, cpu, check_exact=False, rel_tol=1e-4, abs_tol=1e-4)
+    assert_frame_equal(second, cpu, check_exact=False, rel_tol=1e-4, abs_tol=1e-4)
+
+
+def test_non_rolling_collect_after_rolling_unaffected():
+    # A non-with_columns frame collected after a rolling one must not pick up
+    # stale exprs from a previous (now-evicted) cache entry.
+    eng = polars_metal.MetalEngine()
+    # Consume a rolling lf — populates then evicts the cache entry.
+    pl.DataFrame({"x": np.arange(20, dtype=np.float32)}).lazy().with_columns(
+        r=pl.col("x").rolling_mean(3)
+    ).collect(engine=eng)
+    # This frame was NOT created via with_columns; it must not see stale exprs.
+    other = pl.DataFrame({"x": np.arange(20, dtype=np.float32)}).lazy().select(pl.col("x") * 2)
+    assert_frame_equal(other.collect(engine=eng), other.collect())
