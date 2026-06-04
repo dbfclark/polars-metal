@@ -499,3 +499,49 @@ CPU. `where` chains still fall back (a null cond keeps the else branch valid, so
 dropping the row is wrong). The key realization: `drop_nulls` rescues
 *reductions* (no rejoin) but not HStack (row-shaped output must preserve null
 positions — that's the genuine "rejoin" cost).
+
+---
+
+## General opacity-unlock subproject deferred (M5 rolling, 2026-06-04)
+
+**Context.** The M5 rolling milestone evaluated two detection strategies before
+settling on `lf.serialize`-based plan inspection for rolling: (a) the general
+serialize→scope analyzer (walk the pre-opt serialized plan to recognize any
+opaque node class, emit a `PyFusionScope`, drive existing MLX/Metal dispatch)
+and (b) cumsum-diff via a new `int_range → RowIndex → cumsum` walker path.
+
+**Why both were deferred for rolling:**
+- *cumsum-diff*: `int_range` is NodeTraverser-opaque (raises at `view_expression`
+  just as `rolling_*` does). Even if unlocked, F32 cumsum grows to ~N·mean in
+  magnitude; subtracting window endpoints cancels ~log2(N/w) bits. Not viable
+  at F32 precision. The M5 custom kernel avoids this by keeping accumulation
+  tile-local.
+- *General serialize→scope analyzer*: feasible in principle (pre-opt
+  `lf.serialize` exposes `rolling_mean`, `list.*`, `array.*`, `corr`, `dt.*`,
+  etc.) but requires non-trivial machinery (serialize→IR parse, scope building
+  from the pre-opt tree, then reconciling with the post-opt NodeTraverser
+  callback). For rolling specifically the custom kernel was simpler and faster.
+
+**Deferred scope for the opacity-unlock subproject (future milestone):** the
+general serialize→scope analyzer remains the right lever for the remaining
+opaque-node workloads: `dt.year`/`dt.month`/`dt.day` (calendar kernel), list/
+array dot (matmul), FFT, and `corr`. When picked up, the entry point is the
+`lf.serialize(format="json")` escape hatch documented in the NodeTraverser
+opacity entry above. *Owner:* future milestone after M5.
+
+## F64/integer rolling and streaming rolling are out of scope (M5, 2026-06-04)
+
+**F64 and integer dtypes.** The M5 rolling kernel (`shaders/rolling.metal`) is
+F32-only. MLX has no `float64` support; MSL Metal shaders do not expose F64
+arithmetic. F64 and integer rolling columns fall back to Polars CPU, which is
+correct behavior. There is no plan to close this gap in the engine (the engine
+is F32-compute-shaped, per Mission).
+
+**Streaming rolling.** The rolling dispatch is in-memory-only: it materializes
+the entire column, dispatches the kernel, and returns the full output array.
+An online windowed kernel (emit one output element per arriving input element
+without materializing the full column) would require a stateful streaming
+adapter that the current architecture does not have. Polars streaming mode
+falls back to CPU. No plan to build a streaming-specific rolling path.
+*Owner:* out of scope indefinitely unless the engine acquires a streaming
+execution model.

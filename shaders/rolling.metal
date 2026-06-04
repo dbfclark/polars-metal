@@ -75,8 +75,8 @@ kernel void rolling_sum_f32(
     //
     // ## Threadgroup memory budget
     //   tile      : TG_SIZE + MAX_W = 4352 floats = 17 408 B
-    //   seg_a/b   : TG_SIZE = 256 floats each      =  2 048 B  (×2 = 4 096 B)
-    //   Total                                       = 21 504 B < 32 KB limit
+    //   seg_a/b   : TG_SIZE = 256 floats each      =  1 024 B  (×2 = 2 048 B)
+    //   Total                                       = 19 456 B < 32 KB limit
     //
     // ## Grid
     //   Dispatched with n_padded threads (n rounded up to TG_SIZE multiple).
@@ -138,33 +138,11 @@ kernel void rolling_sum_f32(
     // We use Hillis-Steele (log2(TG_SIZE) = 8 passes) on TG_SIZE elements.
     // Double-buffering between seg_a and seg_b prevents read/write races.
     //
-    // After this phase, seg_a holds the INCLUSIVE scan of the original
-    // segment totals. The exclusive offset for thread lid is then:
-    //   off = seg_a[lid] - (original) seg_a[lid]
-    // We save the original totals into seg_b first, then compute.
-
-    // Save original segment totals into seg_b (used to derive exclusive offset).
-    seg_b[lid] = seg_a[lid];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Hillis-Steele inclusive scan: at each pass p, every element reads
-    // from the element `stride` positions to its left and adds it.
-    // We ping-pong: even passes read seg_a, write seg_b (and vice versa),
-    // except that after saving originals we need a clear scheme.
-    // Cleaner: use seg_a as the "current" scan buffer (starts as the totals),
-    // and seg_b as the scratch (ping-pong), carrying the result back to seg_a.
-    //
     // Pass structure (8 passes for TG_SIZE=256):
     //   stride = 1, 2, 4, 8, 16, 32, 64, 128
-    //   read from seg_a, write to seg_b; then swap.
-    // After all passes seg_a holds the inclusive scan of the original totals.
+    //   read from seg_a, write to seg_b; then copy seg_b → seg_a.
+    // After all passes seg_a holds the inclusive scan of the segment totals.
     // The exclusive offset for thread `lid` is: off = (lid == 0) ? 0 : seg_a[lid-1].
-    //
-    // We need to restore the original totals so we can compute the exclusive
-    // offset correctly. They were saved in seg_b at the top of Phase B.
-    // Reload seg_a from the saved originals so seg_a starts as totals again.
-    seg_a[lid] = seg_b[lid];   // seg_b still holds originals at this point
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Hillis-Steele inclusive scan over seg_a (8 passes).
     for (uint stride = 1u; stride < TG_SIZE; stride <<= 1u) {
