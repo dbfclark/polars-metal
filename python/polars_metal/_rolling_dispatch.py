@@ -34,6 +34,12 @@ def _rolling_series(src: pl.Series, b: RollingBinding) -> pl.Series:
 
     s = src.rechunk()  # contiguous F32 buffer (zero-copy contract)
     x = np.ascontiguousarray(s.to_numpy(), dtype=np.float32)
+    # `out` is a plain numpy allocation and is generally NOT page-aligned, so
+    # `execute_rolling` takes its copy-back path for the output (the kernel
+    # writes a Metal buffer that's copied into `out` after eval). That copy is
+    # cheap relative to the kernel; the zero-copy output path only fires for a
+    # page-aligned `out`. The input `x` (a large rechunked column) is typically
+    # page-aligned, so the input side stays zero-copy.
     out = np.empty(x.shape[0], dtype=np.float32)
     _native.execute_rolling(
         inp=(x.ctypes.data, x.size),
