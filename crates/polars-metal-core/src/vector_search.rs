@@ -87,6 +87,70 @@ pub fn vector_search_topk(
     Ok((indices, values))
 }
 
+/// Default tile threshold: 256 MiB of (Q,N) F32 similarity matrix.
+pub const TILE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Top-k with corpus row-tiling. `tile_rows` caps corpus rows per GPU pass.
+/// Merges per-query partial top-k on host, correcting indices by tile offset.
+#[allow(clippy::too_many_arguments)]
+pub fn vector_search_topk_tiled(
+    query: &[f32],
+    q_rows: i64,
+    corpus: &[f32],
+    n_rows: i64,
+    d: i64,
+    k: i64,
+    op: u32,
+    tile_rows: i64,
+) -> Result<(Vec<i32>, Vec<f32>), FfiError> {
+    if tile_rows >= n_rows {
+        return vector_search_topk(query, q_rows, corpus, n_rows, d, k, op);
+    }
+    let kk = k.min(n_rows) as usize;
+    // Per-query running top-k as (index, value); kept short (≤ k).
+    let mut best: Vec<Vec<(i32, f32)>> = vec![Vec::new(); q_rows as usize];
+    let mut offset: i64 = 0;
+    while offset < n_rows {
+        let rows = (n_rows - offset).min(tile_rows);
+        let start = (offset * d) as usize;
+        let end = ((offset + rows) * d) as usize;
+        let (idx, val) = vector_search_topk(
+            query,
+            q_rows,
+            &corpus[start..end],
+            rows,
+            d,
+            kk.min(rows as usize) as i64,
+            op,
+        )?;
+        let per = kk.min(rows as usize);
+        for qi in 0..q_rows as usize {
+            for j in 0..per {
+                let global_idx = idx[qi * per + j] + offset as i32;
+                best[qi].push((global_idx, val[qi * per + j]));
+            }
+            // Keep only top-k by op order; cosine=desc, knn(squared)=asc.
+            // `total_cmp` gives a total order over f32 (NaN-safe; no unwrap).
+            if op == OP_COSINE {
+                best[qi].sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            } else {
+                best[qi].sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+            }
+            best[qi].truncate(kk);
+        }
+        offset += rows;
+    }
+    let mut out_idx = Vec::with_capacity(q_rows as usize * kk);
+    let mut out_val = Vec::with_capacity(q_rows as usize * kk);
+    for qi in 0..q_rows as usize {
+        for (i, v) in &best[qi] {
+            out_idx.push(*i);
+            out_val.push(*v);
+        }
+    }
+    Ok((out_idx, out_val))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +186,28 @@ mod tests {
         assert!(pairs[0].1.abs() < 1e-4); // squared distance 0
         assert_eq!(pairs[1].0, 2);
         assert!((pairs[1].1 - 1.0).abs() < 1e-4); // squared distance 1 (sqrt applied later, host)
+    }
+
+    #[test]
+    fn tiling_matches_untiled() {
+        // 6 corpus rows, force a tiny tile size so multiple tiles run.
+        let q = [1.0f32, 0.0];
+        let c = [
+            1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0, 0.9, 0.1, 0.2, 0.2, 0.95, 0.0,
+        ]; // (6,2)
+        let (i_ref, s_ref) = vector_search_topk(&q, 1, &c, 6, 2, 3, OP_COSINE).unwrap();
+        let (i_t, s_t) =
+            vector_search_topk_tiled(&q, 1, &c, 6, 2, 3, OP_COSINE, /*tile_rows=*/ 2).unwrap();
+        // Compare as score-sorted sets.
+        let norm = |idx: &[i32], sc: &[f32]| {
+            let mut p: Vec<(i32, i32)> = idx
+                .iter()
+                .zip(sc)
+                .map(|(i, s)| (*i, (s * 1e4) as i32))
+                .collect();
+            p.sort();
+            p
+        };
+        assert_eq!(norm(&i_ref, &s_ref), norm(&i_t, &s_t));
     }
 }
