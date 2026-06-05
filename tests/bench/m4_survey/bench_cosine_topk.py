@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import numpy as np
 import polars as pl
+import pytest
 
+import polars_metal
 from tests.bench.m4_survey._timing import time_callable
 
 
@@ -97,6 +99,72 @@ def cosine_topk_polars_columnar(query: np.ndarray, corpus: np.ndarray, k: int) -
     return corpus_df.with_columns(sim=sim_expr).sort("sim", descending=True).head(k)
 
 
+def _numpy_cosine_topk_indices(qv: np.ndarray, cv: np.ndarray, k: int) -> np.ndarray:
+    """numpy brute force used as the CPU baseline for the engine-path gate."""
+    qn = qv / np.linalg.norm(qv, axis=1, keepdims=True)
+    cn = cv / np.linalg.norm(cv, axis=1, keepdims=True)
+    sims = qn @ cn.T
+    return np.argsort(-sims, axis=1)[:, :k]
+
+
+def bench_engine_path(
+    Q: int = 100, N: int = 200_000, D: int = 256, K: int = 10
+) -> float:
+    """Engine-path cosine top-k vs the numpy brute force (baseline.json gate).
+
+    Returns ratio_metal_over_cpu (metal_s / cpu_s); the gate requires it < 1.0
+    (metal faster than numpy). Recorded in baseline.json as
+    ``phase10_cosine_topk_q100_n200k_d256``.
+    """
+    rng = np.random.default_rng(0)
+    qv = rng.standard_normal((Q, D)).astype(np.float32)
+    cv = rng.standard_normal((N, D)).astype(np.float32)
+    corpus = pl.DataFrame(
+        {"emb": list(cv)}, schema={"emb": pl.Array(pl.Float32, D)}
+    ).lazy()
+    qframe = pl.DataFrame({"emb": list(qv)}, schema={"emb": pl.Array(pl.Float32, D)})
+    eng = polars_metal.MetalEngine()
+
+    def metal():
+        return (
+            qframe.lazy()
+            .with_columns(pl.col("emb").metal.cosine_topk(corpus, k=K).alias("h"))
+            .collect(engine=eng)
+        )
+
+    metal()  # warmup: first call builds the MLX pipeline.
+
+    metal_res = time_callable(
+        f"metal.cosine_topk[Q={Q} N={N:,} D={D} k={K}]", metal
+    )
+    cpu_res = time_callable(
+        f"numpy.cosine_topk[Q={Q} N={N:,} D={D} k={K}]",
+        lambda: _numpy_cosine_topk_indices(qv, cv, K),
+    )
+    ratio = metal_res.median_ms / cpu_res.median_ms
+    print(
+        f"\n=== engine path (baseline.json: phase10_cosine_topk_q100_n200k_d256) ===\n"
+        f"  metal_ms={metal_res.median_ms:.2f}"
+        f"  cpu_ms={cpu_res.median_ms:.2f}"
+        f"  ratio_metal_over_cpu={ratio:.4f}"
+        f"  speedup={cpu_res.median_ms / metal_res.median_ms:.1f}x\n"
+    )
+    # Self-check mirroring the baseline.json `_gate.ratio_lt` (metal must win).
+    assert ratio < 1.0, f"cosine top-k gate: metal/cpu={ratio:.4f} not < 1.0"
+    return ratio
+
+
+@pytest.mark.benchmark(group="cosine_topk")
+def test_bench_cosine_topk_engine_gate() -> None:
+    """Engine-path gate: metal cosine top-k must beat numpy brute force.
+
+    Records ratio_metal_over_cpu for baseline.json entry
+    phase10_cosine_topk_q100_n200k_d256 (_gate: ratio_lt 1.0).
+    """
+    ratio = bench_engine_path()
+    assert ratio < 1.0
+
+
 def main() -> None:
     Q = 100
     N = 100_000
@@ -133,6 +201,9 @@ def main() -> None:
         f"  → projected for Q={Q} queries: ~{res.median_ms * Q:.0f} ms "
         f"(if Polars scales linearly, which it should)"
     )
+
+    # Engine-path gate measurement (CI-reasonable size).
+    bench_engine_path()
 
 
 if __name__ == "__main__":

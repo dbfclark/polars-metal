@@ -248,6 +248,18 @@
       "_pending": true,
       "_target_ms": 50.0
     },
+    "phase10_cosine_topk_q100_n200k_d256": {
+      "cpu_ms": 1452.61,
+      "metal_ms": 15.5,
+      "ratio_metal_over_cpu": 0.0107,
+      "n_rows": 200000,
+      "hardware": "M2 Ultra",
+      "_notes": "M6 vector search: .metal.cosine_topk engine path, Q=100 N=200k D=256 k=10, vs numpy brute force (matmul + argsort). Measured 15.5 ms metal vs 1452.6 ms numpy = 93.7x. Reproduce: tests/bench/m4_survey/bench_cosine_topk.py::test_bench_cosine_topk_engine_gate. Gate: metal must beat numpy (ratio < 1.0).",
+      "_pending": false,
+      "_gate": {
+        "ratio_lt": 1.0
+      }
+    },
     "phase11_fft_8m": {
       "cpu_ms": null,
       "metal_ms": null,
