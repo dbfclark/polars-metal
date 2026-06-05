@@ -1432,14 +1432,27 @@ def _alias_name(node) -> str | None:
 
 
 def _literal_int(node) -> int | None:
-    """Extract an Int literal value from an Alias([Literal, name]) node."""
+    """Extract the Int64 handle from an Alias([Literal, name]) node.
+
+    CONFIRMED at py-1.40.1 (Phase 2): the shape is
+        {"Literal": {"Scalar": {"Int64": <value>}}}
+    i.e. value at node["Alias"][0]["Literal"]["Scalar"]["Int64"]. We match that
+    primarily, with a couple of legacy/fallback shapes for resilience.
+    """
     if isinstance(node, dict):
         a = node.get("Alias")
-        if isinstance(a, list) and len(a) == 2:
-            lit = a[0].get("Literal") if isinstance(a[0], dict) else None
-            # Polars serializes ints in a few shapes; probe common ones.
+        if isinstance(a, list) and len(a) == 2 and isinstance(a[0], dict):
+            lit = a[0].get("Literal")
             if isinstance(lit, dict):
-                for key in ("Int", "Int64", "Dyn"):
+                # Primary (py-1.40.1): {"Scalar": {"Int64": N}}
+                scalar = lit.get("Scalar")
+                if isinstance(scalar, dict):
+                    for key in ("Int64", "Int32", "Int"):
+                        v = scalar.get(key)
+                        if isinstance(v, int):
+                            return v
+                # Fallbacks for other Polars revs.
+                for key in ("Int64", "Int32", "Int"):
                     v = lit.get(key)
                     if isinstance(v, int):
                         return v
