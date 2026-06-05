@@ -651,6 +651,19 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
                 "is not reproducible on the fused path; CPU preserves Polars null semantics"
             )
 
+    # The only executable HStack dispatch path is the all-fused fast path
+    # (`_dispatch_hstack_fused`). A non-fused binding (an M3 closed-set expr the
+    # F32 fusion analyzer rejected) — or a mix of fused and non-fused bindings —
+    # would be handed to `_native.execute_plan`, which has no HStack handler and
+    # raises `unknown plan kind "HStack"`. Fall back to CPU at plan time so the
+    # whole query runs on Polars and produces the correct result. (Mixed/partial
+    # fused dispatch was never supported; this converts a crash into a fallback.)
+    if not all("_fused_scope" in b for b in out_exprs):
+        return FallBack(
+            reason="HStack has non-fused binding(s); only all-fused HStacks are "
+            "executable on the GPU path — CPU produces the correct result"
+        )
+
     return Handled(
         plan={
             "kind": "HStack",
