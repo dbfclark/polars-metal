@@ -131,3 +131,21 @@ fn slice_first_2_cols_of_2x3() {
     assert_eq!(s.shape(), vec![2, 2]);
     assert_eq!(mlx_array_to_f32_vec(&s).unwrap(), vec![1.0, 2.0, 4.0, 5.0]);
 }
+
+#[test]
+fn take_along_axis_gathers_per_row() {
+    use polars_metal_mlx_sys::shape::mlx_take_along_axis;
+
+    // values (2,3); gather columns [2,0] from row 0 and [0,1] from row 1.
+    let vals = arr2d(&[10.0f32, 11.0, 12.0, 20.0, 21.0, 22.0], 2, 3);
+    // index array (2,2) as F32 then cast to I32 (FFI takes an MLX integer array).
+    let idx_f = arr2d(&[2.0f32, 0.0, 0.0, 1.0], 2, 2);
+    let idx = mlx_cast(&idx_f, MlxDtype::I32).expect("cast idx");
+    let g = mlx_take_along_axis(&vals, &idx, 1).expect("gather");
+    mlx_array_eval(&[g.clone()]).expect("eval");
+    assert_eq!(g.shape(), vec![2, 2]);
+    assert_eq!(
+        mlx_array_to_f32_vec(&g).unwrap(),
+        vec![12.0, 10.0, 20.0, 21.0]
+    );
+}

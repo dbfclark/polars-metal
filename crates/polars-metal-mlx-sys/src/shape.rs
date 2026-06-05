@@ -34,3 +34,18 @@ pub fn mlx_slice(
         _input_refs: a._input_refs.clone(),
     })
 }
+
+/// Gather along `axis`: `out[i,j] = a[i, indices[i,j]]` for `axis=1`.
+pub fn mlx_take_along_axis(
+    a: &MlxArrayHandle,
+    indices: &MlxArrayHandle,
+    axis: i32,
+) -> Result<MlxArrayHandle, FfiError> {
+    let ptr = ffi::mlx_op_take_along_axis(&a.ptr, &indices.ptr, axis).map_err(FfiError::from)?;
+    let mut refs = a._input_refs.clone();
+    refs.extend(indices._input_refs.iter().cloned());
+    Ok(MlxArrayHandle {
+        ptr,
+        _input_refs: refs,
+    })
+}

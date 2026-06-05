@@ -267,6 +267,11 @@ mod ffi {
             stop: &[i32],
             strides: &[i32],
         ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_take_along_axis(
+            a: &SharedPtr<MlxArray>,
+            indices: &SharedPtr<MlxArray>,
+            axis: i32,
+        ) -> Result<SharedPtr<MlxArray>>;
 
         fn mlx_op_fft_1d(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
         fn mlx_op_ifft_1d(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;

@@ -257,6 +257,10 @@ std::shared_ptr<MlxArray> mlx_op_slice(
     rust::Slice<const int32_t> start,
     rust::Slice<const int32_t> stop,
     rust::Slice<const int32_t> strides);
+std::shared_ptr<MlxArray> mlx_op_take_along_axis(
+    const std::shared_ptr<MlxArray>& a,
+    const std::shared_ptr<MlxArray>& indices,
+    int32_t axis);
 
 std::shared_ptr<MlxArray> mlx_op_fft_1d(const std::shared_ptr<MlxArray>& a);
 std::shared_ptr<MlxArray> mlx_op_ifft_1d(const std::shared_ptr<MlxArray>& a);

@@ -476,6 +476,15 @@ std::shared_ptr<MlxArray> mlx_op_slice(
     return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
 }
 
+std::shared_ptr<MlxArray> mlx_op_take_along_axis(
+    const std::shared_ptr<MlxArray>& a,
+    const std::shared_ptr<MlxArray>& indices,
+    int32_t axis) {
+    auto base = std::make_shared<mlx::core::array>(
+        mlx::core::take_along_axis(*a, *indices, axis));
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
 std::shared_ptr<MlxArray> mlx_op_fft_1d(const std::shared_ptr<MlxArray>& a) {
     auto base = std::make_shared<mlx::core::array>(mlx::core::fft::fft(*a));
     return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
