@@ -44,9 +44,7 @@ _CORPUS_CACHE: dict[int, CorpusSpec] = {}
 SENTINEL_TAG = "__pm_vsearch__"
 
 
-def _capture_corpus(
-    corpus: Any, corpus_col: str, k: int, metric: str, query_col: str = ""
-) -> int:
+def _capture_corpus(corpus: Any, corpus_col: str, k: int, metric: str, query_col: str = "") -> int:
     handle = next(_HANDLE_COUNTER)
     _CORPUS_CACHE[handle] = CorpusSpec(corpus, corpus_col, k, metric, query_col)
     return handle
@@ -81,9 +79,7 @@ def build_sentinel(query_col_expr: pl.Expr, query_col_name: str, handle: int) ->
         [
             query_col_expr.alias("__pm_vs_query"),
             pl.lit(handle, dtype=pl.Int64).alias(f"{SENTINEL_TAG}{query_col_name}"),
-            query_col_expr.map_batches(_raise_cpu, return_dtype=pl.Float32).alias(
-                "__pm_vs_raise"
-            ),
+            query_col_expr.map_batches(_raise_cpu, return_dtype=pl.Float32).alias("__pm_vs_raise"),
         ]
     )
 

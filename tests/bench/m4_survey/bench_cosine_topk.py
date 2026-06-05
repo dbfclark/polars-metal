@@ -113,9 +113,7 @@ def _numpy_cosine_topk_indices(qv: np.ndarray, cv: np.ndarray, k: int) -> np.nda
     return np.argpartition(-sims, kth=k - 1, axis=1)[:, :k]
 
 
-def bench_engine_path(
-    Q: int = 100, N: int = 200_000, D: int = 256, K: int = 10
-) -> float:
+def bench_engine_path(Q: int = 100, N: int = 200_000, D: int = 256, K: int = 10) -> float:
     """Engine-path cosine top-k vs the numpy brute force (baseline.json gate).
 
     Returns ratio_metal_over_cpu (metal_s / cpu_s); the gate requires it < 1.0
@@ -125,9 +123,7 @@ def bench_engine_path(
     rng = np.random.default_rng(0)
     qv = rng.standard_normal((Q, D)).astype(np.float32)
     cv = rng.standard_normal((N, D)).astype(np.float32)
-    corpus = pl.DataFrame(
-        {"emb": list(cv)}, schema={"emb": pl.Array(pl.Float32, D)}
-    ).lazy()
+    corpus = pl.DataFrame({"emb": list(cv)}, schema={"emb": pl.Array(pl.Float32, D)}).lazy()
     qframe = pl.DataFrame({"emb": list(qv)}, schema={"emb": pl.Array(pl.Float32, D)})
     eng = polars_metal.MetalEngine()
 
@@ -140,9 +136,7 @@ def bench_engine_path(
 
     metal()  # warmup: first call builds the MLX pipeline.
 
-    metal_res = time_callable(
-        f"metal.cosine_topk[Q={Q} N={N:,} D={D} k={K}]", metal
-    )
+    metal_res = time_callable(f"metal.cosine_topk[Q={Q} N={N:,} D={D} k={K}]", metal)
     cpu_res = time_callable(
         f"numpy.cosine_topk[Q={Q} N={N:,} D={D} k={K}]",
         lambda: _numpy_cosine_topk_indices(qv, cv, K),

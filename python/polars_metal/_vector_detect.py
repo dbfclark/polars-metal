@@ -120,7 +120,7 @@ def _binding_from_expr_json(expr_json: dict, out_name: str) -> VectorBinding | N
         for fld in fields:
             alias_name = _alias_name(fld)
             if alias_name and alias_name.startswith(SENTINEL_TAG):
-                query_col = alias_name[len(SENTINEL_TAG):]
+                query_col = alias_name[len(SENTINEL_TAG) :]
                 handle = _literal_int(fld)
         if query_col is None or handle is None:
             return None

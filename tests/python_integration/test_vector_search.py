@@ -52,9 +52,7 @@ def test_detect_finds_sentinel_binding():
         schema={"id": pl.Int64, "emb": pl.Array(pl.Float32, 2)},
     )
     corpus = df.lazy()
-    lf = df.lazy().with_columns(
-        pl.col("emb").metal.cosine_topk(corpus, k=1).alias("hits")
-    )
+    lf = df.lazy().with_columns(pl.col("emb").metal.cosine_topk(corpus, k=1).alias("hits"))
     bindings = vdet.find_vector_bindings(lf)
     assert len(bindings) == 1
     b = bindings[0]
@@ -75,16 +73,12 @@ def test_dispatch_builds_struct_column_cosine():
         {"id": [0], "emb": [[1.0, 0.0]]},
         schema={"id": pl.Int64, "emb": pl.Array(pl.Float32, 2)},
     )
-    lf = qframe.lazy().with_columns(
-        pl.col("emb").metal.cosine_topk(corpus, k=2).alias("hits")
-    )
+    lf = qframe.lazy().with_columns(pl.col("emb").metal.cosine_topk(corpus, k=2).alias("hits"))
     bindings = vdet.find_vector_bindings(lf)
     df = vdisp.apply_vector_search(lf, bindings, collect_fn=lambda rest: rest.collect())
     assert df.columns == ["id", "emb", "hits"]
     hits = df.get_column("hits")
-    assert hits.dtype == pl.Struct(
-        {"indices": pl.List(pl.UInt32), "scores": pl.List(pl.Float32)}
-    )
+    assert hits.dtype == pl.Struct({"indices": pl.List(pl.UInt32), "scores": pl.List(pl.Float32)})
     row = hits[0]
     assert list(row["indices"]) == [0, 2]  # cosine: e0=1.0 then e2=0.707, desc
     assert abs(row["scores"][0] - 1.0) < 1e-5
@@ -165,9 +159,7 @@ def test_matches_numpy_oracle(metric, Q, N, D, k):
     rng = np.random.default_rng(0)
     qv = rng.standard_normal((Q, D)).astype(np.float32) + 0.1
     cv = rng.standard_normal((N, D)).astype(np.float32) + 0.1
-    corpus = pl.DataFrame(
-        {"emb": list(cv)}, schema={"emb": pl.Array(pl.Float32, D)}
-    ).lazy()
+    corpus = pl.DataFrame({"emb": list(cv)}, schema={"emb": pl.Array(pl.Float32, D)}).lazy()
     qframe = pl.DataFrame({"emb": list(qv)}, schema={"emb": pl.Array(pl.Float32, D)})
     verb = "cosine_topk" if metric == "cosine" else "knn"
     out = (
@@ -199,19 +191,13 @@ def test_raises_on_bad_inputs(bad):
     from polars_metal import MetalEngine
 
     if bad == "dtype":  # F64 instead of F32
-        corpus = pl.DataFrame(
-            {"emb": [[1.0, 0.0]]}, schema={"emb": pl.Array(pl.Float64, 2)}
-        ).lazy()
-        qframe = pl.DataFrame(
-            {"emb": [[1.0, 0.0]]}, schema={"emb": pl.Array(pl.Float64, 2)}
-        )
+        corpus = pl.DataFrame({"emb": [[1.0, 0.0]]}, schema={"emb": pl.Array(pl.Float64, 2)}).lazy()
+        qframe = pl.DataFrame({"emb": [[1.0, 0.0]]}, schema={"emb": pl.Array(pl.Float64, 2)})
     elif bad == "dmismatch":  # query D != corpus D
         corpus = pl.DataFrame(
             {"emb": [[1.0, 0.0, 0.0]]}, schema={"emb": pl.Array(pl.Float32, 3)}
         ).lazy()
-        qframe = pl.DataFrame(
-            {"emb": [[1.0, 0.0]]}, schema={"emb": pl.Array(pl.Float32, 2)}
-        )
+        qframe = pl.DataFrame({"emb": [[1.0, 0.0]]}, schema={"emb": pl.Array(pl.Float32, 2)})
     else:  # ragged List, not fixed-width Array
         corpus = pl.DataFrame({"emb": [[1.0, 0.0], [1.0]]}).lazy()
         qframe = pl.DataFrame({"emb": [[1.0, 0.0]]})
@@ -229,9 +215,7 @@ def test_k_greater_than_n_clamps():
     corpus = pl.DataFrame(
         {"emb": [[1.0, 0.0], [0.0, 1.0]]}, schema={"emb": pl.Array(pl.Float32, 2)}
     ).lazy()
-    qframe = pl.DataFrame(
-        {"emb": [[1.0, 0.0]]}, schema={"emb": pl.Array(pl.Float32, 2)}
-    )
+    qframe = pl.DataFrame({"emb": [[1.0, 0.0]]}, schema={"emb": pl.Array(pl.Float32, 2)})
     out = (
         qframe.lazy()
         .with_columns(pl.col("emb").metal.cosine_topk(corpus, k=10).alias("hits"))
@@ -245,9 +229,7 @@ def test_empty_corpus_returns_empty_hits():
     NOT a low-level MLX allocation error. Dtype stays Struct{List[u32], List[f32]}."""
     from polars_metal import MetalEngine
 
-    corpus = pl.DataFrame(
-        {"emb": []}, schema={"emb": pl.Array(pl.Float32, 2)}
-    ).lazy()
+    corpus = pl.DataFrame({"emb": []}, schema={"emb": pl.Array(pl.Float32, 2)}).lazy()
     qframe = pl.DataFrame(
         {"id": [0, 1], "emb": [[1.0, 0.0], [0.0, 1.0]]},
         schema={"id": pl.Int64, "emb": pl.Array(pl.Float32, 2)},

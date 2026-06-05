@@ -206,19 +206,13 @@ def _patch_gpu_engine_callback() -> None:
             # practice (and if they did, rolling consumes first — acceptable for MVP).
             from polars_metal import _vector_detect, _vector_dispatch
 
-            vector_bindings = (
-                [] if streaming else _vector_detect.find_vector_bindings(self)
-            )
+            vector_bindings = [] if streaming else _vector_detect.find_vector_bindings(self)
             if vector_bindings:
 
                 def _collect_rest_vs(rest_lf: Any) -> Any:
-                    return original_collect(
-                        rest_lf, engine="cpu", post_opt_callback=cb, **kwargs
-                    )
+                    return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
 
-                return _vector_dispatch.apply_vector_search(
-                    self, vector_bindings, _collect_rest_vs
-                )
+                return _vector_dispatch.apply_vector_search(self, vector_bindings, _collect_rest_vs)
             # post_opt_callback is an internal bypass that injects a callback
             # directly, skipping _gpu_engine_callback. We run the query on
             # the CPU engine; in M0 our callback falls through, so the result

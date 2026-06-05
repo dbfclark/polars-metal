@@ -24,9 +24,7 @@ _TILE_ROWS_DEFAULT = 1 << 30  # effectively no tiling unless the corpus is enorm
 def _array_col_to_matrix(s: pl.Series) -> tuple[np.ndarray, int, int]:
     """Return (contiguous (N*D) f32, N, D) for an Array(Float32, D) column."""
     if not isinstance(s.dtype, pl.Array) or s.dtype.inner != pl.Float32:
-        raise ValueError(
-            f"polars_metal vector search requires Array(Float32, D); got {s.dtype}"
-        )
+        raise ValueError(f"polars_metal vector search requires Array(Float32, D); got {s.dtype}")
     d = s.dtype.size
     n = s.len()
     flat = s.to_numpy()  # Array(F32, D) → (N, D) ndarray
@@ -41,9 +39,7 @@ def _corpus_matrix(spec_corpus, corpus_col: str) -> tuple[np.ndarray, int, int]:
         if m.ndim != 2:
             raise ValueError("numpy corpus must be 2-D (N, D)")
         return m.reshape(-1), m.shape[0], m.shape[1]
-    corpus_df = (
-        spec_corpus.collect() if isinstance(spec_corpus, pl.LazyFrame) else spec_corpus
-    )
+    corpus_df = spec_corpus.collect() if isinstance(spec_corpus, pl.LazyFrame) else spec_corpus
     s = corpus_df.get_column(corpus_col).rechunk()
     return _array_col_to_matrix(s)
 
@@ -66,10 +62,7 @@ def _build_struct(
         score_lists.append([float(x) for x in ss[order]])
     return pl.Series(
         "",
-        [
-            {"indices": il, "scores": sl}
-            for il, sl in zip(idx_lists, score_lists, strict=True)
-        ],
+        [{"indices": il, "scores": sl} for il, sl in zip(idx_lists, score_lists, strict=True)],
         dtype=pl.Struct({"indices": pl.List(pl.UInt32), "scores": pl.List(pl.Float32)}),
     )
 
@@ -77,9 +70,7 @@ def _build_struct(
 def _run_binding(qframe: pl.DataFrame, b: VectorBinding) -> pl.Series:
     spec = pop_capture(b.handle)
     if spec is None:
-        raise RuntimeError(
-            "polars_metal: vector-search corpus handle missing (already consumed?)"
-        )
+        raise RuntimeError("polars_metal: vector-search corpus handle missing (already consumed?)")
     qmat, q_rows, qd = _array_col_to_matrix(qframe.get_column(b.query_col).rechunk())
     cmat, n_rows, cd = _corpus_matrix(spec.corpus, spec.corpus_col)
     if qd != cd:
