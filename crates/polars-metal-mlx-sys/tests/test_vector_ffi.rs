@@ -159,3 +159,18 @@ fn i32_readback_roundtrip() {
     mlx_array_eval(&[i.clone()]).expect("eval");
     assert_eq!(mlx_array_to_i32_vec(&i).unwrap(), vec![2, 0, 5, 9]);
 }
+
+#[test]
+fn argpartition_axis_is_per_row() {
+    use polars_metal_mlx_sys::sort::mlx_argpartition_axis;
+
+    // (2,3): row 0 min at col 2, row 1 min at col 0. axis=-1 → per-row partition.
+    let a = arr2d(&[3.0f32, 5.0, 1.0, 2.0, 8.0, 9.0], 2, 3);
+    let idx = mlx_argpartition_axis(&a, 0, -1).expect("argpartition_axis");
+    let idx_f = mlx_cast(&idx, MlxDtype::F32).expect("cast");
+    mlx_array_eval(&[idx_f.clone()]).expect("eval");
+    assert_eq!(idx_f.shape(), vec![2, 3], "axis-aware keeps 2-D shape");
+    let v = mlx_array_to_f32_vec(&idx_f).unwrap();
+    assert_eq!(v[0] as i32, 2, "row 0 col0 = argmin = col 2");
+    assert_eq!(v[3] as i32, 0, "row 1 col0 = argmin = col 0");
+}

@@ -235,6 +235,15 @@ mod ffi {
         fn mlx_op_sort(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
         fn mlx_op_argpartition(a: &SharedPtr<MlxArray>, kth: i32) -> Result<SharedPtr<MlxArray>>;
 
+        // M6 vector search: axis-aware argpartition (per-row top-k). Unlike the
+        // flattening `mlx_op_argpartition` above, this preserves the input shape
+        // and partitions along `axis` (use -1 for the last axis).
+        fn mlx_op_argpartition_axis(
+            a: &SharedPtr<MlxArray>,
+            kth: i32,
+            axis: i32,
+        ) -> Result<SharedPtr<MlxArray>>;
+
         // M5 rolling Task 1: forward shift (zero-fill).
         //
         // Shifts array `a` forward by `shift` positions along axis 0, prepending
