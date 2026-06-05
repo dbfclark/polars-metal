@@ -41,3 +41,22 @@ def test_sentinel_raises_on_plain_cpu():
     # engine="metal") and raises our RuntimeError carrying the engine hint.
     with pytest.raises(RuntimeError, match="engine='metal'"):
         df.lazy().with_columns(expr.alias("hits")).collect()  # no engine="metal"
+
+
+def test_detect_finds_sentinel_binding():
+    from polars_metal import _vector_detect as vdet
+
+    df = pl.DataFrame(
+        {"id": [0, 1], "emb": [[1.0, 0.0], [0.0, 1.0]]},
+        schema={"id": pl.Int64, "emb": pl.Array(pl.Float32, 2)},
+    )
+    corpus = df.lazy()
+    lf = df.lazy().with_columns(
+        pl.col("emb").metal.cosine_topk(corpus, k=1).alias("hits")
+    )
+    bindings = vdet.find_vector_bindings(lf)
+    assert len(bindings) == 1
+    b = bindings[0]
+    assert b.out_name == "hits"
+    assert b.query_col == "emb"
+    assert b.handle in vns._CORPUS_CACHE  # not yet popped
