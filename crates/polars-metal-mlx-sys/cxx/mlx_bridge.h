@@ -249,6 +249,9 @@ std::shared_ptr<MlxArray> mlx_op_matmul(
 std::shared_ptr<MlxArray> mlx_op_transpose(
     const std::shared_ptr<MlxArray>& a,
     rust::Slice<const int32_t> axes);
+std::shared_ptr<MlxArray> mlx_op_reshape(
+    const std::shared_ptr<MlxArray>& a,
+    rust::Slice<const int32_t> shape);
 
 std::shared_ptr<MlxArray> mlx_op_fft_1d(const std::shared_ptr<MlxArray>& a);
 std::shared_ptr<MlxArray> mlx_op_ifft_1d(const std::shared_ptr<MlxArray>& a);

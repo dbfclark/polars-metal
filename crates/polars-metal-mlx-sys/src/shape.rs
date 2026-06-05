@@ -11,3 +11,12 @@ pub fn mlx_transpose(a: &MlxArrayHandle, axes: &[i32]) -> Result<MlxArrayHandle,
         _input_refs: a._input_refs.clone(),
     })
 }
+
+/// Reshape `a` to `shape` (total element count must match).
+pub fn mlx_reshape(a: &MlxArrayHandle, shape: &[i32]) -> Result<MlxArrayHandle, FfiError> {
+    let ptr = ffi::mlx_op_reshape(&a.ptr, shape).map_err(FfiError::from)?;
+    Ok(MlxArrayHandle {
+        ptr,
+        _input_refs: a._input_refs.clone(),
+    })
+}

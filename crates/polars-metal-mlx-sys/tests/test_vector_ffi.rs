@@ -102,3 +102,19 @@ fn transpose_2x3_to_3x2() {
         vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]
     );
 }
+
+#[test]
+fn reshape_6_to_3x2_and_keepdim() {
+    use polars_metal_mlx_sys::shape::mlx_reshape;
+
+    let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let a = arr2d(&data, 1, 6);
+    let r = mlx_reshape(&a, &[3, 2]).expect("reshape");
+    mlx_array_eval(&[r.clone()]).expect("eval");
+    assert_eq!(r.shape(), vec![3, 2]);
+    // (N,) -> (N,1) keepdim case used by norm broadcasting:
+    let n = arr2d(&[7.0, 8.0, 9.0], 1, 3);
+    let col = mlx_reshape(&n, &[3, 1]).expect("reshape col");
+    mlx_array_eval(&[col.clone()]).expect("eval");
+    assert_eq!(col.shape(), vec![3, 1]);
+}

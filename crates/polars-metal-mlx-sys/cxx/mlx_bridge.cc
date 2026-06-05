@@ -453,6 +453,14 @@ std::shared_ptr<MlxArray> mlx_op_transpose(
     return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
 }
 
+std::shared_ptr<MlxArray> mlx_op_reshape(
+    const std::shared_ptr<MlxArray>& a,
+    rust::Slice<const int32_t> shape) {
+    std::vector<int> sh(shape.begin(), shape.end());
+    auto base = std::make_shared<mlx::core::array>(mlx::core::reshape(*a, sh));
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
 std::shared_ptr<MlxArray> mlx_op_fft_1d(const std::shared_ptr<MlxArray>& a) {
     auto base = std::make_shared<mlx::core::array>(mlx::core::fft::fft(*a));
     return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
