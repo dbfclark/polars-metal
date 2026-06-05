@@ -108,4 +108,19 @@ mod tests {
         assert_eq!(pairs[1].0, 2);
         assert!((pairs[1].1 - 0.70710677).abs() < 1e-5);
     }
+
+    #[test]
+    fn knn_l2_small() {
+        // D=2. corpus e0=[0,0], e1=[3,4], e2=[1,0]. query=[0,0].
+        // squared dists: e0=0, e1=25, e2=1. top-2 nearest = {e0, e2}.
+        let q = [0.0f32, 0.0];
+        let c = [0.0f32, 0.0, 3.0, 4.0, 1.0, 0.0];
+        let (idx, d2) = vector_search_topk(&q, 1, &c, 3, 2, 2, OP_KNN_L2).unwrap();
+        let mut pairs: Vec<(i32, f32)> = idx.iter().copied().zip(d2.iter().copied()).collect();
+        pairs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap()); // ascending (nearest)
+        assert_eq!(pairs[0].0, 0);
+        assert!(pairs[0].1.abs() < 1e-4); // squared distance 0
+        assert_eq!(pairs[1].0, 2);
+        assert!((pairs[1].1 - 1.0).abs() < 1e-4); // squared distance 1 (sqrt applied later, host)
+    }
 }
