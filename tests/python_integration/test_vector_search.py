@@ -184,7 +184,8 @@ def test_matches_numpy_oracle(metric, Q, N, D, k):
         # Clamp: a query against N rows can return at most N neighbours.
         assert len(got_idx) == min(k, N)
         assert got_idx == oi[qi], f"q{qi} idx {got_idx} != oracle {oi[qi]}"
-        # F32 GEMM vs F64 numpy oracle: ~1e-4 tolerance.
+        # Both sides compute in F32 (numpy norm/@ preserve float32); MLX vs BLAS
+        # accumulation order differs, so allow ~1e-4 tolerance on the scores.
         np.testing.assert_allclose(got_sc, osc[qi], rtol=1e-4, atol=1e-4)
 
 

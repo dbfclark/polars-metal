@@ -249,12 +249,12 @@
       "_target_ms": 50.0
     },
     "phase10_cosine_topk_q100_n200k_d256": {
-      "cpu_ms": 1452.61,
-      "metal_ms": 15.5,
-      "ratio_metal_over_cpu": 0.0107,
+      "cpu_ms": 277.15,
+      "metal_ms": 13.94,
+      "ratio_metal_over_cpu": 0.0503,
       "n_rows": 200000,
       "hardware": "M2 Ultra",
-      "_notes": "M6 vector search: .metal.cosine_topk engine path, Q=100 N=200k D=256 k=10, vs numpy brute force (matmul + argsort). Measured 15.5 ms metal vs 1452.6 ms numpy = 93.7x. Reproduce: tests/bench/m4_survey/bench_cosine_topk.py::test_bench_cosine_topk_engine_gate. Gate: metal must beat numpy (ratio < 1.0).",
+      "_notes": "M6 vector search: .metal.cosine_topk engine path, Q=100 N=200k D=256 k=10, vs a FAIR numpy baseline (matmul + argpartition partial top-k, same algorithm as the GPU). Measured 13.9 ms metal vs 277 ms numpy = 19.9x — consistent with the survey's compute-bound class. (An argsort baseline does ~5x more work and would inflate this to ~93x, past the survey's 29x ceiling; we report the honest argpartition number.) Reproduce: tests/bench/m4_survey/bench_cosine_topk.py::test_bench_cosine_topk_engine_gate. Gate: metal must beat numpy (ratio < 1.0).",
       "_pending": false,
       "_gate": {
         "ratio_lt": 1.0

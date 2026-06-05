@@ -100,11 +100,17 @@ def cosine_topk_polars_columnar(query: np.ndarray, corpus: np.ndarray, k: int) -
 
 
 def _numpy_cosine_topk_indices(qv: np.ndarray, cv: np.ndarray, k: int) -> np.ndarray:
-    """numpy brute force used as the CPU baseline for the engine-path gate."""
+    """numpy CPU baseline for the engine-path gate.
+
+    Uses ``argpartition`` (partial top-k), matching the GPU's algorithm, for an
+    apples-to-apples comparison — NOT a full ``argsort``. A full sort baseline
+    does ~5x more work than the GPU's partial selection and inflates the speedup
+    well past the survey's honest 29x ceiling; we report the fair number.
+    """
     qn = qv / np.linalg.norm(qv, axis=1, keepdims=True)
     cn = cv / np.linalg.norm(cv, axis=1, keepdims=True)
     sims = qn @ cn.T
-    return np.argsort(-sims, axis=1)[:, :k]
+    return np.argpartition(-sims, kth=k - 1, axis=1)[:, :k]
 
 
 def bench_engine_path(
