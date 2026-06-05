@@ -111,56 +111,71 @@ implementable depth and stubs the rest.
 
 ## A2 — Vector search (FLAGSHIP, drilled)
 
-### API
+### API (expression namespace)
 
 ```python
-result = (
-    queries_lf                                  # the frame; height = Q
-      .metal.cosine_topk(corpus_lf, "emb", k=10)   # also .metal.knn(..., metric="l2")
-      .collect(engine="metal")
-)
-# result = queries_lf's columns + two new columns, height Q:
-#   indices : List[UInt32]   length k   (row offsets into the corpus)
-#   scores  : List[Float32]  length k   (cosine similarity, or L2 distance for knn)
+result = queries_lf.with_columns(
+    pl.col("emb").metal.cosine_topk(corpus_lf, k=10).alias("hits")   # also .metal.knn(...)
+).collect(engine="metal")
+
+# result = queries_lf's columns + "hits", height Q. "hits" is one column:
+#   Struct{ indices: List[UInt32](len k), scores: List[Float32](len k) }
+# split with: pl.col("hits").struct.field("indices") / .struct.field("scores")
 ```
 
-- **Verbs:** `cosine_topk` (similarity, descending) and `knn` (L2 distance, ascending). Both are
-  one normalize/prep + one GEMM + one top-k — shipped together.
-- **Queries:** the collected frame. Its `emb` column is `Array[Float32, D]`, height Q. Composes
-  with arbitrary query-metadata columns (carried through to the result).
-- **Corpus:** a `LazyFrame` (also accept eager `DataFrame` / numpy `(N,D)` F32 as conveniences),
-  with an `Array[Float32, D]` embedding column. Captured by-reference; materialized at dispatch
-  via a normal Polars `.collect()` so pushdown applies — only surviving rows' embedding column
-  reaches GPU memory.
-- **Output contract:** one row per query (height-preserving → per-row sentinel kind); two list
-  columns of length k. Tie-break: score (sim desc / dist asc), then `index asc`.
+- **Namespace kind:** **expression** namespace (`pl.api.register_expr_namespace("metal")`). The verb
+  is a per-row expression on the query embedding column → one struct column, height-preserving.
+- **Verbs:** `cosine_topk(corpus, k)` (cosine similarity, descending) and `knn(corpus, k)`
+  (**true L2 distance**, `sqrt`, ascending). Both = normalize/prep + one GEMM + one top-k.
+- **Queries:** the frame's `emb` column (`Array[Float32, D]`, height Q). Composes with arbitrary
+  query-metadata columns (carried through unchanged).
+- **Corpus:** a `LazyFrame` (also accept eager `DataFrame` / numpy `(N,D)` F32), with an
+  `Array[Float32, D]` embedding column named by a `corpus_col=` arg (default `"emb"`). Captured
+  by-reference under a monotonic **handle-id**; materialized at dispatch via a normal Polars
+  `.collect()` so pushdown applies — only surviving rows' embedding column reaches GPU memory.
+- **Output:** one `Struct{indices: List[UInt32], scores: List[Float32]}` column per query row,
+  length k. Tie-break: score (sim desc / dist asc), then `index asc`.
+- **Mismatch → raise** (resolved): non-F32 embedding, ragged/non-Array `List`, D-mismatch
+  query↔corpus, missing corpus column, or use without `engine="metal"` → clear `ComputeError`/raise.
+  No silent CPU fallback (the op has no native Polars equivalent to fall back to).
 
-### Mechanism
+### Mechanism (expr namespace + handle-id capture, M5 collect-and-stitch)
 
-Height is preserved (Q in, Q out), so A2 uses the **per-row sentinel kind** for op recognition
-**plus** the side-capture for the by-reference corpus handle:
+Recognition reuses the **M5 template** (serialize-detect + collect-and-stitch), *not* the
+post-opt NodeTraverser. The expr namespace is just the user-facing surface:
 
-1. `queries_lf.metal.cosine_topk(corpus_lf, "emb", k, metric)` stashes
-   `(corpus_lf, "emb", k, metric)` in the capture dict keyed by the result frame `id()`
-   (pop-on-consume), and returns a frame bearing the `as_struct` sentinel for the new columns
-   (carrying op tag, k, metric, query-column name, and a small corpus *handle-id* — never the
-   corpus data).
-2. `collect(engine="metal")` dispatch: pop the capture; `corpus_lf.collect()` (Polars optimizer,
-   pushdown) → corpus `Array[F32,D]` → MLX `(N,D)`; the query column buffer (contiguous Q×D F32)
-   → MLX `(Q,D)`; GEMM → `(Q,N)`; top-k per row → `(Q,k)` indices+values; scatter back as the two
-   list columns aligned to the Q query rows.
+1. `pl.col("emb").metal.cosine_topk(corpus, k, corpus_col="emb")` allocates a monotonic
+   **handle-id**, stashes `(corpus, corpus_col, k, metric)` in a module-global capture dict
+   under that id (pop-on-consume eviction), and returns a **sentinel expression**: a struct-shaped
+   marker carrying the query column ref + handle-id as a viewable literal, plus an opaque
+   `map_batches(_raise)` field so plain-CPU collect (no `engine="metal"`) **raises** rather than
+   silently mis-computing.
+2. `collect(engine="metal")` dispatch (in `collect_wrapper`): serialize-detect the sentinel
+   (find `(out_name, query_col, handle_id)` bindings), `lf.drop(out_names)` → CPU-collect the rest
+   (projection pushdown elides the sentinel), then for each binding pop the corpus from the cache,
+   `corpus.collect()` (Polars optimizer/pushdown) → run the GPU op → stitch the result struct
+   column back in schema order. Same shape as `_rolling_dispatch.apply_rolling`.
 
-### Backend (MLX)
+### Backend (MLX composition + new FFI building blocks)
 
-- **cosine:** L2-normalize queries and corpus once (`x / ‖x‖₂`); `sim = Qn @ Cnᵀ` → `(Q,N)`;
-  `top_k` along axis 1 (`mx.argpartition`/sort the partition).
-- **knn (L2):** `‖q−c‖² = ‖q‖² + ‖c‖² − 2·q·cᵀ`; the `−2·q·cᵀ` cross term is the GEMM; add the
-  norm vectors (broadcast); smallest-k. Return distances (optionally `sqrt`).
-- **Zero-copy in:** `Array[F32,D]` is contiguous `len·D` F32 in Arrow → reshape to `(len,D)` in
-  MLX with no copy where alignment permits (buffer bridge).
-- **Tiling over N:** the `(Q,N)` matrix can be large (Q=100, N=1M = 400 MB). When it exceeds a
-  threshold, tile the corpus over N: per tile compute `(Q,tile)`, merge into a running per-query
-  top-k. Each tile resident; running heap/merge in F32.
+The GEMM exists (`mlx_op_matmul`); on-GPU top-k extraction needs **5 new MLX FFI wrappers**
+(reusable for FFT/future ops): `transpose`, `reshape`, `slice` (first-k along an axis),
+`take_along_axis` (gather), and **I32 readback** (`argpartition` returns I32; none exists today).
+
+- **Buffer staging:** host query/corpus F32 `(rows·D)` → `MetalBuffer::from_borrowed_f32` →
+  `mlx_array_view_metal_buffer(buf, [rows, D], F32)` (the existing 2-D view path; same staging as
+  `execute_fused_expr`).
+- **cosine:** normalize each side `x / ‖x‖₂` (`square`→`sum_axis(1)`→`reshape (rows,1)`→`sqrt`→
+  `div` broadcast); `sims = Qn @ transpose(Cn)` → `(Q,N)`; `idx = argpartition(neg(sims))`,
+  `slice [:, :k]` → `(Q,k)` indices; `take_along_axis(sims, idx_k)` → `(Q,k)` scores; sort the k
+  for ranked order (sim desc).
+- **knn (true L2):** `‖q−c‖² = ‖q‖² + ‖c‖² − 2·q·cᵀ` (GEMM is the cross term, norms broadcast);
+  smallest-k via `argpartition(d2)`; `sqrt` the gathered `(Q,k)` distances; ascending.
+- **Readback:** scores `(Q,k)` via `mlx_array_copy_to_f32`; indices `(Q,k)` via the new I32
+  readback → host. Build the `Struct{indices, scores}` column from the `(Q,k)` host arrays.
+- **Tiling over N:** the `(Q,N)` matrix can be large (Q=100,N=1M = 400 MB). Above a byte threshold,
+  tile the corpus over N: per tile compute `(Q,tile)` top-k, merge into a running per-query top-k
+  (host-side merge of `(Q,k)` partials with index-offset correction). Each tile resident.
 
 ### Scope / fallbacks
 
@@ -225,14 +240,18 @@ not a headline).
 
 ---
 
-## Open questions
+## Resolved (brainstorm 2026-06-04/05)
 
-- **F32-mismatch handling:** raise vs. silent CPU brute-force fallback for non-F32 / ragged /
-  D-mismatch vector-search inputs? (Lean: raise for clear user error, CPU-fallback only where a
-  native plan exists.)
-- **Namespace registration surface:** expression namespace, LazyFrame namespace, or both? (A2 is
-  most naturally a LazyFrame verb; A3 an expression verb.)
+- **F32-mismatch → raise** (no silent fallback; the op has no native equivalent).
+- **Namespace = expression** namespace (`register_expr_namespace`); output a single `Struct` column.
+- **`knn` → true L2** (`sqrt`), ascending.
+- **Top-k path = MLX composition** + 5 new reusable FFI wrappers (transpose, reshape, slice,
+  take_along_axis, I32 readback).
+
+## Open questions (deferred to plan/drill time)
+
 - **Tiling threshold** for the `(Q,N)` matrix — fixed bytes vs. queried from `MTLDevice`.
-- **`knn` return:** squared L2 vs. true L2 (`sqrt`) as the default.
-- **dt recognition path:** confirm whether `dt.year/month/day` is NodeTraverser-viewable or needs
-  serialize/sentinel handling (drill-time verification).
+- **`argpartition` 2-D semantics** — confirm last-axis default + tie-break in a kernel test before
+  relying on it (first Phase-0 task).
+- **dt recognition path** — confirm whether `dt.year/month/day` is NodeTraverser-viewable or needs
+  serialize/sentinel handling (Track-B drill time).
