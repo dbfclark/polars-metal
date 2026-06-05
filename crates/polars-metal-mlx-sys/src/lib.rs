@@ -261,6 +261,12 @@ mod ffi {
         // M6 vector search: shape ops (transpose/reshape/slice/take_along_axis).
         fn mlx_op_transpose(a: &SharedPtr<MlxArray>, axes: &[i32]) -> Result<SharedPtr<MlxArray>>;
         fn mlx_op_reshape(a: &SharedPtr<MlxArray>, shape: &[i32]) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_slice(
+            a: &SharedPtr<MlxArray>,
+            start: &[i32],
+            stop: &[i32],
+            strides: &[i32],
+        ) -> Result<SharedPtr<MlxArray>>;
 
         fn mlx_op_fft_1d(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
         fn mlx_op_ifft_1d(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;

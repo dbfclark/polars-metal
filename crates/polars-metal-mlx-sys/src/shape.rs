@@ -20,3 +20,17 @@ pub fn mlx_reshape(a: &MlxArrayHandle, shape: &[i32]) -> Result<MlxArrayHandle, 
         _input_refs: a._input_refs.clone(),
     })
 }
+
+/// Slice `a` with per-axis `start`/`stop`/`strides` (NumPy-style half-open).
+pub fn mlx_slice(
+    a: &MlxArrayHandle,
+    start: &[i32],
+    stop: &[i32],
+    strides: &[i32],
+) -> Result<MlxArrayHandle, FfiError> {
+    let ptr = ffi::mlx_op_slice(&a.ptr, start, stop, strides).map_err(FfiError::from)?;
+    Ok(MlxArrayHandle {
+        ptr,
+        _input_refs: a._input_refs.clone(),
+    })
+}

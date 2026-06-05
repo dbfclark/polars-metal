@@ -118,3 +118,16 @@ fn reshape_6_to_3x2_and_keepdim() {
     mlx_array_eval(&[col.clone()]).expect("eval");
     assert_eq!(col.shape(), vec![3, 1]);
 }
+
+#[test]
+fn slice_first_2_cols_of_2x3() {
+    use polars_metal_mlx_sys::shape::mlx_slice;
+
+    let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]; // (2,3)
+    let a = arr2d(&data, 2, 3);
+    // start=[0,0], stop=[2,2], strides=[1,1] -> (2,2) first two columns.
+    let s = mlx_slice(&a, &[0, 0], &[2, 2], &[1, 1]).expect("slice");
+    mlx_array_eval(&[s.clone()]).expect("eval");
+    assert_eq!(s.shape(), vec![2, 2]);
+    assert_eq!(mlx_array_to_f32_vec(&s).unwrap(), vec![1.0, 2.0, 4.0, 5.0]);
+}

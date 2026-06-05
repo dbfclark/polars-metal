@@ -461,6 +461,21 @@ std::shared_ptr<MlxArray> mlx_op_reshape(
     return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
 }
 
+std::shared_ptr<MlxArray> mlx_op_slice(
+    const std::shared_ptr<MlxArray>& a,
+    rust::Slice<const int32_t> start,
+    rust::Slice<const int32_t> stop,
+    rust::Slice<const int32_t> strides) {
+    std::vector<int> lo(start.begin(), start.end());
+    std::vector<int> hi(stop.begin(), stop.end());
+    std::vector<int> st(strides.begin(), strides.end());
+    // slice yields a strided view; force contiguity so the raw-memcpy readback
+    // sees row-major data.
+    auto base = std::make_shared<mlx::core::array>(
+        mlx::core::contiguous(mlx::core::slice(*a, lo, hi, st)));
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
 std::shared_ptr<MlxArray> mlx_op_fft_1d(const std::shared_ptr<MlxArray>& a) {
     auto base = std::make_shared<mlx::core::array>(mlx::core::fft::fft(*a));
     return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
