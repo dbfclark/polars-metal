@@ -84,6 +84,17 @@ def _run_binding(qframe: pl.DataFrame, b: VectorBinding) -> pl.Series:
     cmat, n_rows, cd = _corpus_matrix(spec.corpus, spec.corpus_col)
     if qd != cd:
         raise ValueError(f"query D={qd} != corpus D={cd}")
+    if n_rows == 0:
+        # A query against an empty corpus has zero neighbours. Short-circuit:
+        # the GPU staging path can't allocate a 0-byte buffer, and the correct
+        # answer is an empty hit-list per query (matches the numpy oracle).
+        return _build_struct(
+            np.empty(0, dtype=np.uint32),
+            np.empty(0, dtype=np.float32),
+            q_rows,
+            0,
+            spec.metric,
+        ).rename(b.out_name)
     k = min(spec.k, n_rows)
     idx, val = _native.execute_vector_search(
         (qmat.ctypes.data, qmat.size),

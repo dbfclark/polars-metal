@@ -186,3 +186,80 @@ def test_matches_numpy_oracle(metric, Q, N, D, k):
         assert got_idx == oi[qi], f"q{qi} idx {got_idx} != oracle {oi[qi]}"
         # F32 GEMM vs F64 numpy oracle: ~1e-4 tolerance.
         np.testing.assert_allclose(got_sc, osc[qi], rtol=1e-4, atol=1e-4)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Task 16 — mismatch / raise tests + k>N clamp + empty-corpus semantics.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("bad", ["dtype", "dmismatch", "ragged"])
+def test_raises_on_bad_inputs(bad):
+    from polars_metal import MetalEngine
+
+    if bad == "dtype":  # F64 instead of F32
+        corpus = pl.DataFrame(
+            {"emb": [[1.0, 0.0]]}, schema={"emb": pl.Array(pl.Float64, 2)}
+        ).lazy()
+        qframe = pl.DataFrame(
+            {"emb": [[1.0, 0.0]]}, schema={"emb": pl.Array(pl.Float64, 2)}
+        )
+    elif bad == "dmismatch":  # query D != corpus D
+        corpus = pl.DataFrame(
+            {"emb": [[1.0, 0.0, 0.0]]}, schema={"emb": pl.Array(pl.Float32, 3)}
+        ).lazy()
+        qframe = pl.DataFrame(
+            {"emb": [[1.0, 0.0]]}, schema={"emb": pl.Array(pl.Float32, 2)}
+        )
+    else:  # ragged List, not fixed-width Array
+        corpus = pl.DataFrame({"emb": [[1.0, 0.0], [1.0]]}).lazy()
+        qframe = pl.DataFrame({"emb": [[1.0, 0.0]]})
+    # All three rejections surface as ValueError from the dispatch validators
+    # (Array(F32, D) requirement / D-mismatch check) before any FFI call.
+    with pytest.raises(ValueError):
+        qframe.lazy().with_columns(
+            pl.col("emb").metal.cosine_topk(corpus, k=1).alias("hits")
+        ).collect(engine=MetalEngine())
+
+
+def test_k_greater_than_n_clamps():
+    from polars_metal import MetalEngine
+
+    corpus = pl.DataFrame(
+        {"emb": [[1.0, 0.0], [0.0, 1.0]]}, schema={"emb": pl.Array(pl.Float32, 2)}
+    ).lazy()
+    qframe = pl.DataFrame(
+        {"emb": [[1.0, 0.0]]}, schema={"emb": pl.Array(pl.Float32, 2)}
+    )
+    out = (
+        qframe.lazy()
+        .with_columns(pl.col("emb").metal.cosine_topk(corpus, k=10).alias("hits"))
+        .collect(engine=MetalEngine())
+    )
+    assert len(out["hits"][0]["indices"]) == 2  # clamped to N
+
+
+def test_empty_corpus_returns_empty_hits():
+    """An empty corpus (N=0) has zero neighbours: each query gets empty lists,
+    NOT a low-level MLX allocation error. Dtype stays Struct{List[u32], List[f32]}."""
+    from polars_metal import MetalEngine
+
+    corpus = pl.DataFrame(
+        {"emb": []}, schema={"emb": pl.Array(pl.Float32, 2)}
+    ).lazy()
+    qframe = pl.DataFrame(
+        {"id": [0, 1], "emb": [[1.0, 0.0], [0.0, 1.0]]},
+        schema={"id": pl.Int64, "emb": pl.Array(pl.Float32, 2)},
+    )
+    out = (
+        qframe.lazy()
+        .with_columns(pl.col("emb").metal.cosine_topk(corpus, k=5).alias("hits"))
+        .collect(engine=MetalEngine())
+    )
+    assert out.get_column("hits").dtype == pl.Struct(
+        {"indices": pl.List(pl.UInt32), "scores": pl.List(pl.Float32)}
+    )
+    assert out.height == 2
+    for qi in range(2):
+        assert len(out["hits"][qi]["indices"]) == 0
+        assert len(out["hits"][qi]["scores"]) == 0
