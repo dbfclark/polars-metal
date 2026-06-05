@@ -86,3 +86,19 @@ fn argpartition_2d_flattens_not_last_axis() {
          not a per-row argmin"
     );
 }
+
+#[test]
+fn transpose_2x3_to_3x2() {
+    use polars_metal_mlx_sys::shape::mlx_transpose;
+
+    let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]; // (2,3) row-major
+    let a = arr2d(&data, 2, 3);
+    let t = mlx_transpose(&a, &[1, 0]).expect("transpose");
+    mlx_array_eval(&[t.clone()]).expect("eval");
+    assert_eq!(t.shape(), vec![3, 2]);
+    // (3,2) row-major = columns of original = [1,4, 2,5, 3,6]
+    assert_eq!(
+        mlx_array_to_f32_vec(&t).unwrap(),
+        vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]
+    );
+}

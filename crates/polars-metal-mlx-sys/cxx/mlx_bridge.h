@@ -245,6 +245,11 @@ std::shared_ptr<MlxArray> mlx_op_cummin(const std::shared_ptr<MlxArray>& a, int3
 std::shared_ptr<MlxArray> mlx_op_matmul(
     const std::shared_ptr<MlxArray>& a, const std::shared_ptr<MlxArray>& b);
 
+// ── M6 vector search: shape ops ──────────────────────────────────────────────
+std::shared_ptr<MlxArray> mlx_op_transpose(
+    const std::shared_ptr<MlxArray>& a,
+    rust::Slice<const int32_t> axes);
+
 std::shared_ptr<MlxArray> mlx_op_fft_1d(const std::shared_ptr<MlxArray>& a);
 std::shared_ptr<MlxArray> mlx_op_ifft_1d(const std::shared_ptr<MlxArray>& a);
 

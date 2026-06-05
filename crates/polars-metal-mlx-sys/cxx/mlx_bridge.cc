@@ -440,6 +440,19 @@ MLX_WRAP_SCAN(mlx_op_cummin, cummin)
 
 MLX_WRAP_BINOP(mlx_op_matmul, matmul)
 
+// ── M6 vector search: shape ops ──────────────────────────────────────────────
+
+std::shared_ptr<MlxArray> mlx_op_transpose(
+    const std::shared_ptr<MlxArray>& a,
+    rust::Slice<const int32_t> axes) {
+    std::vector<int> ax(axes.begin(), axes.end());
+    // transpose yields a strided view; the F32/I32 readback memcpy's the raw
+    // contiguous buffer in storage order, so force row-major contiguity here.
+    auto base = std::make_shared<mlx::core::array>(
+        mlx::core::contiguous(mlx::core::transpose(*a, ax)));
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
 std::shared_ptr<MlxArray> mlx_op_fft_1d(const std::shared_ptr<MlxArray>& a) {
     auto base = std::make_shared<mlx::core::array>(mlx::core::fft::fft(*a));
     return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));

@@ -18,6 +18,7 @@ pub mod fft;
 pub mod matmul;
 pub mod reduce;
 pub mod scan;
+pub mod shape;
 pub mod sort;
 
 // cxx's SharedPtr<T> implementation expands a panic! macro in the generated
@@ -256,6 +257,9 @@ mod ffi {
             a: &SharedPtr<MlxArray>,
             b: &SharedPtr<MlxArray>,
         ) -> Result<SharedPtr<MlxArray>>;
+
+        // M6 vector search: shape ops (transpose/reshape/slice/take_along_axis).
+        fn mlx_op_transpose(a: &SharedPtr<MlxArray>, axes: &[i32]) -> Result<SharedPtr<MlxArray>>;
 
         fn mlx_op_fft_1d(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
         fn mlx_op_ifft_1d(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
