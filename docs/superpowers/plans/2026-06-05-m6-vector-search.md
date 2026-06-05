@@ -578,9 +578,106 @@ git commit -m "feat(mlx): i32 readback (M6 vector search)"
 
 ---
 
+### Task 5b: axis-aware `argpartition` wrapper (REQUIRED — Task 0 finding)
+
+**Files:** same set as Task 1 (`mlx_bridge.h/.cc`, `src/lib.rs`, `src/sort.rs`, `tests/test_vector_ffi.rs`).
+
+Task 0 proved the existing `mlx_op_argpartition` **flattens to 1-D** (calls `mlx::core::argpartition(a, kth)`,
+ops.h:704) — it does NOT partition per-row. Per-query top-k needs the axis-aware overload
+(`argpartition(a, kth, axis)`, ops.h:710). Add it without touching the existing flattening wrapper.
+
+- [ ] **Step 1: Write the failing test** (append to `tests/test_vector_ffi.rs`)
+
+```rust
+use polars_metal_mlx_sys::sort::mlx_argpartition_axis;
+
+#[test]
+fn argpartition_axis_is_per_row() {
+    // (2,3): row 0 min at col 2, row 1 min at col 0. axis=-1 → per-row partition.
+    let a = arr2d(&[3.0f32, 5.0, 1.0,   2.0, 8.0, 9.0], 2, 3);
+    let idx = mlx_argpartition_axis(&a, 0, -1).expect("argpartition_axis");
+    let idx_f = mlx_cast(&idx, MlxDtype::F32).expect("cast");
+    mlx_array_eval(&[idx_f.clone()]).expect("eval");
+    assert_eq!(idx_f.shape(), vec![2, 3], "axis-aware keeps 2-D shape");
+    let v = mlx_array_to_f32_vec(&idx_f).unwrap();
+    assert_eq!(v[0] as i32, 2, "row 0 col0 = argmin = col 2");
+    assert_eq!(v[3] as i32, 0, "row 1 col0 = argmin = col 0");
+}
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `cargo test -p polars-metal-mlx-sys --test test_vector_ffi argpartition_axis_is_per_row -- --test-threads=1`
+Expected: FAIL — `mlx_argpartition_axis` not found.
+
+- [ ] **Step 3: Add the C++ wrapper**
+
+`mlx_bridge.h` (near the existing `mlx_op_argpartition`, ~line 207):
+
+```cpp
+std::shared_ptr<MlxArray> mlx_op_argpartition_axis(
+    const std::shared_ptr<MlxArray>& a, int32_t kth, int32_t axis);
+```
+
+`mlx_bridge.cc` (next to the existing `mlx_op_argpartition`, ~line 376):
+
+```cpp
+std::shared_ptr<MlxArray> mlx_op_argpartition_axis(
+    const std::shared_ptr<MlxArray>& a, int32_t kth, int32_t axis) {
+    auto base = std::make_shared<mlx::core::array>(
+        mlx::core::argpartition(*a, kth, axis));
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+```
+
+- [ ] **Step 4: Declare + wrap**
+
+`src/lib.rs` extern block (near `mlx_op_argpartition`, ~line 230):
+
+```rust
+        fn mlx_op_argpartition_axis(
+            a: &SharedPtr<MlxArray>,
+            kth: i32,
+            axis: i32,
+        ) -> Result<SharedPtr<MlxArray>>;
+```
+
+`src/sort.rs` (next to `mlx_argpartition`, ~line 38):
+
+```rust
+/// Argpartition along `axis` (use `-1` for the last axis). Returns integer indices,
+/// same shape as `a`, with the `0..=kth` positions along `axis` holding the kth-smallest.
+pub fn mlx_argpartition_axis(
+    a: &MlxArrayHandle,
+    kth: i32,
+    axis: i32,
+) -> Result<MlxArrayHandle, FfiError> {
+    let ptr = ffi::mlx_op_argpartition_axis(&a.ptr, kth, axis).map_err(FfiError::from)?;
+    Ok(MlxArrayHandle { ptr, _input_refs: a._input_refs.clone() })
+}
+```
+
+- [ ] **Step 5: Run to verify it passes**
+
+Run: `cargo test -p polars-metal-mlx-sys --test test_vector_ffi argpartition_axis_is_per_row -- --test-threads=1`
+Expected: PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/polars-metal-mlx-sys/
+git commit -m "feat(mlx): axis-aware argpartition wrapper (M6 vector search)"
+```
+
+---
+
 ## Phase 1 — Rust dispatcher + PyO3
 
 ### Task 6: `vector_search_topk` core (cosine path)
+
+> **Corrections from Task 0:** use `MetalDevice::system_default()` (the plan's `default_device()`
+> does not exist) and `mlx_argpartition_axis(&x, k-1, -1)` (the bare `mlx_argpartition` flattens to
+> 1-D). `MetalBuffer::from_borrowed_f32` / `from_f32_slice` and `MlxDtype` are confirmed real.
 
 **Files:**
 - Create: `crates/polars-metal-core/src/vector_search.rs`
@@ -631,7 +728,7 @@ Create `crates/polars-metal-core/src/vector_search.rs`:
 //! M6 vector search: MLX-composition top-k over a query×corpus GEMM.
 use std::sync::Arc;
 
-use polars_metal_buffer::{default_device, MetalBuffer};
+use polars_metal_buffer::{MetalBuffer, MetalDevice};
 use polars_metal_mlx_sys::array::{
     mlx_array_eval, mlx_array_to_f32_vec, mlx_array_to_i32_vec, mlx_array_view_metal_buffer,
     MlxArrayHandle, MlxDtype,
@@ -640,7 +737,7 @@ use polars_metal_mlx_sys::elementwise::{mlx_add, mlx_cast, mlx_div, mlx_mul, mlx
 use polars_metal_mlx_sys::matmul::mlx_matmul;
 use polars_metal_mlx_sys::reduce::mlx_sum_axis;
 use polars_metal_mlx_sys::shape::{mlx_reshape, mlx_slice, mlx_take_along_axis, mlx_transpose};
-use polars_metal_mlx_sys::sort::mlx_argpartition;
+use polars_metal_mlx_sys::sort::mlx_argpartition_axis;
 use polars_metal_mlx_sys::FfiError;
 
 pub const OP_COSINE: u32 = 0;
@@ -648,7 +745,7 @@ pub const OP_KNN_L2: u32 = 1;
 
 /// View a row-major host F32 slice as a 2-D `(rows, cols)` MLX array.
 fn view2d(data: &[f32], rows: i64, cols: i64) -> Result<MlxArrayHandle, FfiError> {
-    let device = default_device();
+    let device = MetalDevice::system_default();
     // SAFETY: `data` outlives every use of the returned handle within this fn's callers,
     // which eval and read back before returning. MetalBuffer borrows, does not own.
     let buf = unsafe { MetalBuffer::from_borrowed_f32(&device, data.as_ptr(), data.len()) }
@@ -701,8 +798,9 @@ pub fn vector_search_topk(
         _ => return Err(FfiError::from_msg("unknown vector-search op")),
     };
 
-    // argpartition along last axis → (Q,N) indices; take first k columns.
-    let part = mlx_argpartition(&partition_on, (k - 1) as i32)?;
+    // argpartition along LAST axis (axis=-1) → (Q,N) indices; take first k columns.
+    // NOTE: must use the axis-aware wrapper; the bare mlx_argpartition flattens to 1-D (Task 0).
+    let part = mlx_argpartition_axis(&partition_on, (k - 1) as i32, -1)?;
     let idx_k = mlx_slice(&part, &[0, 0], &[q_rows as i32, k as i32], &[1, 1])?; // (Q,k)
     let idx_k_i = mlx_cast(&idx_k, MlxDtype::I32)?;
     // gather the metric values at those indices.
