@@ -70,6 +70,70 @@ def _opt_flags_without_cse(user_opt: Any) -> Any:
     return QueryOptFlags(comm_subexpr_elim=False, **kwargs)
 
 
+# Transcendental tokens that signal a fusion-eligible compute chain in
+# `lf.explain()` output (e.g. `col("lat").sin()`). We only force CSE off for
+# such queries — see `_is_fusion_candidate`. Plain arithmetic / non-compute
+# queries keep Polars' default CSE so that fall-back queries are byte-identical
+# to pure CPU (forcing CSE off unconditionally exposed a Polars CSE-off
+# correctness bug on e.g. `value_counts`/struct-expansion plans).
+_FUSION_FUNC_TOKENS = (
+    # Transcendentals (haversine / Black-Scholes chains).
+    ".sin(",
+    ".cos(",
+    ".tan(",
+    ".sinh(",
+    ".cosh(",
+    ".tanh(",
+    ".arcsin(",
+    ".arccos(",
+    ".arctan(",
+    "arctan2",
+    ".arcsinh(",
+    ".arccosh(",
+    ".arctanh(",
+    ".exp(",
+    ".exp2(",
+    ".log(",
+    ".log1p(",
+    ".log10(",
+    ".log2(",
+    ".sqrt(",
+    ".cbrt(",
+    # Fused reductions / scans over a compute chain. A shared sub-expression
+    # feeding two of these (e.g. (x*2).sum() and (x*2).std()) is hoisted by CSE
+    # into a temp the fused HStack dispatch can't consume — so these also need
+    # CSE off. value_counts / struct-expansion plans contain none of these.
+    # (Broadening the set is safe: before this gate CSE was *always* forced off,
+    # so more tokens just preserves the old behavior for more queries; only
+    # token-free, non-fusion plans take the new CSE-on path.)
+    ".sum(",
+    ".mean(",
+    ".std(",
+    ".var(",
+    ".cum_sum(",
+    ".cum_prod(",
+    ".cum_max(",
+    ".cum_min(",
+)
+
+
+def _is_fusion_candidate(lf: Any) -> bool:
+    """True iff the LazyFrame's plan contains a transcendental compute op — the
+    strong signal that a fused MLX subgraph (haversine / Black-Scholes / etc.)
+    will run and would be fragmented by Polars CSE. Conservative: any failure or
+    no-match returns False, leaving CSE at Polars' (correct) default. Uses
+    ``explain()`` (cheap; does not serialize the DataFrame)."""
+    try:
+        import warnings as _w
+
+        with _w.catch_warnings():
+            _w.simplefilter("ignore")
+            txt = lf.explain()
+        return any(tok in txt for tok in _FUSION_FUNC_TOKENS)
+    except Exception:
+        return False
+
+
 def _verify_patch_site() -> None:
     """Assert both Polars functions we're about to patch have the signatures we expect.
 
@@ -179,14 +243,17 @@ def _patch_gpu_engine_callback() -> None:
                     return existing_cb(nt, *args, **kw)
 
                 cb = chained
-            # Force CSE off for Metal-routed plans so a compute subtree stays
-            # a single fused MLX subgraph rather than fragmenting across one
-            # dispatch per hoisted temp column (see `_opt_flags_without_cse`).
-            # A deprecated direct `comm_subexpr_elim` kwarg, if present, is
-            # dropped — the `optimizations` object is the supported channel and
-            # we override CSE regardless of what the caller requested.
-            kwargs.pop("comm_subexpr_elim", None)
-            kwargs["optimizations"] = _opt_flags_without_cse(kwargs.pop("optimizations", None))
+            # Force CSE off for fusion-candidate plans so a compute subtree
+            # stays a single fused MLX subgraph rather than fragmenting across
+            # one dispatch per hoisted temp column (see `_opt_flags_without_cse`).
+            # Gated on `_is_fusion_candidate`: forcing CSE off unconditionally
+            # changed results for fall-back queries that hit a Polars CSE-off
+            # correctness bug (e.g. `value_counts` / struct expansion). Non-fusion
+            # queries keep Polars' default CSE so they stay byte-identical to CPU.
+            # A deprecated direct `comm_subexpr_elim` kwarg, if present, is dropped.
+            if _is_fusion_candidate(self):
+                kwargs.pop("comm_subexpr_elim", None)
+                kwargs["optimizations"] = _opt_flags_without_cse(kwargs.pop("optimizations", None))
             # M5 rolling: serialize-detected rolling_* run on a custom Metal kernel.
             # Skip under streaming (adapter is in-memory only) and when nothing matches.
             from polars_metal import _rolling_detect, _rolling_dispatch

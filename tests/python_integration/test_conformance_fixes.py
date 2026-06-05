@@ -58,3 +58,40 @@ def test_f64_compute_not_downcast_to_f32() -> None:
     assert got.schema["bar"] == pl.Float64
     assert got.schema["foo"] == pl.Float64
     assert got["bar"].to_list() == [1.0, 3.4, 6.4]
+
+
+def test_cse_off_not_forced_on_non_fusion_query() -> None:
+    # Forcing CSE off unconditionally exposed a Polars CSE-off correctness bug on
+    # value_counts/struct plans. CSE-off is now gated on a fusion candidate, so a
+    # non-fusion query keeps Polars' default CSE and matches CPU exactly.
+    src = pl.DataFrame({"x": [i for i in range(1, 6) for _ in range(i)]})
+    got = (
+        src.lazy()
+        .select(pl.struct("x").value_counts().struct.unnest())
+        .sort("count")
+        .collect(engine=MetalEngine())
+    )
+    expected = (
+        src.lazy()
+        .select(pl.struct("x").value_counts().struct.unnest())
+        .sort("count")
+        .collect(engine="cpu")
+    )
+    assert_frame_equal(got, expected)
+
+
+def test_is_fusion_candidate_detection() -> None:
+    import polars_metal as pm
+
+    transcendental = (
+        pl.DataFrame({"a": [1.0]}, schema={"a": pl.Float32})
+        .lazy()
+        .with_columns(pl.col("a").sin().alias("s"))
+    )
+    plain = (
+        pl.DataFrame({"a": [1.0]}, schema={"a": pl.Float32})
+        .lazy()
+        .with_columns((pl.col("a") * 2.0).alias("b"))
+    )
+    assert pm._is_fusion_candidate(transcendental) is True
+    assert pm._is_fusion_candidate(plain) is False
