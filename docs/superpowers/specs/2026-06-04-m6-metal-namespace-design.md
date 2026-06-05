@@ -238,6 +238,19 @@ not a headline).
 - Measure the now-unblocked candidates (vector search; FFT once landed) and record honest numbers.
 - Update [[m6-scope-and-api-direction]] with what actually shipped vs. deferred.
 
+### Delivered — A2 vector search (2026-06-05, branch `m6-vector-search`)
+
+`pl.col("emb").metal.cosine_topk(corpus, k)` / `.metal.knn(corpus, k)` ship as an expression
+namespace over `Array(Float32, D)`, executed under `collect(engine="metal")`, returning
+`Struct{indices: List[UInt32], scores: List[Float32]}` per query row. Implementation: one batched
+MLX GEMM + `argpartition` top-k composed from 6 new reusable MLX FFI wrappers (transpose, reshape,
+slice, take_along_axis, axis-aware argpartition, I32 readback); recognition via the M5
+serialize-detect + collect-and-stitch template (corpus held by handle-id, popped on consume).
+**Honest perf: ~20× at Q=100, N=200k, D=256, k=10** (13.9 ms metal vs 277 ms numpy *argpartition*
+baseline — the apples-to-apples comparison; an `argsort` baseline would have inflated this to ~93×).
+F32-only; non-F32 / ragged / D-mismatch / empty-corpus handled (raise or empty-hits). The 6 FFI
+wrappers + the namespace/sentinel machinery are now available for A3 (FFT) and A4 (pairwise).
+
 ---
 
 ## Resolved (brainstorm 2026-06-04/05)
