@@ -175,9 +175,11 @@ pub fn mlx_array_eval(handles: &[MlxArrayHandle]) -> Result<(), FfiError> {
 /// Must be called after [`mlx_array_eval`] (or equivalent). Returns an empty
 /// `Vec` for a zero-element array without touching the C++ side.
 ///
+/// The copy is a raw `memcpy` in storage order, so it assumes the array is **row-major
+/// contiguous** (see `mlx_array_to_i32_vec` for the strided-producer caveat).
+///
 /// # Errors
 /// Returns `FfiError::DtypeMismatch` if the array's dtype is not F32.
-/// Returns `FfiError::Runtime` if the copy fails on the C++ side.
 pub fn mlx_array_to_f32_vec(handle: &MlxArrayHandle) -> Result<Vec<f32>, FfiError> {
     if !handle.dtype_is_f32() {
         return Err(FfiError::DtypeMismatch);
@@ -200,8 +202,10 @@ pub fn mlx_array_to_f32_vec(handle: &MlxArrayHandle) -> Result<Vec<f32>, FfiErro
 
 /// Read a materialized I32 array back to a host `Vec<i32>`. Call after `mlx_array_eval`.
 ///
-/// # Errors
-/// Returns `FfiError::Runtime` if the copy fails on the C++ side.
+/// The copy is a raw `memcpy` in storage order, so it assumes the array is **row-major
+/// contiguous**. Any producer that yields a strided/transposed view (e.g. `mlx_transpose`,
+/// `mlx_slice`) must be materialized via `mlx::core::contiguous(...)` before readback — the
+/// shape wrappers already do this internally.
 pub fn mlx_array_to_i32_vec(handle: &MlxArrayHandle) -> Result<Vec<i32>, FfiError> {
     let n: usize = handle.shape().iter().product();
     if n == 0 {
