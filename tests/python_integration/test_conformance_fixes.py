@@ -60,6 +60,25 @@ def test_f64_compute_not_downcast_to_f32() -> None:
     assert got["bar"].to_list() == [1.0, 3.4, 6.4]
 
 
+def test_non_f32_output_dtypes_fall_back_to_cpu() -> None:
+    # The fused HStack path produces Float32 buffers; a binding whose output is
+    # Int32/Int64/Boolean must fall back to CPU (else it's downcast to F32 or the
+    # fused eval raises DtypeMismatch). Verify dtype + values match CPU.
+    df = pl.DataFrame(
+        {"x": [1.0, 2.0, 3.0], "k": [1, 2, 3]},
+        schema={"x": pl.Float32, "k": pl.Int32},
+    )
+    lf = df.lazy().with_columns(
+        (pl.col("k") + 1).alias("ki"),  # Int32 output
+        (pl.col("x") > 1.5).alias("gt"),  # Boolean output
+    )
+    got = lf.collect(engine=MetalEngine())
+    expected = lf.collect(engine="cpu")
+    assert_frame_equal(got, expected)
+    assert got.schema["ki"] == pl.Int32
+    assert got.schema["gt"] == pl.Boolean
+
+
 def test_cse_off_not_forced_on_non_fusion_query() -> None:
     # Forcing CSE off unconditionally exposed a Polars CSE-off correctness bug on
     # value_counts/struct plans. CSE-off is now gated on a fusion candidate, so a

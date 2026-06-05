@@ -558,21 +558,27 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
         # expression eval happens.
         output_name = str(getattr(e, "output_name", "") or "")
 
-        # The fused and M3 dispatch paths compute in F32 on the GPU (no GPU
-        # F64). If this binding's output column is Float64, the GPU result would
-        # be downcast to F32 — violating Polars' dtype/precision contract. Fall
-        # back to CPU so the F64 output is preserved exactly. (An F64 input that
-        # the chain explicitly casts to F32 has an F32 output and still fuses.)
-        try:
-            if str(nt.get_dtype(node_id)) == "Float64":
-                return FallBack(
-                    reason="HStack binding output is Float64; the F32 GPU path "
-                    "would downcast it — CPU preserves Polars' Float64"
-                )
-        except Exception:
-            pass
-
         fused = _probe_fusion_analyzer(nt, node_id, in_schema, output_name)
+
+        # The fused and M3 HStack dispatch paths produce Float32 output buffers.
+        # If this binding's correct output dtype is anything else (Float64,
+        # Int32/Int64, Boolean, …) the GPU result would be wrong-typed/downcast
+        # — or the fused eval raises a DtypeMismatch (e.g. a Bool comparison
+        # output). Fall back to CPU so the output dtype is preserved exactly.
+        # (An F64/int input the chain explicitly casts to F32 has an F32 output
+        # and still fuses; internal comparisons inside an F32-output chain, e.g.
+        # when/then, are fine — only the binding's *output* dtype is checked.)
+        # Placed AFTER the fusion probe so the analyzer still runs (and logs its
+        # accept/reject) for non-F32 expressions.
+        try:
+            out_dtype = str(nt.get_dtype(node_id))
+        except Exception:
+            out_dtype = "Float32"  # undeterminable — let the normal paths decide
+        if out_dtype != "Float32":
+            return FallBack(
+                reason=f"HStack binding output dtype is {out_dtype}, not Float32; "
+                "the F32 GPU path can't produce it — CPU preserves Polars' dtype"
+            )
 
         if fused is not None:
             scope, descriptors = fused
