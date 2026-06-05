@@ -149,3 +149,13 @@ fn take_along_axis_gathers_per_row() {
         vec![12.0, 10.0, 20.0, 21.0]
     );
 }
+
+#[test]
+fn i32_readback_roundtrip() {
+    use polars_metal_mlx_sys::array::mlx_array_to_i32_vec;
+
+    let f = arr2d(&[2.0f32, 0.0, 5.0, 9.0], 1, 4);
+    let i = mlx_cast(&f, MlxDtype::I32).expect("cast i32");
+    mlx_array_eval(&[i.clone()]).expect("eval");
+    assert_eq!(mlx_array_to_i32_vec(&i).unwrap(), vec![2, 0, 5, 9]);
+}

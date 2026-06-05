@@ -79,6 +79,11 @@ bool mlx_array_is_f32(const std::shared_ptr<MlxArray>& arr);
 void mlx_array_copy_to_f32(
     const std::shared_ptr<MlxArray>& arr, float* out, size_t n);
 
+// Copy `n` int32 values from the materialized array into the caller's buffer.
+// Must be called after mlx_array_eval_one. The array must be I32 dtype.
+void mlx_array_copy_to_i32(
+    const std::shared_ptr<MlxArray>& arr, int32_t* out, size_t n);
+
 // Force evaluation (materialize) of a single array by calling
 // mlx::core::eval(*arr). Throws std::runtime_error on MLX failure;
 // cxx converts that to a Rust error.

@@ -74,6 +74,11 @@ mod ffi {
         // SAFETY: `out` must point to a buffer of at least `n` f32 values.
         unsafe fn mlx_array_copy_to_f32(arr: &SharedPtr<MlxArray>, out: *mut f32, n: usize);
 
+        // M6 vector search: I32 readback. Copy `n` i32 values from the
+        // materialized (eval'd) array into the caller buffer. Array must be I32.
+        // SAFETY: `out` must point to a buffer of at least `n` i32 values.
+        unsafe fn mlx_array_copy_to_i32(arr: &SharedPtr<MlxArray>, out: *mut i32, n: usize);
+
         // Force evaluation (materialize) of a single array. Wraps
         // `mlx::core::eval(*arr)`. Returns Err on any MLX exception.
         fn mlx_array_eval_one(arr: &SharedPtr<MlxArray>) -> Result<()>;

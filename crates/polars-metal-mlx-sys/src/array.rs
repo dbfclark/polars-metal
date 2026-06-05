@@ -198,6 +198,23 @@ pub fn mlx_array_to_f32_vec(handle: &MlxArrayHandle) -> Result<Vec<f32>, FfiErro
     Ok(out)
 }
 
+/// Read a materialized I32 array back to a host `Vec<i32>`. Call after `mlx_array_eval`.
+///
+/// # Errors
+/// Returns `FfiError::Runtime` if the copy fails on the C++ side.
+pub fn mlx_array_to_i32_vec(handle: &MlxArrayHandle) -> Result<Vec<i32>, FfiError> {
+    let n: usize = handle.shape().iter().product();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out = vec![0i32; n];
+    // SAFETY: `out` has exactly `n` i32 slots; matches the array element count.
+    // The array is eval'd (caller contract) and I32 (caller contract), so
+    // `arr->data<int32_t>()` is valid for `n` elements.
+    unsafe { ffi::mlx_array_copy_to_i32(&handle.ptr, out.as_mut_ptr(), n) };
+    Ok(out)
+}
+
 /// Copy an eval'd F32 array's contents directly into a caller-owned slice,
 /// returning the number of elements written. This is the output-zero-copy
 /// readback: the destination is the final buffer (e.g. a numpy output array),

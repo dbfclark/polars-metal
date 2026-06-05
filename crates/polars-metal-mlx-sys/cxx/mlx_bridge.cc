@@ -127,6 +127,14 @@ void mlx_array_copy_to_f32(
     std::memcpy(out, src, n * sizeof(float));
 }
 
+void mlx_array_copy_to_i32(
+    const std::shared_ptr<MlxArray>& arr, int32_t* out, size_t n) {
+    // Caller guarantees the array has been eval'd, is I32 dtype, and `out`
+    // holds at least n int32 values.
+    const int32_t* src = arr->data<int32_t>();
+    std::memcpy(out, src, n * sizeof(int32_t));
+}
+
 void mlx_array_eval_one(const std::shared_ptr<MlxArray>& arr) {
     // mlx::core::eval's variadic template checks is_arrays_v<T> which only
     // matches mlx::core::array exactly. Downcast to the base type so the
