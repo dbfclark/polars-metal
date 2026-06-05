@@ -47,3 +47,14 @@ def test_mixed_fused_and_nonfused_hstack_falls_back() -> None:
     got = lf.collect(engine=MetalEngine())
     expected = lf.collect(engine="cpu")
     assert_frame_equal(got, expected)
+
+
+def test_f64_compute_not_downcast_to_f32() -> None:
+    # The fused path computes in F32 (no GPU F64). An F64 column must NOT be
+    # silently downcast — the analyzer rejects F64 inputs so the chain falls
+    # back to CPU, preserving Polars' Float64 dtype and precision.
+    df = pl.DataFrame({"foo": [0.5, 1.7, 3.2]}, schema={"foo": pl.Float64})
+    got = df.lazy().with_columns((pl.col("foo") * 2.0).alias("bar")).collect(engine=MetalEngine())
+    assert got.schema["bar"] == pl.Float64
+    assert got.schema["foo"] == pl.Float64
+    assert got["bar"].to_list() == [1.0, 3.4, 6.4]

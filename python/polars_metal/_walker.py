@@ -557,6 +557,21 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
         # _dispatch path intercepts all-fused HStacks before any Rust
         # expression eval happens.
         output_name = str(getattr(e, "output_name", "") or "")
+
+        # The fused and M3 dispatch paths compute in F32 on the GPU (no GPU
+        # F64). If this binding's output column is Float64, the GPU result would
+        # be downcast to F32 — violating Polars' dtype/precision contract. Fall
+        # back to CPU so the F64 output is preserved exactly. (An F64 input that
+        # the chain explicitly casts to F32 has an F32 output and still fuses.)
+        try:
+            if str(nt.get_dtype(node_id)) == "Float64":
+                return FallBack(
+                    reason="HStack binding output is Float64; the F32 GPU path "
+                    "would downcast it — CPU preserves Polars' Float64"
+                )
+        except Exception:
+            pass
+
         fused = _probe_fusion_analyzer(nt, node_id, in_schema, output_name)
 
         if fused is not None:
