@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -113,3 +114,75 @@ def test_end_to_end_cosine_topk_via_engine():
     # query 0 = [1,0]: nearest is corpus[0]; query 1 = [0,1]: nearest is corpus[1].
     assert out["hits"][0]["indices"][0] == 0
     assert out["hits"][1]["indices"][0] == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Task 15 — differential tests vs a numpy oracle (the real correctness bar).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _oracle_cosine_topk(q: np.ndarray, c: np.ndarray, k: int):
+    """Reference cosine top-k: similarity desc, tie-break (-score, index)."""
+    qn = q / np.linalg.norm(q, axis=1, keepdims=True)
+    cn = c / np.linalg.norm(c, axis=1, keepdims=True)
+    sims = qn @ cn.T  # (Q, N)
+    out_idx, out_sc = [], []
+    for row in sims:
+        order = sorted(range(len(row)), key=lambda j: (-row[j], j))[:k]
+        out_idx.append(order)
+        out_sc.append([float(row[j]) for j in order])
+    return out_idx, out_sc
+
+
+def _oracle_knn(q: np.ndarray, c: np.ndarray, k: int):
+    """Reference knn: TRUE L2 distance asc, tie-break (dist, index)."""
+    d = np.sqrt(((q[:, None, :] - c[None, :, :]) ** 2).sum(-1))  # (Q, N) true L2
+    out_idx, out_sc = [], []
+    for row in d:
+        order = sorted(range(len(row)), key=lambda j: (row[j], j))[:k]
+        out_idx.append(order)
+        out_sc.append([float(row[j]) for j in order])
+    return out_idx, out_sc
+
+
+@pytest.mark.parametrize("metric", ["cosine", "knn"])
+@pytest.mark.parametrize(
+    "Q,N,D,k",
+    [
+        (1, 5, 3, 2),
+        (4, 50, 8, 5),
+        (3, 17, 4, 17),  # k == N
+        (2, 8, 1, 12),  # k > N (clamps), D == 1
+        (5, 200, 16, 10),
+    ],
+)
+def test_matches_numpy_oracle(metric, Q, N, D, k):
+    from polars_metal import MetalEngine
+
+    # Fixed seed; the +0.1 offset keeps norms away from zero. Random F32 in
+    # general position makes exact ties (which would make index order ambiguous)
+    # vanishingly unlikely, so exact index match is expected.
+    rng = np.random.default_rng(0)
+    qv = rng.standard_normal((Q, D)).astype(np.float32) + 0.1
+    cv = rng.standard_normal((N, D)).astype(np.float32) + 0.1
+    corpus = pl.DataFrame(
+        {"emb": list(cv)}, schema={"emb": pl.Array(pl.Float32, D)}
+    ).lazy()
+    qframe = pl.DataFrame({"emb": list(qv)}, schema={"emb": pl.Array(pl.Float32, D)})
+    verb = "cosine_topk" if metric == "cosine" else "knn"
+    out = (
+        qframe.lazy()
+        .with_columns(getattr(pl.col("emb").metal, verb)(corpus, k=k).alias("hits"))
+        .collect(engine=MetalEngine())
+    )
+
+    oracle = _oracle_cosine_topk if metric == "cosine" else _oracle_knn
+    oi, osc = oracle(qv, cv, min(k, N))
+    for qi in range(Q):
+        got_idx = list(out["hits"][qi]["indices"])
+        got_sc = list(out["hits"][qi]["scores"])
+        # Clamp: a query against N rows can return at most N neighbours.
+        assert len(got_idx) == min(k, N)
+        assert got_idx == oi[qi], f"q{qi} idx {got_idx} != oracle {oi[qi]}"
+        # F32 GEMM vs F64 numpy oracle: ~1e-4 tolerance.
+        np.testing.assert_allclose(got_sc, osc[qi], rtol=1e-4, atol=1e-4)
