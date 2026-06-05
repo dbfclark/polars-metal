@@ -6,7 +6,9 @@ use polars_metal_mlx_sys::array::{
     mlx_array_eval, mlx_array_to_f32_vec, mlx_array_to_i32_vec, mlx_array_view_metal_buffer,
     MlxArrayHandle, MlxDtype,
 };
-use polars_metal_mlx_sys::elementwise::{mlx_add, mlx_cast, mlx_div, mlx_mul, mlx_neg, mlx_sqrt, mlx_sub};
+use polars_metal_mlx_sys::elementwise::{
+    mlx_add, mlx_cast, mlx_div, mlx_mul, mlx_neg, mlx_sqrt, mlx_sub,
+};
 use polars_metal_mlx_sys::matmul::mlx_matmul;
 use polars_metal_mlx_sys::reduce::mlx_sum_axis;
 use polars_metal_mlx_sys::shape::{mlx_reshape, mlx_slice, mlx_take_along_axis, mlx_transpose};
@@ -87,7 +89,10 @@ pub fn vector_search_topk(
     Ok((indices, values))
 }
 
-/// Default tile threshold: 256 MiB of (Q,N) F32 similarity matrix.
+/// Default tile threshold: 256 MiB of (Q,N) F32 similarity matrix. The Python
+/// dispatch layer (Phase 2) uses this to derive `tile_rows`; not referenced
+/// from Rust yet.
+#[allow(dead_code)]
 pub const TILE_BYTES: usize = 256 * 1024 * 1024;
 
 /// Top-k with corpus row-tiling. `tile_rows` caps corpus rows per GPU pass.
@@ -142,8 +147,8 @@ pub fn vector_search_topk_tiled(
     }
     let mut out_idx = Vec::with_capacity(q_rows as usize * kk);
     let mut out_val = Vec::with_capacity(q_rows as usize * kk);
-    for qi in 0..q_rows as usize {
-        for (i, v) in &best[qi] {
+    for row in best.iter().take(q_rows as usize) {
+        for (i, v) in row {
             out_idx.push(*i);
             out_val.push(*v);
         }
@@ -151,7 +156,41 @@ pub fn vector_search_topk_tiled(
     Ok((out_idx, out_val))
 }
 
+use pyo3::prelude::*;
+
+/// PyO3 entry: `_native.execute_vector_search(query, q_rows, corpus, n_rows, d, k, op, tile_rows)`.
+/// `query`/`corpus` are `(ptr, len)` of contiguous row-major F32. Returns `(indices, values)`
+/// each length `q_rows*min(k,n_rows)`, row-major. `op`: 0=cosine, 1=knn(L2²). Values are raw
+/// metric (cosine sim / squared L2); the Python layer applies `sqrt` for knn and sorts each row.
+#[pyfunction]
+#[pyo3(signature = (query, q_rows, corpus, n_rows, d, k, op, tile_rows))]
+#[allow(clippy::too_many_arguments)]
+pub fn execute_vector_search(
+    query: (usize, usize),
+    q_rows: i64,
+    corpus: (usize, usize),
+    n_rows: i64,
+    d: i64,
+    k: i64,
+    op: u32,
+    tile_rows: i64,
+) -> PyResult<(Vec<u32>, Vec<f32>)> {
+    let (qptr, qlen) = query;
+    let (cptr, clen) = corpus;
+    // SAFETY: Python guarantees these point to contiguous F32 arrays of the given lengths,
+    // kept alive (via numpy arrays / rechunked Series) for the duration of the call. The
+    // reconstructed slices are read-only and never outlive this synchronous call. `f32` has
+    // no invalid bit patterns. Mirrors the `(ptr,len)` idiom in `udf::execute_rolling`.
+    let qslice = unsafe { std::slice::from_raw_parts(qptr as *const f32, qlen) };
+    let cslice = unsafe { std::slice::from_raw_parts(cptr as *const f32, clen) };
+    let (idx, val) = vector_search_topk_tiled(qslice, q_rows, cslice, n_rows, d, k, op, tile_rows)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("vector search: {e}")))?;
+    let idx_u32: Vec<u32> = idx.into_iter().map(|i| i as u32).collect();
+    Ok((idx_u32, val))
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
