@@ -60,3 +60,30 @@ def test_detect_finds_sentinel_binding():
     assert b.out_name == "hits"
     assert b.query_col == "emb"
     assert b.handle in vns._CORPUS_CACHE  # not yet popped
+
+
+def test_dispatch_builds_struct_column_cosine():
+    from polars_metal import _vector_detect as vdet
+    from polars_metal import _vector_dispatch as vdisp
+
+    corpus = pl.DataFrame(
+        {"emb": [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]},
+        schema={"emb": pl.Array(pl.Float32, 2)},
+    ).lazy()
+    qframe = pl.DataFrame(
+        {"id": [0], "emb": [[1.0, 0.0]]},
+        schema={"id": pl.Int64, "emb": pl.Array(pl.Float32, 2)},
+    )
+    lf = qframe.lazy().with_columns(
+        pl.col("emb").metal.cosine_topk(corpus, k=2).alias("hits")
+    )
+    bindings = vdet.find_vector_bindings(lf)
+    df = vdisp.apply_vector_search(lf, bindings, collect_fn=lambda rest: rest.collect())
+    assert df.columns == ["id", "emb", "hits"]
+    hits = df.get_column("hits")
+    assert hits.dtype == pl.Struct(
+        {"indices": pl.List(pl.UInt32), "scores": pl.List(pl.Float32)}
+    )
+    row = hits[0]
+    assert list(row["indices"]) == [0, 2]  # cosine: e0=1.0 then e2=0.707, desc
+    assert abs(row["scores"][0] - 1.0) < 1e-5
