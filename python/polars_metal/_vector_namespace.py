@@ -33,6 +33,10 @@ class CorpusSpec:
     query_col: str
 
 
+# Handle-id → corpus spec, held BY-REFERENCE. Entries are evicted by pop_capture()
+# at dispatch (pop-on-consume, mirroring M5). NOTE: a captured expr that is built but
+# never collected under engine="metal" leaks its entry (and the corpus it references)
+# until process exit — inherent to the by-reference design; acceptable for the MVP.
 _CORPUS_CACHE: dict[int, CorpusSpec] = {}
 
 # Magic prefix embedded in the sentinel's Int64-literal field alias so the
