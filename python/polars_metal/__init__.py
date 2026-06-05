@@ -11,7 +11,12 @@ import polars.lazyframe.frame as _plf
 
 from polars_metal import _native
 from polars_metal import _rolling_detect as _rolling_detect_module  # noqa: F401
-from polars_metal import _vector_namespace as _vector_namespace_module  # noqa: F401  (registers .metal)
+from polars_metal import (
+    _vector_detect as _vector_detect_module,  # noqa: F401  (installs with_columns patch eagerly)
+)
+from polars_metal import (
+    _vector_namespace as _vector_namespace_module,  # noqa: F401  (registers .metal)
+)
 from polars_metal._callback import execute_with_metal
 from polars_metal._engine import MetalEngine
 
@@ -194,6 +199,26 @@ def _patch_gpu_engine_callback() -> None:
                     return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
 
                 return _rolling_dispatch.apply_rolling(self, rolling_bindings, _collect_rest)
+
+            # M6 vector search: serialize-detected .metal.cosine_topk/.knn sentinels
+            # run on the GPU via the same M5 collect-and-stitch template. Placed after
+            # the rolling block; the two don't co-occur in one outermost layer in
+            # practice (and if they did, rolling consumes first — acceptable for MVP).
+            from polars_metal import _vector_detect, _vector_dispatch
+
+            vector_bindings = (
+                [] if streaming else _vector_detect.find_vector_bindings(self)
+            )
+            if vector_bindings:
+
+                def _collect_rest_vs(rest_lf: Any) -> Any:
+                    return original_collect(
+                        rest_lf, engine="cpu", post_opt_callback=cb, **kwargs
+                    )
+
+                return _vector_dispatch.apply_vector_search(
+                    self, vector_bindings, _collect_rest_vs
+                )
             # post_opt_callback is an internal bypass that injects a callback
             # directly, skipping _gpu_engine_callback. We run the query on
             # the CPU engine; in M0 our callback falls through, so the result

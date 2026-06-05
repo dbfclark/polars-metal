@@ -87,3 +87,29 @@ def test_dispatch_builds_struct_column_cosine():
     row = hits[0]
     assert list(row["indices"]) == [0, 2]  # cosine: e0=1.0 then e2=0.707, desc
     assert abs(row["scores"][0] - 1.0) < 1e-5
+
+
+def test_end_to_end_cosine_topk_via_engine():
+    from polars_metal import MetalEngine
+
+    corpus = pl.DataFrame(
+        {"emb": [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.9, 0.1]]},
+        schema={"emb": pl.Array(pl.Float32, 2)},
+    ).lazy()
+    qframe = pl.DataFrame(
+        {"id": [10, 20], "emb": [[1.0, 0.0], [0.0, 1.0]]},
+        schema={"id": pl.Int64, "emb": pl.Array(pl.Float32, 2)},
+    )
+    out = (
+        qframe.lazy()
+        .with_columns(pl.col("emb").metal.cosine_topk(corpus, k=2).alias("hits"))
+        .collect(engine=MetalEngine())
+    )
+
+    assert out.columns == ["id", "emb", "hits"]
+    assert out.get_column("hits").dtype == pl.Struct(
+        {"indices": pl.List(pl.UInt32), "scores": pl.List(pl.Float32)}
+    )
+    # query 0 = [1,0]: nearest is corpus[0]; query 1 = [0,1]: nearest is corpus[1].
+    assert out["hits"][0]["indices"][0] == 0
+    assert out["hits"][1]["indices"][0] == 1
