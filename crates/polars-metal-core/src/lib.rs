@@ -13,6 +13,7 @@ pub mod plan;
 pub mod router;
 mod router_udf;
 mod udf;
+mod fft;
 mod vector_search;
 
 pub use arena::{BumpArena, ScratchArena, StubArena};
