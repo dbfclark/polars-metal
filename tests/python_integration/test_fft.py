@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
 import polars as pl
 import pytest
 
+import polars_metal  # noqa: F401  (registers engine + .metal namespace)
+from polars_metal import MetalEngine, _fft_detect
 from polars_metal import _fft_namespace as fns
 
 
@@ -23,11 +26,8 @@ def test_fft_verb_builds_sentinel_and_raises_on_cpu():
     expr = pl.col("sig").metal.fft()
     j = json.loads(expr.meta.serialize(format="json"))
     assert fns.FFT_SENTINEL_TAG in json.dumps(j)
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError, match="engine='metal'"):
         df.lazy().with_columns(expr.alias("spec")).collect()  # plain CPU → raises
-
-
-from polars_metal import _fft_detect
 
 
 def test_find_fft_bindings_recovers_col_and_op():
@@ -38,3 +38,18 @@ def test_find_fft_bindings_recovers_col_and_op():
     assert bindings[0].out_name == "spec"
     assert bindings[0].input_col == "sig"
     assert bindings[0].op == fns.OP_FFT
+
+
+def test_fft_matches_numpy_end_to_end():
+    rng = np.random.default_rng(0)
+    sig = rng.standard_normal(64).astype(np.float32)
+    df = pl.DataFrame({"sig": sig}, schema={"sig": pl.Float32})
+    out = df.lazy().with_columns(pl.col("sig").metal.fft().alias("spec")).collect(
+        engine=MetalEngine()
+    )
+    spec = out.get_column("spec")
+    got_re = np.asarray(spec.struct.field("real").to_numpy(), dtype=np.float32)
+    got_im = np.asarray(spec.struct.field("imag").to_numpy(), dtype=np.float32)
+    exp = np.fft.fft(sig.astype(np.float32))
+    assert np.allclose(got_re, exp.real, rtol=1e-3, atol=1e-3)
+    assert np.allclose(got_im, exp.imag, rtol=1e-3, atol=1e-3)

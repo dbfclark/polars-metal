@@ -17,6 +17,7 @@ from polars_metal import (
 from polars_metal import (
     _vector_namespace as _vector_namespace_module,  # noqa: F401  (registers .metal)
 )
+from polars_metal import _fft_detect as _fft_detect_module  # noqa: F401  (installs with_columns patch)
 from polars_metal._callback import execute_with_metal
 from polars_metal._engine import MetalEngine
 
@@ -280,6 +281,18 @@ def _patch_gpu_engine_callback() -> None:
                     return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
 
                 return _vector_dispatch.apply_vector_search(self, vector_bindings, _collect_rest_vs)
+            # M6 A3 FFT: serialize-detected .metal.fft()/.ifft() sentinels run on the GPU via
+            # the same collect-and-stitch template. Independent with_columns patch/cache, so it
+            # coexists with rolling + vector search.
+            from polars_metal import _fft_detect, _fft_dispatch
+
+            fft_bindings = [] if streaming else _fft_detect.find_fft_bindings(self)
+            if fft_bindings:
+
+                def _collect_rest_fft(rest_lf: Any) -> Any:
+                    return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
+
+                return _fft_dispatch.apply_fft(self, fft_bindings, _collect_rest_fft)
             # post_opt_callback is an internal bypass that injects a callback
             # directly, skipping _gpu_engine_callback. We run the query on
             # the CPU engine; in M0 our callback falls through, so the result
