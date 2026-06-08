@@ -73,4 +73,15 @@ mod tests {
             assert!(re[k].abs() < 1e-4 && im[k].abs() < 1e-4, "bin {k} not ~0");
         }
     }
+
+    #[test]
+    fn fft_then_ifft_round_trips_via_complex_input() {
+        // Forward FFT a real signal, then inverse-FFT the complex result; recover the signal.
+        let sig = [1.0f32, 0.0, -1.0, 0.0, 1.0, 0.0, -1.0, 0.0];
+        let (fre, fim) = fft_core(FftInput::Real(&sig), 8, false).unwrap();
+        let (ire, _iim) = fft_core(FftInput::Complex(&fre, &fim), 8, true).unwrap();
+        for (a, b) in ire.iter().zip(sig.iter()) {
+            assert!((a - b).abs() < 1e-4, "round-trip differs: {a} vs {b}");
+        }
+    }
 }
