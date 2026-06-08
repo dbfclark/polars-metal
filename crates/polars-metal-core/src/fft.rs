@@ -9,17 +9,12 @@ use polars_metal_mlx_sys::fft::{mlx_complex, mlx_fft, mlx_ifft, mlx_imag, mlx_re
 use polars_metal_mlx_sys::FfiError;
 
 /// Input to `fft_core`: a real F32 signal, or a complex signal as two F32 streams.
-// Task 4 wires these to the `execute_fft` PyO3 binding; allow until then.
-#[allow(dead_code)]
 pub enum FftInput<'a> {
     Real(&'a [f32]),
-    // Task 4: Complex input path used by execute_fft for pre-split real/imag columns.
     Complex(&'a [f32], &'a [f32]),
 }
 
 /// View a host F32 slice as a 1-D `(n,)` MLX array (mirrors `vector_search::view2d`).
-// Task 4: used by execute_fft; allow until the pyfunction registration lands.
-#[allow(dead_code)]
 fn view1d(data: &[f32], n: i64) -> Result<MlxArrayHandle, FfiError> {
     let device = MetalDevice::system_default()
         .map_err(|e| FfiError::Runtime(format!("metal device unavailable: {e}")))?;
@@ -34,8 +29,6 @@ fn view1d(data: &[f32], n: i64) -> Result<MlxArrayHandle, FfiError> {
 
 /// Run a 1-D FFT (or inverse) over the whole signal. Returns `(real_out, imag_out)`,
 /// each length `n`, row order = MLX bin order (matches numpy.fft).
-// Task 4: execute_fft calls this from PyO3; allow until then.
-#[allow(dead_code)]
 pub fn fft_core(
     input: FftInput<'_>,
     n: i64,
@@ -54,6 +47,49 @@ pub fn fft_core(
     let im_out = mlx_imag(&transformed)?;
     mlx_array_eval(&[re_out.clone(), im_out.clone()])?;
     Ok((mlx_array_to_f32_vec(&re_out)?, mlx_array_to_f32_vec(&im_out)?))
+}
+
+use pyo3::prelude::*;
+
+/// PyO3 entry: `_native.execute_fft(real, imag, n, inverse)`.
+/// `real` is `(ptr, len)` of a contiguous F32 stream; `imag` is `Some((ptr,len))` for complex
+/// input (struct column) or `None` for a real signal. Returns `(real_out, imag_out)`, each
+/// length `n`, in MLX/numpy bin order.
+#[pyfunction]
+#[pyo3(signature = (real, imag, n, inverse))]
+pub fn execute_fft(
+    real: (usize, usize),
+    imag: Option<(usize, usize)>,
+    n: i64,
+    inverse: bool,
+) -> PyResult<(Vec<f32>, Vec<f32>)> {
+    let (rptr, rlen) = real;
+    // Guard: the signal length must match the declared n (Python supplies n independently; a
+    // mismatch would make MLX read past the buffer). Reject clearly instead of risking UB.
+    if rlen != n as usize {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "fft: real stream len {rlen} != n {n}"
+        )));
+    }
+    if let Some((_, ilen)) = imag {
+        if ilen != n as usize {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "fft: imag stream len {ilen} != n {n}"
+            )));
+        }
+    }
+    // SAFETY: Python guarantees these point to contiguous F32 arrays of the given lengths, kept
+    // alive (rechunked Series / numpy arrays) for this synchronous call. Read-only; `f32` has no
+    // invalid bit patterns. Mirrors `vector_search::execute_vector_search`.
+    let rslice = unsafe { std::slice::from_raw_parts(rptr as *const f32, rlen) };
+    let result = match imag {
+        None => fft_core(FftInput::Real(rslice), n, inverse),
+        Some((iptr, ilen)) => {
+            let islice = unsafe { std::slice::from_raw_parts(iptr as *const f32, ilen) };
+            fft_core(FftInput::Complex(rslice, islice), n, inverse)
+        }
+    };
+    result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("fft: {e}")))
 }
 
 #[cfg(test)]
