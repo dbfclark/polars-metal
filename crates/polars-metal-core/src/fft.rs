@@ -50,19 +50,21 @@ pub fn fft_core(
 }
 
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 /// PyO3 entry: `_native.execute_fft(real, imag, n, inverse)`.
 /// `real` is `(ptr, len)` of a contiguous F32 stream; `imag` is `Some((ptr,len))` for complex
-/// input (struct column) or `None` for a real signal. Returns `(real_out, imag_out)`, each
-/// length `n`, in MLX/numpy bin order.
+/// input (struct column) or `None` for a real signal. Returns the real and imaginary streams as
+/// raw little-endian f32 bytes; the Python layer reconstructs them with np.frombuffer.
 #[pyfunction]
 #[pyo3(signature = (real, imag, n, inverse))]
 pub fn execute_fft(
+    py: Python<'_>,
     real: (usize, usize),
     imag: Option<(usize, usize)>,
     n: i64,
     inverse: bool,
-) -> PyResult<(Vec<f32>, Vec<f32>)> {
+) -> PyResult<(Bound<'_, PyBytes>, Bound<'_, PyBytes>)> {
     let (rptr, rlen) = real;
     // Guard: the signal length must match the declared n (Python supplies n independently; a
     // mismatch would make MLX read past the buffer). Reject clearly instead of risking UB.
@@ -89,7 +91,16 @@ pub fn execute_fft(
             fft_core(FftInput::Complex(rslice, islice), n, inverse)
         }
     };
-    result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("fft: {e}")))
+    let (re_out, im_out) =
+        result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("fft: {e}")))?;
+    // SAFETY: `f32` is plain-old-data with no padding and no invalid bit patterns; reinterpreting
+    // a &[f32] as &[u8] of 4x the length is sound and read-only. The slices do not outlive
+    // `re_out` / `im_out`, which are alive for the duration of `PyBytes::new_bound` (which copies).
+    let re_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(re_out.as_ptr() as *const u8, re_out.len() * 4) };
+    let im_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(im_out.as_ptr() as *const u8, im_out.len() * 4) };
+    Ok((PyBytes::new_bound(py, re_bytes), PyBytes::new_bound(py, im_bytes)))
 }
 
 #[cfg(test)]

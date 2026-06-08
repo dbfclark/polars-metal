@@ -55,13 +55,10 @@ def _run_binding(df: pl.DataFrame, b: FftBinding) -> pl.Series:
         ).to_struct(b.out_name)
     inverse = b.op == OP_IFFT
     imag_arg = None if im is None else (im.ctypes.data, im.size)
-    real_out, imag_out = _native.execute_fft((re.ctypes.data, re.size), imag_arg, n, inverse)
-    return pl.DataFrame(
-        {
-            "real": np.asarray(real_out, dtype=np.float32),
-            "imag": np.asarray(imag_out, dtype=np.float32),
-        }
-    ).to_struct(b.out_name)
+    real_bytes, imag_bytes = _native.execute_fft((re.ctypes.data, re.size), imag_arg, n, inverse)
+    real_out = np.frombuffer(real_bytes, dtype=np.float32)
+    imag_out = np.frombuffer(imag_bytes, dtype=np.float32)
+    return pl.DataFrame({"real": real_out, "imag": imag_out}).to_struct(b.out_name)
 
 
 def apply_fft(lf: pl.LazyFrame, bindings: list[FftBinding], collect_fn) -> pl.DataFrame:
