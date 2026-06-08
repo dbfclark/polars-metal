@@ -292,6 +292,11 @@ mod ffi {
 
         fn mlx_op_real(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
         fn mlx_op_imag(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_complex(
+            re: &SharedPtr<MlxArray>,
+            im: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
     }
 }
 

@@ -70,3 +70,16 @@ fn fft_ifft_round_trip() {
         assert!(close(*a, *b, TOL), "fft round-trip differs: {} vs {}", a, b);
     }
 }
+
+#[test]
+fn complex_from_re_im_round_trips_through_real_imag() {
+    // Assemble complex64 from re=[1,2,3], im=[4,5,6]; real()/imag() must recover them.
+    let re = mlx_array_from_f32_slice(&[1.0, 2.0, 3.0]).unwrap();
+    let im = mlx_array_from_f32_slice(&[4.0, 5.0, 6.0]).unwrap();
+    let c = mlx_complex(&re, &im).unwrap();
+    let r = mlx_real(&c).unwrap();
+    let i = mlx_imag(&c).unwrap();
+    mlx_array_eval(&[r.clone(), i.clone()]).unwrap();
+    assert_eq!(mlx_array_to_f32_vec(&r).unwrap(), vec![1.0, 2.0, 3.0]);
+    assert_eq!(mlx_array_to_f32_vec(&i).unwrap(), vec![4.0, 5.0, 6.0]);
+}

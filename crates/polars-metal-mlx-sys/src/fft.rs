@@ -45,3 +45,15 @@ pub fn mlx_imag(a: &MlxArrayHandle) -> Result<MlxArrayHandle, FfiError> {
         _input_refs: a._input_refs.clone(),
     })
 }
+
+/// Assemble a complex64 array from two real F32 arrays (`re + i*im`). The inputs
+/// must have identical shape; use `mlx_real`/`mlx_imag` to split the result back.
+pub fn mlx_complex(re: &MlxArrayHandle, im: &MlxArrayHandle) -> Result<MlxArrayHandle, FfiError> {
+    let ptr = ffi::mlx_op_complex(&re.ptr, &im.ptr).map_err(FfiError::from)?;
+    let mut refs = re._input_refs.clone();
+    refs.extend(im._input_refs.iter().cloned());
+    Ok(MlxArrayHandle {
+        ptr,
+        _input_refs: refs,
+    })
+}

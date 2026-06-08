@@ -513,6 +513,17 @@ std::shared_ptr<MlxArray> mlx_op_ifft_1d(const std::shared_ptr<MlxArray>& a) {
 MLX_WRAP_UNOP(mlx_op_real, real)
 MLX_WRAP_UNOP(mlx_op_imag, imag)
 
+std::shared_ptr<MlxArray> mlx_op_complex(
+    const std::shared_ptr<MlxArray>& re,
+    const std::shared_ptr<MlxArray>& im) {
+    auto re_c = mlx::core::astype(*re, mlx::core::complex64);
+    auto im_c = mlx::core::astype(*im, mlx::core::complex64);
+    auto i_unit = mlx::core::array(mlx::core::complex64_t{0.0f, 1.0f});
+    auto base = std::make_shared<mlx::core::array>(
+        mlx::core::add(re_c, mlx::core::multiply(im_c, i_unit)));
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
 #undef MLX_WRAP_BINOP
 #undef MLX_WRAP_UNOP
 
