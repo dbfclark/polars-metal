@@ -53,3 +53,52 @@ def test_fft_matches_numpy_end_to_end():
     exp = np.fft.fft(sig.astype(np.float32))
     assert np.allclose(got_re, exp.real, rtol=1e-3, atol=1e-3)
     assert np.allclose(got_im, exp.imag, rtol=1e-3, atol=1e-3)
+
+
+def test_ifft_matches_numpy_real_input():
+    rng = np.random.default_rng(1)
+    sig = rng.standard_normal(128).astype(np.float32)
+    df = pl.DataFrame({"sig": sig}, schema={"sig": pl.Float32})
+    out = df.lazy().with_columns(pl.col("sig").metal.ifft().alias("out")).collect(
+        engine=MetalEngine()
+    )
+    spec = out.get_column("out")
+    got = np.asarray(spec.struct.field("real").to_numpy(), np.float32) + 1j * np.asarray(
+        spec.struct.field("imag").to_numpy(), np.float32
+    )
+    exp = np.fft.ifft(sig.astype(np.float32))
+    assert np.allclose(got.real, exp.real, rtol=1e-3, atol=1e-3)
+    assert np.allclose(got.imag, exp.imag, rtol=1e-3, atol=1e-3)
+
+
+def test_fft_then_ifft_round_trip_struct_input():
+    rng = np.random.default_rng(2)
+    sig = rng.standard_normal(256).astype(np.float32)
+    df = pl.DataFrame({"sig": sig}, schema={"sig": pl.Float32})
+    spec_df = df.lazy().with_columns(pl.col("sig").metal.fft().alias("spec")).collect(
+        engine=MetalEngine()
+    )
+    rec = spec_df.lazy().with_columns(pl.col("spec").metal.ifft().alias("rec")).collect(
+        engine=MetalEngine()
+    )
+    got = np.asarray(rec.get_column("rec").struct.field("real").to_numpy(), np.float32)
+    assert np.allclose(got, sig, rtol=1e-3, atol=1e-3)
+
+
+def test_fft_non_f32_raises():
+    df = pl.DataFrame({"sig": [1, 2, 3, 4]}, schema={"sig": pl.Int64})
+    with pytest.raises(ValueError):
+        df.lazy().with_columns(pl.col("sig").metal.fft().alias("o")).collect(engine=MetalEngine())
+
+
+def test_fft_nulls_raise():
+    df = pl.DataFrame({"sig": [1.0, None, 3.0, 4.0]}, schema={"sig": pl.Float32})
+    with pytest.raises(ValueError):
+        df.lazy().with_columns(pl.col("sig").metal.fft().alias("o")).collect(engine=MetalEngine())
+
+
+def test_fft_empty_column():
+    df = pl.DataFrame({"sig": []}, schema={"sig": pl.Float32})
+    out = df.lazy().with_columns(pl.col("sig").metal.fft().alias("o")).collect(engine=MetalEngine())
+    assert out.get_column("o").len() == 0
+    assert isinstance(out.get_column("o").dtype, pl.Struct)
