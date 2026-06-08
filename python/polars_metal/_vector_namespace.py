@@ -21,6 +21,8 @@ from typing import Any
 
 import polars as pl
 
+from polars_metal import _fft_namespace
+
 _HANDLE_COUNTER = itertools.count(1)
 
 
@@ -113,3 +115,20 @@ class MetalExprNamespace:
         qcol = self._query_col_name()
         handle = _capture_corpus(corpus, corpus_col, k, "knn", qcol)
         return build_sentinel(self._expr, qcol, handle)
+
+    def _input_col(self) -> str:
+        roots = self._expr.meta.root_names()
+        if len(roots) != 1:
+            raise ValueError(
+                "polars_metal: .metal.fft/.ifft must be applied to a single column "
+                f"(got roots {roots})."
+            )
+        return roots[0]
+
+    def fft(self) -> pl.Expr:
+        col = self._input_col()
+        return _fft_namespace.build_fft_sentinel(self._expr, col, _fft_namespace.OP_FFT)
+
+    def ifft(self) -> pl.Expr:
+        col = self._input_col()
+        return _fft_namespace.build_fft_sentinel(self._expr, col, _fft_namespace.OP_IFFT)
