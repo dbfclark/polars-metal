@@ -50,8 +50,14 @@ pub fn fft_gpu(
     let lib = shared_library(device)?;
     let pso = lib.pipeline("fft_stockham_pow2_f32")?;
     let mut queue = CommandQueue::new(device)?;
-    // One threadgroup; width = min(n, base). The kernel strides by tg_size.
-    let tg = (n as usize).min(1024);
+    // This kernel REQUIRES exactly one threadgroup: all log2(n) butterfly
+    // stages run in per-threadgroup memory, so a second threadgroup would
+    // transform uninitialized data. dispatch_1d_with_tg sets grid_width =
+    // tg_width = tg here, and n <= FFT_BASE_MAX (1024) <= the PSO's
+    // maxTotalThreadsPerThreadgroup on Apple Silicon, so the width clamp
+    // never splits this into multiple threadgroups. The kernel strides by
+    // tg_size to cover all n points.
+    let tg = (n as usize).min(FFT_BASE_MAX as usize);
     queue.dispatch_1d_with_tg(&pso, &[&in_buf, &out_buf, &n_buf, &inv_buf], tg, tg)?;
     queue.wait_until_complete()?;
     Ok(out_buf.to_f32_vec())
