@@ -571,7 +571,12 @@ fn compact_one_column(
         // filter compaction path — filter is CPU-routed for these and the
         // walker should never lift a filter over such a column. Surface as
         // PyNotImplementedError so a router bug is visible.
-        MetalDtype::I8 | MetalDtype::I16 | MetalDtype::U8 | MetalDtype::U16 | MetalDtype::U32 => {
+        MetalDtype::I8
+        | MetalDtype::I16
+        | MetalDtype::U8
+        | MetalDtype::U16
+        | MetalDtype::U32
+        | MetalDtype::U64 => {
             Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
                 "polars_metal: filter compaction for {column_name:?} ({dtype:?}) not supported; filter should route CPU"
             )))
@@ -1389,8 +1394,15 @@ pub fn parse_groupby_plan(plan: &Bound<PyDict>) -> Result<ParsedGroupByPlan, Gro
 }
 
 /// Map a [`MetalDtype`] (plan layer) to the kernel-layer [`KeyDtype`].
-fn metal_dtype_to_key_dtype(d: MetalDtype) -> KeyDtype {
-    match d {
+///
+/// Returns `Err` for dtypes that have no groupby-key encoding. The only such
+/// case today is `U64`: the composite-key encoder has no 64-bit-unsigned
+/// `KeyDtype`, and the groupby kernel is conformance-only (Non-goals — not
+/// extended). The Python walker already gates U64 keys to CPU fallback, so
+/// this arm is defensive: if a router bug ever lifts a U64-key groupby, we
+/// surface a clear error rather than mis-encoding or panicking.
+fn metal_dtype_to_key_dtype(d: MetalDtype) -> Result<KeyDtype, String> {
+    Ok(match d {
         MetalDtype::I64 => KeyDtype::I64,
         MetalDtype::F64 => KeyDtype::F64,
         MetalDtype::Bool => KeyDtype::Bool,
@@ -1402,7 +1414,14 @@ fn metal_dtype_to_key_dtype(d: MetalDtype) -> KeyDtype {
         MetalDtype::U16 => KeyDtype::U16,
         MetalDtype::U32 => KeyDtype::U32,
         MetalDtype::Utf8 => KeyDtype::Utf8,
-    }
+        MetalDtype::U64 => {
+            return Err(
+                "groupby key dtype UInt64 has no composite-key encoding (groupby is \
+                 conformance-only and not extended); should route CPU at the walker"
+                    .to_string(),
+            )
+        }
+    })
 }
 
 /// Build the `(AggKind, ValueColumn<'a>)` pair for a single agg request,
@@ -2121,16 +2140,18 @@ pub fn execute_groupby<'py>(
                 Some((codes_bytes, dict)) => (codes_bytes.as_slice(), Some(dict.clone())),
                 None => (*data, None),
             };
-            KeyColumn {
+            Ok(KeyColumn {
                 name: k.name.clone(),
-                dtype: metal_dtype_to_key_dtype(k.dtype),
+                dtype: metal_dtype_to_key_dtype(k.dtype).map_err(|e| {
+                    pyo3::exceptions::PyNotImplementedError::new_err(format!("polars_metal: {e}"))
+                })?,
                 data: data_slice,
                 valid,
                 n_rows,
                 dict,
-            }
+            })
         })
-        .collect();
+        .collect::<PyResult<Vec<KeyColumn<'_>>>>()?;
 
     // 4. Build the routing-input view: each agg's value-column byte/dtype
     //    triple, keyed by column name. The fused path consumes a HashMap of

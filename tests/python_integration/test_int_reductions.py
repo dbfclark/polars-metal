@@ -145,39 +145,12 @@ def test_int_minmax_byte_exact_no_nulls(dtype, op):
     assert got["r"].dtype == dtype
 
 
-# UInt64 is admitted by the B2 reduction analyzer (sum/min/max → "U64"), but a
-# UInt64 *input column* never reaches the fused path: `_walker._map_dtype` has no
-# UInt64 arm (it maps UInt8..UInt32 but stops short of UInt64), so the upstream
-# DataFrameScan node falls back to CPU before the fused reduction can dispatch.
-# Result: byte-exact (CPU fallback is correct) but dispatch==0, not 1. Fixing it
-# safely is out of B2 Task 5's (test-only, Python-only) scope — `_map_dtype` is
-# shared with the non-fused execute_plan/filter/groupby paths whose Rust side
-# (`udf.rs::str_to_dtype`) also lacks "U64", so a blanket map edit would route a
-# plain UInt64 projection into Rust and raise instead of falling back. Tracked as
-# a follow-up (add a UInt64 arm to `_map_dtype` + the Rust dtype tag, or a
-# fused-only Scan-gate). Int32/Int64/UInt32 still genuinely exercise the GPU int
-# path, satisfying the B2 exit bar's "≥1 GPU case".
-_GPU_PATH_XFAIL = {pl.UInt64}
-
-
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        pytest.param(
-            d,
-            marks=pytest.mark.xfail(
-                reason="UInt64 input column falls back at the DataFrameScan gate "
-                "(_walker._map_dtype has no UInt64 arm); admitted by the reduction "
-                "analyzer but never reaches the fused path — byte-exact via CPU, "
-                "but dispatch==0. See comment above.",
-                strict=True,
-            ),
-        )
-        if d in _GPU_PATH_XFAIL
-        else d
-        for d in _SUM_DTYPES
-    ],
-)
+# M6: `_walker._map_dtype` now maps all 8 integer widths (UInt64 → "U64"), and
+# the Rust `MetalDtype` enum + `from_wire` gained the matching "U64" arm, so a
+# UInt64 input column is recognized at the DataFrameScan gate and reaches the
+# fused GPU reduction path (the reduction analyzer already admits UInt64
+# sum/min/max). All of _SUM_DTYPES now genuinely exercise the GPU int path.
+@pytest.mark.parametrize("dtype", _SUM_DTYPES)
 def test_int_chain_sum_gpu_path(dtype):
     # Chain → is_chain=True → routes to GPU. Proves the GPU int-reduction path
     # (dispatch count == 1) AND byte-exact dtype/value.

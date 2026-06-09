@@ -1169,6 +1169,13 @@ def _walk_group_by(nt: Any, node: Any) -> WalkResult:
         mapped = _map_dtype(dtype)
         if mapped is None:
             return FallBack(reason=f"unsupported dtype {dtype!s} on key {key_name!r}")
+        # UInt64 is a valid scan/projection/reduction dtype (M6) but the
+        # groupby composite-key encoder has no 64-bit-unsigned KeyDtype, and
+        # the groupby kernel is conformance-only — not extended (Non-goals).
+        # A U64 *key* therefore falls back to CPU. (U64 still reaches the
+        # fused reduction path; only the groupby-key role is excluded.)
+        if mapped == "U64":
+            return FallBack(reason=f"GroupBy key {key_name!r} is UInt64; not supported")
         keys.append([str(key_name), mapped])
 
     aggs: list[dict[str, str]] = []
@@ -1512,6 +1519,9 @@ def _map_dtype(dt: Any) -> str | None:
 
     M2 set: Int64, Float64, Boolean, Int32, Float32.
     M3 adds: Int8, Int16, UInt8, UInt16, UInt32 (capability F).
+    M6 adds: UInt64 — completes the 8 integer widths so a UInt64 column is
+    recognized at the DataFrameScan gate and can reach the fused GPU path
+    (the reduction analyzer already admits UInt64 sum/min/max).
     M3 Phase 7 (Task 34) adds: String (pl.Utf8) — dictionary-encoded as
     a key column. py-1.40.1 reports ``str(pl.Utf8) == "String"``; older
     Polars reported ``"Utf8"`` — accept both for forward/back compat.
@@ -1538,6 +1548,8 @@ def _map_dtype(dt: Any) -> str | None:
         return "U16"
     if s == "UInt32":
         return "U32"
+    if s == "UInt64":
+        return "U64"
     if s in ("String", "Utf8"):
         return "Utf8"
     if s == "Date":

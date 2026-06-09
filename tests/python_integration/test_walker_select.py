@@ -85,17 +85,22 @@ def test_walker_actually_routes_supported_query_via_router(caplog) -> None:
 
 
 def test_walker_falls_back_for_unsupported_dtype(caplog) -> None:
-    """Mirror of the previous test: with an unsupported dtype (UInt64, which
-    is outside the M3 closed set) we must FallBack — no UDF install line
-    in the log.
+    """Mirror of the previous test: with an unsupported dtype (Time, which is
+    outside the closed set) we must FallBack — no UDF install line in the log.
 
     Note: String/Utf8 was unsupported in M2/early-M3 but moved into the
-    closed set as a key-only dtype in M3 Phase 7 (Task 34). UInt64 takes
-    over as the canonical "unsupported numeric dtype" sentinel.
+    closed set as a key-only dtype in M3 Phase 7 (Task 34). UInt64 was the
+    canonical "unsupported numeric dtype" sentinel through M5, but M6 added a
+    UInt64 arm to ``_map_dtype`` (completing the 8 integer widths so UInt64
+    reaches the fused GPU path), so it is now *supported*. ``pl.Time`` takes
+    over as the canonical unsupported-dtype sentinel.
     """
     caplog.set_level(logging.DEBUG, logger="polars_metal")
-    df = pl.DataFrame({"a": [1, 2, 3], "u": [10, 20, 30]}, schema={"a": pl.Int64, "u": pl.UInt64})
-    _ = df.lazy().select(["u", "a"]).collect(engine=polars_metal.MetalEngine(debug=True))
+    df = pl.DataFrame(
+        {"a": [1, 2, 3], "t": [0, 1, 2]},
+        schema={"a": pl.Int64, "t": pl.Time},
+    )
+    _ = df.lazy().select(["t", "a"]).collect(engine=polars_metal.MetalEngine(debug=True))
     msgs = [r.getMessage() for r in caplog.records if r.name == "polars_metal"]
     assert any("walker fallback" in m for m in msgs), msgs
     assert not any("installed UDF" in m for m in msgs), msgs
