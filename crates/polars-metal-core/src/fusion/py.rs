@@ -172,6 +172,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod add_input_tests {
+    #![allow(clippy::expect_used)]
+
     use super::PyFusionScope;
 
     #[test]
@@ -180,7 +182,7 @@ mod add_input_tests {
             let mut scope = PyFusionScope::new();
             scope
                 .add_input("c", s)
-                .unwrap_or_else(|_| panic!("dtype {s} should parse"));
+                .expect("int dtype string should parse");
         }
     }
 }

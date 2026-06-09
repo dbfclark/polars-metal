@@ -1,4 +1,6 @@
 // crates/polars-metal-mlx-sys/tests/test_int_readback.rs
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use std::sync::Arc;
 
 use polars_metal_buffer::{MetalBuffer, MetalDevice};
