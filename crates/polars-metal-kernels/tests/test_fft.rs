@@ -176,6 +176,40 @@ fn fourstep_inverse_and_roundtrip() {
 }
 
 #[test]
+fn recursive_fourstep_broken_band_and_beyond() {
+    let device = MetalDevice::system_default().expect("device");
+    for pow in [21u32, 22, 23, 24, 25] {
+        // > 2^20 → needs recursion; MLX is broken here (ml-explore/mlx#1800).
+        let n = 1usize << pow;
+        let sig = interleaved_signal(n, pow as u64);
+        let got = fft_gpu(&device, &sig, n as i64, false).expect("fft");
+        let exp = host_fft_f64(&sig, n, false);
+        let err = l2_rel_err(&got, &exp);
+        assert!(err < 1e-3, "2^{pow} L2 {err}");
+    }
+}
+
+#[test]
+fn recursive_fourstep_inverse_broken_band() {
+    let device = MetalDevice::system_default().expect("device");
+    // Inverse / round-trip in the recursion band (one and two recursion levels).
+    for pow in [21u32, 22] {
+        let n = 1usize << pow;
+        let sig = interleaved_signal(n, 2000 + pow as u64);
+        // inverse vs the f64 oracle
+        let inv = fft_gpu(&device, &sig, n as i64, true).expect("ifft");
+        let exp = host_fft_f64(&sig, n, true);
+        let err = l2_rel_err(&inv, &exp);
+        assert!(err < 1e-3, "2^{pow} ifft L2 {err}");
+        // round-trip ifft(fft(x)) ≈ x
+        let fwd = fft_gpu(&device, &sig, n as i64, false).expect("fft");
+        let back = fft_gpu(&device, &fwd, n as i64, true).expect("ifft");
+        let rerr = l2_rel_err(&back, &sig);
+        assert!(rerr < 1e-3, "2^{pow} roundtrip L2 {rerr}");
+    }
+}
+
+#[test]
 fn radix2_inverse_and_roundtrip() {
     let device = MetalDevice::system_default().expect("device");
     // sizes within the single-threadgroup base path (n <= FFT_BASE_MAX = 1024);

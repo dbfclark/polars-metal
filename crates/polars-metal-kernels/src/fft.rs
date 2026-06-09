@@ -75,10 +75,12 @@ pub fn fft_gpu(
         return Err(FftError::Unsupported(n));
     }
     if n > FFT_BASE_MAX {
-        // Larger sizes route to the four-step path (this task) when pow2 and
-        // both factors fit; otherwise unsupported until later tasks.
+        // Larger sizes route to the recursive batched four-step path when pow2;
+        // otherwise unsupported until later tasks. The recursion handles both
+        // the single-level band (2^11..2^20) and the previously-broken
+        // 2^21..2^25 band (where MLX returns garbage, ml-explore/mlx#1800).
         if (n & (n - 1)) == 0 {
-            return fft_fourstep(device, input, n, inverse);
+            return fft_recursive_fourstep(device, input, n, inverse);
         }
         return Err(FftError::Unsupported(n));
     }
@@ -134,40 +136,30 @@ pub fn fft_gpu(
     Ok(out_buf.to_f32_vec())
 }
 
-/// Bailey's four-step FFT for power-of-two `n` with `FFT_BASE_MAX < n <=
-/// FFT_BASE_MAX^2` (= 2^20). Factor `n = 2^p` as `n1 = 2^(p/2)`,
-/// `n2 = 2^(p - p/2)`, so both factors are `<= FFT_BASE_MAX` for `p <= 20`.
+/// Maximum four-step recursion depth before bailing to [`FftError::Unsupported`].
+/// With `l1 = FFT_BASE_MAX = 2^10` chosen at every level, each level reduces the
+/// signal length by `2^10`, so depth `d` covers up to `2^(10*(d+1))`. Depth 6
+/// covers `2^70` — astronomically beyond any size that fits in memory; the guard
+/// exists only to make accidental non-termination a clean error, not a hang.
+const FFT_MAX_RECURSION_DEPTH: u32 = 6;
+
+/// Recursive batched Bailey four-step FFT for power-of-two `n > FFT_BASE_MAX`.
 ///
-/// View the input as an `n1 x n2` row-major matrix and run:
-/// (1) length-`n1` column FFTs, (2) the `W_N^{i*j}` cross-twiddle,
-/// (3) length-`n2` row FFTs, (4) an `n1 x n2 -> n2 x n1` transpose. The
-/// sub-FFTs are forward-only; inverse is handled by conjugating the input
-/// host-side, running the forward four-step, then conjugating and scaling by
-/// `1/N` on readback (`ifft(x) = conj(fft(conj(x)))/N`).
-///
-/// The four passes are data-dependent, so we `wait_until_complete` after each
-/// dispatch before issuing the next — both for correctness (later passes read
-/// the prior pass's output) and so per-pass GPU errors surface (the queue only
-/// tracks the most-recently-committed command buffer; see `command.rs`).
-fn fft_fourstep(
+/// Stages the (optionally conjugated) input into a data buffer, allocates a
+/// same-size scratch for the non-in-place per-signal transpose, runs
+/// [`fft_pass`] (forward-only) over the single length-`n` signal, then reads
+/// back. Inverse is handled at this boundary: `ifft(x) = conj(fft(conj(x)))/N`
+/// — conjugate the input host-side, run the forward recursion, then conjugate
+/// and scale by `1/N` on readback. This UNIFIES the old single-level
+/// (2^11..2^20) four-step with the recursive (2^21..2^25) path: the former is
+/// one recursion level, the latter two or more.
+fn fft_recursive_fourstep(
     device: &MetalDevice,
     input: &[f32],
     n: i64,
     inverse: bool,
 ) -> Result<Vec<f32>, FftError> {
-    // p = log2(n); split p into p1 = p/2, p2 = p - p1.
-    let p = (n as u64).trailing_zeros();
-    let p1 = p / 2;
-    let p2 = p - p1;
-    let n1 = 1u32 << p1;
-    let n2 = 1u32 << p2;
-    // n1*n2 == n by construction (p1 + p2 == p); assert it to document the
-    // invariant the column/row/transpose passes rely on.
-    debug_assert_eq!((n1 as i64) * (n2 as i64), n);
-    if i64::from(n1) > FFT_BASE_MAX || i64::from(n2) > FFT_BASE_MAX {
-        // p > 20: a factor exceeds the base cap; recursive path is Task 5.
-        return Err(FftError::Unsupported(n));
-    }
+    debug_assert_eq!((n & (n - 1)), 0, "fft_recursive_fourstep requires pow2 n");
     let ntot = n as usize;
 
     // Stage the (optionally conjugated) input into the data buffer.
@@ -177,48 +169,24 @@ fn fft_fourstep(
             c[1] = -c[1];
         }
     }
-    let data_buf = MetalBuffer::from_f32_slice(device, &staged)?;
-    let trans_buf = device.new_buffer_zeroed(2 * ntot * std::mem::size_of::<f32>())?;
-    let n1_buf = device.new_buffer_from_bytes(&n1.to_le_bytes())?;
-    let n2_buf = device.new_buffer_from_bytes(&n2.to_le_bytes())?;
-    let ntot_buf = device.new_buffer_from_bytes(&(ntot as u32).to_le_bytes())?;
+    let mut data_buf = MetalBuffer::from_f32_slice(device, &staged)?;
+    let mut scratch_buf = device.new_buffer_zeroed(2 * ntot * std::mem::size_of::<f32>())?;
 
     let lib = shared_library(device)?;
     let mut queue = CommandQueue::new(device)?;
 
-    // Pass 1: column FFTs — n2 threadgroups, each width <= n1 (the column len).
-    let cols_pso = lib.pipeline("fft_fourstep_cols")?;
-    let col_tg = n1 as usize;
-    queue.dispatch_1d_with_tg(
-        &cols_pso,
-        &[&data_buf, &n1_buf, &n2_buf],
-        n2 as usize * col_tg,
-        col_tg,
+    fft_pass(
+        lib,
+        &mut queue,
+        device,
+        &mut data_buf,
+        &mut scratch_buf,
+        ntot,
+        1,
+        0,
     )?;
-    queue.wait_until_complete()?;
 
-    // Pass 2: elementwise cross-twiddle over all N elements.
-    let tw_pso = lib.pipeline("fft_twiddle_mul")?;
-    queue.dispatch_1d(&tw_pso, &[&data_buf, &n2_buf, &ntot_buf], ntot)?;
-    queue.wait_until_complete()?;
-
-    // Pass 3: row FFTs — n1 threadgroups, each width <= n2 (the row len).
-    let rows_pso = lib.pipeline("fft_fourstep_rows")?;
-    let row_tg = n2 as usize;
-    queue.dispatch_1d_with_tg(
-        &rows_pso,
-        &[&data_buf, &n1_buf, &n2_buf],
-        n1 as usize * row_tg,
-        row_tg,
-    )?;
-    queue.wait_until_complete()?;
-
-    // Pass 4: transpose n1 x n2 -> n2 x n1 into the scratch buffer.
-    let tr_pso = lib.pipeline("fft_transpose")?;
-    queue.dispatch_1d(&tr_pso, &[&data_buf, &trans_buf, &n1_buf, &n2_buf], ntot)?;
-    queue.wait_until_complete()?;
-
-    let mut out = trans_buf.to_f32_vec();
+    let mut out = data_buf.to_f32_vec();
     if inverse {
         // ifft = conj(fft(conj(x)))/N: conjugate + scale by 1/N on readback.
         let scale = 1.0f32 / n as f32;
@@ -228,6 +196,105 @@ fn fft_fourstep(
         }
     }
     Ok(out)
+}
+
+/// Forward-only recursive batched four-step over `batch` contiguous signals,
+/// each length `len` (pow2), packed back-to-back in `data` (signal `s` occupies
+/// `data[s*len .. (s+1)*len]`). Result is written in place into `data`.
+///
+/// Base case (`len <= FFT_BASE_MAX`): dispatch `batch` threadgroups, one per
+/// signal, running the batched single-threadgroup Stockham.
+///
+/// Recursive case: four-step each signal as `l1 x l2` row-major (`l1 =
+/// FFT_BASE_MAX`, `l2 = len/l1`, both pow2, `l2 >= 2`):
+///   1. column FFTs (length `l1`, strided) — `batch*l2` threadgroups,
+///   2. cross-twiddle `W_len^{i*j}` (modulus = `len`, the CURRENT sub-length),
+///   3. row FFTs (length `l2`) — RECURSE: the `l1` contiguous rows of every
+///      signal form `batch*l1` contiguous length-`l2` signals at `data[0]`,
+///   4. per-signal transpose `l1 x l2 -> l2 x l1` into `scratch`, then copy
+///      `scratch -> data`.
+///
+/// Passes are data-dependent: `wait_until_complete` after each so later passes
+/// read the prior output and per-pass GPU errors surface (the queue tracks only
+/// the last command buffer; see `command.rs`).
+///
+/// `scratch` must be the same byte size as `data`; it is reused at every
+/// recursion level for the transpose (the recursive row call runs in place on
+/// `data`, using `scratch` for its own deeper transposes — disjoint in time).
+#[allow(clippy::too_many_arguments)]
+fn fft_pass(
+    lib: &crate::shader_lib::ShaderLibrary,
+    queue: &mut CommandQueue,
+    device: &MetalDevice,
+    data: &mut MetalBuffer,
+    scratch: &mut MetalBuffer,
+    len: usize,
+    batch: usize,
+    depth: u32,
+) -> Result<(), FftError> {
+    if depth > FFT_MAX_RECURSION_DEPTH {
+        return Err(FftError::Unsupported(len as i64));
+    }
+
+    if len as i64 <= FFT_BASE_MAX {
+        // Base case: one threadgroup per signal, contiguous length-len Stockham.
+        let len_buf = device.new_buffer_from_bytes(&(len as u32).to_le_bytes())?;
+        let pso = lib.pipeline("fft_stockham_pow2_batched")?;
+        // Threadgroup width = len (the signal cooperatively transformed by its
+        // group); grid = batch * len so each group covers one signal. Both
+        // <= FFT_BASE_MAX <= maxTotalThreadsPerThreadgroup on Apple Silicon.
+        queue.dispatch_1d_with_tg(&pso, &[data, &len_buf], batch * len, len)?;
+        queue.wait_until_complete()?;
+        return Ok(());
+    }
+
+    // Four-step: l1 = FFT_BASE_MAX (= 2^10), l2 = len / l1 (pow2, >= 2). If
+    // l2 > FFT_BASE_MAX the recursion four-steps it again.
+    let l1 = FFT_BASE_MAX as usize;
+    let l2 = len / l1;
+    debug_assert_eq!(l1 * l2, len, "l1*l2 must equal len");
+    debug_assert!(l2 >= 2, "l2 must be >= 2 (len > FFT_BASE_MAX)");
+
+    let l1_buf = device.new_buffer_from_bytes(&(l1 as u32).to_le_bytes())?;
+    let l2_buf = device.new_buffer_from_bytes(&(l2 as u32).to_le_bytes())?;
+    let len_buf = device.new_buffer_from_bytes(&(len as u32).to_le_bytes())?;
+    let batch_buf = device.new_buffer_from_bytes(&(batch as u32).to_le_bytes())?;
+
+    // Pass 1: column FFTs — batch*l2 threadgroups, width l1 (<= FFT_BASE_MAX).
+    let cols_pso = lib.pipeline("fft_fourstep_cols")?;
+    queue.dispatch_1d_with_tg(
+        &cols_pso,
+        &[data, &l1_buf, &l2_buf, &batch_buf],
+        batch * l2 * l1,
+        l1,
+    )?;
+    queue.wait_until_complete()?;
+
+    // Pass 2: cross-twiddle over all batch*len elements (modulus = len).
+    let tw_pso = lib.pipeline("fft_twiddle_mul")?;
+    queue.dispatch_1d(&tw_pso, &[data, &l2_buf, &len_buf, &batch_buf], batch * len)?;
+    queue.wait_until_complete()?;
+
+    // Pass 3: row FFTs — RECURSE. The l1 contiguous rows of length l2 across all
+    // batch signals are batch*l1 contiguous length-l2 signals starting at data[0].
+    fft_pass(lib, queue, device, data, scratch, l2, batch * l1, depth + 1)?;
+
+    // Pass 4: per-signal transpose l1 x l2 -> l2 x l1 into scratch, then copy
+    // scratch -> data. Transpose is NOT in-place, hence the separate buffer.
+    let tr_pso = lib.pipeline("fft_transpose")?;
+    queue.dispatch_1d(
+        &tr_pso,
+        &[data, scratch, &l1_buf, &l2_buf, &batch_buf],
+        batch * len,
+    )?;
+    queue.wait_until_complete()?;
+
+    let count_buf = device.new_buffer_from_bytes(&((batch * len) as u32).to_le_bytes())?;
+    let copy_pso = lib.pipeline("fft_copy")?;
+    queue.dispatch_1d(&copy_pso, &[scratch, data, &count_buf], batch * len)?;
+    queue.wait_until_complete()?;
+
+    Ok(())
 }
 
 /// Naive O(N^2) DFT over interleaved-complex input `[re0,im0,re1,im1,...]`.

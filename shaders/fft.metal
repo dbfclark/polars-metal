@@ -50,89 +50,124 @@ inline void stockham_pow2_tg(threadgroup float2* a, threadgroup float2* b,
     }
 }
 
-// ============================ Four-step FFT ============================
-// For N = n1*n2 (both pow2, each <= FFT_BASE_MAX), view interleaved input as an
-// n1 x n2 row-major matrix M[i][j] = x[i*n2 + j]. Bailey's four-step:
-//   1. fft_fourstep_cols : length-n1 FFT down each of the n2 columns (stride n2)
-//   2. fft_twiddle_mul   : multiply element at flat idx=i*n2+j by W_N^{i*j}
-//   3. fft_fourstep_rows : length-n2 FFT across each of the n1 rows (contiguous)
-//   4. fft_transpose     : out[j*n1 + i] = in[i*n2 + j]   (n1 x n2 -> n2 x n1)
-// All sub-FFTs are FORWARD-only; the driver applies inverse via boundary
-// conjugation (host-side) + a single 1/N on readback.
+// ===================== Recursive batched four-step FFT =====================
+// The Rust driver (`fft_pass` in fft.rs) transforms `batch` contiguous signals,
+// each length `len` (pow2). When len <= FFT_BASE_MAX it dispatches the batched
+// base kernel `fft_stockham_pow2_batched`. Otherwise it four-steps each signal
+// with l1 x l2 (l1 = min(1024, ...) <= FFT_BASE_MAX, l2 = len/l1), recursing on
+// the length-l2 row FFTs. All sub-FFTs here are FORWARD-only; the driver applies
+// inverse via boundary conjugation (host-side) + a single 1/N on readback.
 //
-// Each of cols/rows is dispatched as (n_groups * tg_width) threads with
-// threadgroup width tg_width, so threadgroup_position_in_grid selects the
-// column/row. Each threadgroup owns a disjoint column/row, loads it fully into
-// tg memory before writing, so in-place over the shared data buffer is safe.
+// LAYOUT per recursion level (one signal s of length len = l1*l2, row-major):
+//   element (i,j) lives at  buf[s*len + i*l2 + j]   (i in [0,l1), j in [0,l2))
+//   1. COLUMN FFTs  (fft_fourstep_cols)  length l1, stride l2: batch*l2 groups,
+//      group g -> signal s=g/l2, col c=g%l2.
+//   2. TWIDDLE      (fft_twiddle_mul)    over batch*len: (s,i,j) -> *= W_len^{i*j}
+//      with modulus = len (the CURRENT sub-signal length, NOT the top-level N).
+//   3. ROW FFTs     (recurse)            the l1 contiguous rows of length l2 of
+//      every signal form batch*l1 contiguous length-l2 signals at buf[0].
+//   4. TRANSPOSE    (fft_transpose)      per signal l1 x l2 -> l2 x l1, NOT
+//      in-place: out[s*len + j*l1 + i] = in[s*len + i*l2 + j], into scratch,
+//      then fft_copy scratch -> buf.
+//
+// Each of cols dispatches (n_groups * tg_width) threads with threadgroup width
+// tg_width, so threadgroup_position_in_grid selects (signal, column). Each
+// threadgroup owns a disjoint column, loads it fully into tg memory before
+// writing, so in-place over the shared data buffer is safe.
 
-// One threadgroup per column j (0..n2). Loads its n1 elements at stride n2,
-// base offset j, runs a forward length-n1 Stockham, writes back strided.
-kernel void fft_fourstep_cols(
+// Batched base case: one threadgroup per signal s (0..batch). Transforms the
+// contiguous length-`len` signal at buf[s*len .. s*len+len] via a forward
+// Stockham. FORWARD only — no inverse/scale (the boundary handles inverse).
+kernel void fft_stockham_pow2_batched(
     device float2*  data [[buffer(0)]],
-    constant uint&  n1   [[buffer(1)]],
-    constant uint&  n2   [[buffer(2)]],
+    constant uint&  len  [[buffer(1)]],
     uint tgid           [[threadgroup_position_in_grid]],
     uint tid            [[thread_position_in_threadgroup]],
     uint tg_size        [[threads_per_threadgroup]]) {
     threadgroup float2 a[FFT_BASE_MAX];
     threadgroup float2 b[FFT_BASE_MAX];
-    uint col = tgid;  // column index in [0, n2)
-    // strided load: M[i][col] = data[i*n2 + col]
-    for (uint i = tid; i < n1; i += tg_size) a[i] = data[i * n2 + col];
+    uint base = tgid * len;  // signal s = tgid
+    for (uint i = tid; i < len; i += tg_size) a[i] = data[base + i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    stockham_pow2_tg(a, b, n1, tid, tg_size);
-    // strided store back
-    for (uint i = tid; i < n1; i += tg_size) data[i * n2 + col] = a[i];
+    stockham_pow2_tg(a, b, len, tid, tg_size);
+    for (uint i = tid; i < len; i += tg_size) data[base + i] = a[i];
 }
 
-// Elementwise twiddle: data[idx] *= W_N^{i*j}, i=idx/n2, j=idx%n2, forward sign.
-// Grid-strided one thread per element over all N = n1*n2 elements.
+// COLUMN FFTs (batched). One threadgroup per (signal s, column c): tgid = s*l2 + c.
+// Loads the l1 elements at base s*len + c, stride l2; forward length-l1 Stockham;
+// writes back strided. l1 <= FFT_BASE_MAX (caller guarantees).
+kernel void fft_fourstep_cols(
+    device float2*  data [[buffer(0)]],
+    constant uint&  l1   [[buffer(1)]],
+    constant uint&  l2   [[buffer(2)]],
+    constant uint&  batch [[buffer(3)]],
+    uint tgid           [[threadgroup_position_in_grid]],
+    uint tid            [[thread_position_in_threadgroup]],
+    uint tg_size        [[threads_per_threadgroup]]) {
+    (void)batch;
+    threadgroup float2 a[FFT_BASE_MAX];
+    threadgroup float2 b[FFT_BASE_MAX];
+    uint s   = tgid / l2;       // signal index
+    uint col = tgid % l2;       // column index in [0, l2)
+    uint base = s * (l1 * l2) + col;
+    for (uint i = tid; i < l1; i += tg_size) a[i] = data[base + i * l2];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    stockham_pow2_tg(a, b, l1, tid, tg_size);
+    for (uint i = tid; i < l1; i += tg_size) data[base + i * l2] = a[i];
+}
+
+// TWIDDLE (batched). For element at global idx in [0, batch*len): s=idx/len,
+// loc=idx%len, i=loc/l2, j=loc%l2; data[idx] *= W_len^{i*j} (forward sign,
+// modulus = len = l1*l2 of the CURRENT sub-signal). Grid-strided.
 kernel void fft_twiddle_mul(
     device float2*  data [[buffer(0)]],
-    constant uint&  n2   [[buffer(1)]],
-    constant uint&  ntot [[buffer(2)]],
+    constant uint&  l2   [[buffer(1)]],
+    constant uint&  len  [[buffer(2)]],
+    constant uint&  batch [[buffer(3)]],
     uint gid            [[thread_position_in_grid]],
     uint grid_size      [[threads_per_grid]]) {
-    for (uint idx = gid; idx < ntot; idx += grid_size) {
-        uint i = idx / n2;
-        uint j = idx % n2;
-        data[idx] = cmul(data[idx], twiddle(int(i * j), int(ntot), false));
+    uint total = batch * len;
+    for (uint idx = gid; idx < total; idx += grid_size) {
+        uint loc = idx % len;
+        uint i = loc / l2;
+        uint j = loc % l2;
+        data[idx] = cmul(data[idx], twiddle(int(i * j), int(len), false));
     }
 }
 
-// One threadgroup per row i (0..n1). Loads its contiguous n2 elements at
-// base i*n2, runs a forward length-n2 Stockham, writes back contiguous.
-kernel void fft_fourstep_rows(
-    device float2*  data [[buffer(0)]],
-    constant uint&  n1   [[buffer(1)]],
-    constant uint&  n2   [[buffer(2)]],
-    uint tgid           [[threadgroup_position_in_grid]],
-    uint tid            [[thread_position_in_threadgroup]],
-    uint tg_size        [[threads_per_threadgroup]]) {
-    threadgroup float2 a[FFT_BASE_MAX];
-    threadgroup float2 b[FFT_BASE_MAX];
-    uint row = tgid;          // row index in [0, n1)
-    uint base = row * n2;
-    for (uint j = tid; j < n2; j += tg_size) a[j] = data[base + j];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    stockham_pow2_tg(a, b, n2, tid, tg_size);
-    for (uint j = tid; j < n2; j += tg_size) data[base + j] = a[j];
+// TRANSPOSE (batched). Per signal s, l1 x l2 -> l2 x l1:
+//   out[s*len + j*l1 + i] = in[s*len + i*l2 + j].
+// One thread per source element, grid-strided over batch*len elements. NOT
+// in-place (out must differ from in).
+kernel void fft_transpose(
+    device const float2* in    [[buffer(0)]],
+    device float2*       out   [[buffer(1)]],
+    constant uint&       l1    [[buffer(2)]],
+    constant uint&       l2    [[buffer(3)]],
+    constant uint&       batch [[buffer(4)]],
+    uint gid                   [[thread_position_in_grid]],
+    uint grid_size             [[threads_per_grid]]) {
+    uint len = l1 * l2;
+    uint total = batch * len;
+    for (uint idx = gid; idx < total; idx += grid_size) {
+        uint s   = idx / len;
+        uint loc = idx % len;
+        uint i = loc / l2;   // source row
+        uint j = loc % l2;   // source col
+        out[s * len + j * l1 + i] = in[idx];
+    }
 }
 
-// Transpose n1 x n2 -> n2 x n1: out[j*n1 + i] = in[i*n2 + j]. One thread per
-// element, grid-strided over the n1*n2 source elements (simple, correct).
-kernel void fft_transpose(
-    device const float2* in   [[buffer(0)]],
-    device float2*       out  [[buffer(1)]],
-    constant uint&       n1   [[buffer(2)]],
-    constant uint&       n2   [[buffer(3)]],
-    uint gid                  [[thread_position_in_grid]],
-    uint grid_size            [[threads_per_grid]]) {
-    uint ntot = n1 * n2;
-    for (uint idx = gid; idx < ntot; idx += grid_size) {
-        uint i = idx / n2;   // source row
-        uint j = idx % n2;   // source col
-        out[j * n1 + i] = in[idx];
+// Straight copy of `count` float2 elements (in -> out). Grid-strided. Used to
+// fold the transpose scratch buffer back into the data buffer.
+kernel void fft_copy(
+    device const float2* in    [[buffer(0)]],
+    device float2*       out   [[buffer(1)]],
+    constant uint&       count [[buffer(2)]],
+    uint gid                   [[thread_position_in_grid]],
+    uint grid_size             [[threads_per_grid]]) {
+    for (uint idx = gid; idx < count; idx += grid_size) {
+        out[idx] = in[idx];
     }
 }
 
