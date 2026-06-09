@@ -4,8 +4,9 @@
 ([[m6-scope-and-api-direction]]); implementation decomposes into four staged plans
 (B1→B2→B3→B4), each its own plan→implement cycle under this one spec.
 
-**Goal:** Extend the Metal execution engine — currently **F32-first** — to **Int32 and Int64**
-dtypes; ship a **gregorian `dt` MSL kernel** (`dt.year/month/day`) as the flagship compute-bound
+**Goal:** Extend the Metal execution engine — currently **F32-first** — to **all integer dtypes**
+(`Int8/16/32/64`, `UInt8/16/32/64`); ship a **gregorian `dt` MSL kernel** (`dt.year/month/day`) as
+the flagship compute-bound
 consumer; and — a finding surfaced during this brainstorm — **re-tune bare reduction routing for
 both int AND F32**, where GPU reductions are a measured 3.5–10× win at scale.
 
@@ -32,12 +33,14 @@ add the I64 leg + the `dt` kernel.
 "spike unknowns during brainstorm" discipline — Python MLX 0.25.1 is importable in-repo and matches
 the vendored build):
 
-1. **MLX int64-on-Metal works.** Live spike: int32 AND int64 elementwise (add/sub/mul/floordiv/mod),
-   comparison→bool, reductions (sum/min/max), and cast→f32 all execute correctly on `mx.gpu`,
-   including genuine 64-bit values (`3e9+2e9=6e9`, `sum=1e10`). The M2 "no 64-bit atomics" limit
-   doesn't bite (reductions are tree-based, not atomic). → **I32 + I64 committed, no remaining
-   unknown.** One semantic wrinkle: MLX keeps `sum(int32)→int32`, but Polars upcasts
-   `sum(Int32)→Int64` — we cast on fold-back to match.
+1. **All eight integer dtypes work on MLX Metal.** Live spikes: `Int8/16/32/64` AND
+   `UInt8/16/32/64` elementwise (add/sub/mul/floordiv/mod), comparison→bool, reductions
+   (sum/min/max), and cast→f32 all execute correctly on `mx.gpu`, including genuine 64-bit values
+   (`3e9+2e9=6e9`) and `UInt64` beyond I64 range (`1e19+5` exact — the case widening *can't* handle).
+   The M2 "no 64-bit atomics" limit doesn't bite (reductions are tree-based, not atomic). → **all
+   integer dtypes first-class, no widening, no remaining unknown.** One semantic wrinkle: MLX keeps
+   the reduction accumulator's width by default, but Polars upcasts integer `sum` to 64-bit
+   (`sum(Int32)→Int64`, `sum(UInt32)→UInt64`) — we cast on fold-back to match.
 
 2. **Bare reductions are a real GPU win — and not just for int.** Spike (pure-compute, resident
    data, Polars CPU vs MLX GPU):
@@ -61,8 +64,9 @@ the vendored build):
 
 **Architect-approved decisions:**
 - **Full Track B** (B1+B2+B3+B4), one umbrella spec, four staged plans.
-- **I32 + I64**, both committed (spike-verified). Int8/Int16 inputs widen to I32; unsigned → CPU
-  fallback (documented).
+- **All eight integer dtypes first-class** — `Int8/16/32/64`, `UInt8/16/32/64` — mapped natively to
+  MLX dtypes (spike-verified, incl. `UInt64` beyond I64 range). No widening, no unsigned fallback;
+  covering them all is uniform (`dtype → MlxDtype`) and is the only correct path for `UInt64`.
 - **`dt` = native acceleration** of `pl.col(d).dt.year/month/day` (no new verb) via the
   serialize-detect + collect-and-stitch template (rolling/FFT proven path); `dt.*` is
   NodeTraverser-opaque. Date(I32) + Datetime(I64→days), all time units.
@@ -92,22 +96,23 @@ build on it.
 
 ### B1 — Integer buffer/FFI/subgraph dtype-awareness
 
-- **`InputDtype`** (`fusion/scope.rs`) + **`MlxDtype`** (`mlx-sys/array.rs`): add the **`I64`**
-  variant (I32 already present). `MlxDtype::I64` → `element_size` 8.
-- **Buffer crate:** add `from_i32_slice` / `from_i64_slice` + `to_i32_vec` / `to_i64_vec` (mirror the
-  F32 convenience methods; the Arrow↔MTL bridge and validity bitmap are already dtype-agnostic).
-  Add `from_borrowed_i32` / `from_borrowed_i64` (zero-copy where alignment permits, mirroring
-  `from_borrowed_f32`).
-- **MLX FFI:** add `mlx_array_from_i64_slice` + `mlx_array_to_i64_vec` (the I32 readback already
-  exists from vector search). `mlx_array_view_metal_buffer` already takes a `MlxDtype` → the view
-  path is ready.
+- **`InputDtype`** (`fusion/scope.rs`) + **`MlxDtype`** (`mlx-sys/array.rs`): add variants for all
+  integer widths — `I8/I16/I64` and `U8/U16/U32/U64` (I32 already present) — each with its
+  `element_size`. The variants are mechanical (mirror the existing pattern).
+- **Buffer crate:** add `from_<t>_slice` / `to_<t>_vec` / `from_borrowed_<t>` per width (the
+  Arrow↔MTL bridge and validity bitmap are already byte-agnostic, so each is a thin convenience
+  wrapper; consider a generic-over-width helper to avoid eight near-copies). Zero-copy where
+  alignment permits, mirroring `from_borrowed_f32`.
+- **MLX FFI:** add `mlx_array_from_<t>_slice` + `mlx_array_to_<t>_vec` readback per width (the I32
+  readback already exists from vector search). `mlx_array_view_metal_buffer` already takes a
+  `MlxDtype` → the view path is ready for every width.
 - **`subgraph.rs`** (the hard-codes at `:170/:184/:227`): map `InputDtype → MlxDtype` when wrapping
   each buffer; derive element count from `dtype.element_size()` (not `/4`); dispatch readback on the
   *output* dtype (`to_i32_vec` / `to_i64_vec` / `to_f32_vec`).
 - **Python dispatch** (`_udf.py:170/181`): pass each column as its **native dtype** bytes
   (i32/i64/f32), not force-cast to `np.float32`; pre-allocate the output by the analyzer-inferred
-  dtype. Analyzer (`_fusion_analyzer.py`): add `pl.Int64 → "I64"` (I32 already mapped); accept
-  Int8/Int16 by widening to I32.
+  dtype. Analyzer (`_fusion_analyzer.py`): map every Polars integer dtype to its `InputDtype`
+  (`Int8/16/64`, `UInt8/16/32/64`; I32 already mapped).
 - **Exit bar:** an Int32 *and* an Int64 column round-trip through a trivial fused chain (`col + 1`)
   end-to-end, byte-exact vs Polars CPU, nulls preserved.
 
@@ -118,8 +123,9 @@ build on it.
   for both widths. Transcendentals/`pow`/rounding stay F32-only (an int feeding them casts to f32
   first, which already works).
 - **Reduction dtype semantics — matched to Polars exactly, all GPU-capable as chain terminators:**
-  - `sum(Int32)`→**Int64**, `sum(Int64)`→Int64 (Polars upcasts; MLX keeps width → cast on fold-back).
-  - `min/max(IntN)`→IntN (preserve).
+  - `sum` upcasts to 64-bit per Polars: signed → **Int64**, unsigned → **UInt64** (MLX keeps the
+    input width → cast on fold-back; the differential test pins the exact per-dtype result).
+  - `min/max(<int>)`→ same dtype (preserve).
   - `mean(IntN)`→**F32** (MLX upcasts int→f32 and divides). Polars returns Float64; we return F32 —
     the same documented divergence as the existing "Mean F32 returns F32 not F64" baseline. The
     int-mean path exists and is used when `mean` terminates a fused compute-bound chain (bare mean
@@ -173,8 +179,9 @@ build on it.
 ## Testing strategy
 
 Differential vs **Polars CPU (the oracle), byte-exact** unless a documented F32 divergence applies:
-- **Int arith/cmp/cast:** I32 + I64, overflow domain (>2³¹ for I64), null-heavy inputs, mixed
-  int↔f32 chains, Int8/Int16 widening.
+- **Int arith/cmp/cast:** the full dtype matrix — `Int8/16/32/64`, `UInt8/16/32/64` — including
+  per-dtype overflow/wraparound domain (e.g. `Int8` wrap mod 256, `UInt64` beyond I64 range),
+  null-heavy inputs, and mixed int↔f32 chains.
 - **Reductions:** `sum`→Int64, `min/max`→IntN, `mean`→F32 (F32 tolerance); correct dtype + value;
   nulls; the size-aware threshold routes correctly (small→CPU, large→GPU) and both paths agree.
 - **dt kernel:** year/month/day on Date + Datetime (all 3 time units); epoch, leap/century,
@@ -189,8 +196,8 @@ All `cargo test` runs use `--test-threads=1` (Metal command-queue contention).
 
 ## Scope / non-goals (explicit)
 
-- **First-class:** Int32, Int64 (signed). **Int8/Int16 inputs widen to I32**; **unsigned ints → CPU
-  fallback** (documented).
+- **First-class:** all eight integer dtypes — `Int8/16/32/64`, `UInt8/16/32/64` — natively (no
+  widening, no fallback; spike-verified on Metal incl. `UInt64`).
 - **Out:** bit-ops (`and/or/xor/shift` — rare in OLAP; revisit on demand); integer groupby-keys /
   hash-join (stays CPU/conformance — standing bandwidth non-goal); `mean`→Float64 precision (we
   return F32 — documented divergence, same as existing F32-mean baseline).
