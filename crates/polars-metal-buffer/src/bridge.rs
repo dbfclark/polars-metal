@@ -170,7 +170,32 @@ impl MetalBuffer {
         ptr: *const f32,
         n_elements: usize,
     ) -> Result<Self, BufferError> {
-        let len = n_elements * std::mem::size_of::<f32>();
+        // SAFETY: caller guarantees `ptr` is valid for `n_elements * 4` bytes
+        // for the buffer's lifetime; delegate to the byte-level shared path.
+        unsafe {
+            Self::from_borrowed_bytes(
+                device,
+                ptr as *const u8,
+                n_elements * std::mem::size_of::<f32>(),
+            )
+        }
+    }
+
+    /// Byte-level borrowed-buffer ingest shared by every `from_borrowed_<t>`
+    /// and by the core fused-expr dispatch. Zero-copy `newBufferWithBytesNoCopy`
+    /// when `ptr` is page-aligned, else a single copy. `len` is the total byte
+    /// length.
+    ///
+    /// # Safety
+    /// `ptr` must be non-null and valid for `len` bytes for the entire lifetime
+    /// of the returned `MetalBuffer` (the zero-copy path holds no keep-alive —
+    /// the caller owns the memory). On the copy path the borrow ends when this
+    /// returns.
+    pub unsafe fn from_borrowed_bytes(
+        device: &MetalDevice,
+        ptr: *const u8,
+        len: usize,
+    ) -> Result<Self, BufferError> {
         if len == 0 {
             // Metal rejects zero-byte buffers (mirrors the copy path).
             return Err(BufferError::AllocationFailed { bytes: 0 });
@@ -185,15 +210,17 @@ impl MetalBuffer {
                 RcBlock::new(move |_ptr, _len| {});
             // SAFETY: `ptr` is valid for `len` bytes for the buffer's lifetime
             // (caller-guaranteed); page-aligned pointer satisfies bytesNoCopy.
-            let inner = device
-                .raw()
-                .newBufferWithBytesNoCopy_length_options_deallocator(
-                    nn,
-                    len,
-                    MTLResourceOptions::MTLResourceStorageModeShared,
-                    Some(&deallocator),
-                )
-                .ok_or(BufferError::AllocationFailed { bytes: len })?;
+            let inner = unsafe {
+                device
+                    .raw()
+                    .newBufferWithBytesNoCopy_length_options_deallocator(
+                        nn,
+                        len,
+                        MTLResourceOptions::MTLResourceStorageModeShared,
+                        Some(&deallocator),
+                    )
+            }
+            .ok_or(BufferError::AllocationFailed { bytes: len })?;
             Ok(Self {
                 inner,
                 _owner: None,
@@ -201,14 +228,14 @@ impl MetalBuffer {
             })
         } else {
             // SAFETY: `ptr` is valid for `len` bytes; Metal copies them in now.
-            let inner = device
-                .raw()
-                .newBufferWithBytes_length_options(
+            let inner = unsafe {
+                device.raw().newBufferWithBytes_length_options(
                     nn,
                     len,
                     MTLResourceOptions::MTLResourceStorageModeShared,
                 )
-                .ok_or(BufferError::AllocationFailed { bytes: len })?;
+            }
+            .ok_or(BufferError::AllocationFailed { bytes: len })?;
             Ok(Self {
                 inner,
                 _owner: None,
@@ -459,6 +486,75 @@ impl MetalBuffer {
         unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), len) }
     }
 }
+
+/// Generate per-width integer accessors mirroring the F32 byte-reinterpret
+/// pattern (`from_f32_slice` / `to_f32_vec` / `from_borrowed_f32`). Emitted at
+/// module scope because each invocation opens its own `impl MetalBuffer` block.
+macro_rules! impl_typed_accessors {
+    ($t:ty, $from_slice:ident, $to_vec:ident, $from_borrowed:ident) => {
+        impl MetalBuffer {
+            #[doc = concat!("Construct a `MetalBuffer` by copying a `&[", stringify!($t), "]` into a new Metal allocation. Errors on empty input (Metal rejects zero-byte allocations).")]
+            pub fn $from_slice(device: &MetalDevice, data: &[$t]) -> Result<Self, BufferError> {
+                // SAFETY: `$t` is a Pod integer with no padding; reinterpreting
+                // `&[$t]` as `&[u8]` is valid (align of [u8] is 1 ≤ align of
+                // [$t]; byte length is exact). Read-only view bounded by `data`.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        data.as_ptr() as *const u8,
+                        std::mem::size_of_val(data),
+                    )
+                };
+                device.new_buffer_from_bytes(bytes)
+            }
+
+            #[doc = concat!("Copy the buffer's contents out as a `Vec<", stringify!($t), ">`.")]
+            pub fn $to_vec(&self) -> Vec<$t> {
+                let bytes = self.as_slice();
+                let n = bytes.len() / std::mem::size_of::<$t>();
+                let mut out: Vec<$t> = Vec::with_capacity(n);
+                // SAFETY: `bytes` is valid for `n * size_of::<$t>()` bytes; we
+                // copy `n` `$t` values out. `copy_nonoverlapping` tolerates a
+                // misaligned source (bytewise copy).
+                unsafe {
+                    let src = bytes.as_ptr().cast::<$t>();
+                    out.set_len(n);
+                    std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), n);
+                }
+                out
+            }
+
+            #[doc = concat!("Wrap a borrowed `", stringify!($t), "` region (input-zero-copy path), mirroring `from_borrowed_f32`.")]
+            ///
+            /// # Safety
+            /// `ptr` must be non-null and valid for `n_elements * size_of::<T>()`
+            /// bytes for the entire lifetime of the returned `MetalBuffer`.
+            pub unsafe fn $from_borrowed(
+                device: &MetalDevice,
+                ptr: *const $t,
+                n_elements: usize,
+            ) -> Result<Self, BufferError> {
+                // SAFETY: caller guarantees `ptr` valid for
+                // n_elements*size_of::<$t>() bytes; delegate to the byte path.
+                unsafe {
+                    Self::from_borrowed_bytes(
+                        device,
+                        ptr as *const u8,
+                        n_elements * std::mem::size_of::<$t>(),
+                    )
+                }
+            }
+        }
+    };
+}
+
+impl_typed_accessors!(i8, from_i8_slice, to_i8_vec, from_borrowed_i8);
+impl_typed_accessors!(i16, from_i16_slice, to_i16_vec, from_borrowed_i16);
+impl_typed_accessors!(i32, from_i32_slice, to_i32_vec, from_borrowed_i32);
+impl_typed_accessors!(i64, from_i64_slice, to_i64_vec, from_borrowed_i64);
+impl_typed_accessors!(u8, from_u8_slice, to_u8_vec, from_borrowed_u8);
+impl_typed_accessors!(u16, from_u16_slice, to_u16_vec, from_borrowed_u16);
+impl_typed_accessors!(u32, from_u32_slice, to_u32_vec, from_borrowed_u32);
+impl_typed_accessors!(u64, from_u64_slice, to_u64_vec, from_borrowed_u64);
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
@@ -748,6 +844,56 @@ mod tests {
 
             prop_assert_eq!(dict_metal.as_slice(), dict_bytes.as_slice());
             prop_assert_eq!(idx_metal.as_slice(), idx_bytes.as_slice());
+        }
+
+        // ── Per-width integer accessor round-trips ───────────────────────
+        #[test]
+        fn i8_slice_round_trip(vals in proptest::collection::vec(any::<i8>(), 1..512)) {
+            let device = device();
+            let metal = MetalBuffer::from_i8_slice(&device, &vals).expect("stage i8");
+            prop_assert_eq!(metal.to_i8_vec(), vals);
+        }
+        #[test]
+        fn i16_slice_round_trip(vals in proptest::collection::vec(any::<i16>(), 1..512)) {
+            let device = device();
+            let metal = MetalBuffer::from_i16_slice(&device, &vals).expect("stage i16");
+            prop_assert_eq!(metal.to_i16_vec(), vals);
+        }
+        #[test]
+        fn i32_slice_round_trip(vals in proptest::collection::vec(any::<i32>(), 1..512)) {
+            let device = device();
+            let metal = MetalBuffer::from_i32_slice(&device, &vals).expect("stage i32");
+            prop_assert_eq!(metal.to_i32_vec(), vals);
+        }
+        #[test]
+        fn i64_slice_round_trip(vals in proptest::collection::vec(any::<i64>(), 1..512)) {
+            let device = device();
+            let metal = MetalBuffer::from_i64_slice(&device, &vals).expect("stage i64");
+            prop_assert_eq!(metal.to_i64_vec(), vals);
+        }
+        #[test]
+        fn u8_slice_round_trip(vals in proptest::collection::vec(any::<u8>(), 1..512)) {
+            let device = device();
+            let metal = MetalBuffer::from_u8_slice(&device, &vals).expect("stage u8");
+            prop_assert_eq!(metal.to_u8_vec(), vals);
+        }
+        #[test]
+        fn u16_slice_round_trip(vals in proptest::collection::vec(any::<u16>(), 1..512)) {
+            let device = device();
+            let metal = MetalBuffer::from_u16_slice(&device, &vals).expect("stage u16");
+            prop_assert_eq!(metal.to_u16_vec(), vals);
+        }
+        #[test]
+        fn u32_slice_round_trip(vals in proptest::collection::vec(any::<u32>(), 1..512)) {
+            let device = device();
+            let metal = MetalBuffer::from_u32_slice(&device, &vals).expect("stage u32");
+            prop_assert_eq!(metal.to_u32_vec(), vals);
+        }
+        #[test]
+        fn u64_slice_round_trip(vals in proptest::collection::vec(any::<u64>(), 1..512)) {
+            let device = device();
+            let metal = MetalBuffer::from_u64_slice(&device, &vals).expect("stage u64");
+            prop_assert_eq!(metal.to_u64_vec(), vals);
         }
     }
 }
