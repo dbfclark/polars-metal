@@ -62,6 +62,29 @@ impl MlxDtype {
             MlxDtype::F64 | MlxDtype::I64 | MlxDtype::U64 => 8,
         }
     }
+
+    /// Decode a `u32` dtype tag (as returned by `mlx_array_dtype`) into an
+    /// `MlxDtype`. `FfiError::Runtime` on an unknown tag.
+    pub fn from_tag(tag: u32) -> Result<Self, crate::error::FfiError> {
+        Ok(match tag {
+            0 => MlxDtype::F32,
+            1 => MlxDtype::F64,
+            2 => MlxDtype::I32,
+            3 => MlxDtype::Bool,
+            4 => MlxDtype::I8,
+            5 => MlxDtype::I16,
+            6 => MlxDtype::I64,
+            7 => MlxDtype::U8,
+            8 => MlxDtype::U16,
+            9 => MlxDtype::U32,
+            10 => MlxDtype::U64,
+            other => {
+                return Err(crate::error::FfiError::Runtime(format!(
+                    "unknown MlxDtype tag {other}"
+                )))
+            }
+        })
+    }
 }
 
 /// A ref-counted handle to an `mlx::core::array`.
@@ -92,6 +115,16 @@ impl MlxArrayHandle {
     /// Return `true` iff the array's dtype is `float32`.
     pub fn dtype_is_f32(&self) -> bool {
         ffi::mlx_array_is_f32(&self.ptr)
+    }
+
+    /// Return the array's dtype as an [`MlxDtype`].
+    ///
+    /// # Errors
+    /// `FfiError::Runtime` if the array's dtype is one we do not map
+    /// (e.g. float64), surfaced from the C++ `mlx_array_dtype` throw.
+    pub fn dtype(&self) -> Result<MlxDtype, FfiError> {
+        let tag = ffi::mlx_array_dtype(&self.ptr).map_err(FfiError::from)?;
+        MlxDtype::from_tag(tag)
     }
 }
 
@@ -226,6 +259,35 @@ pub fn mlx_array_to_i32_vec(handle: &MlxArrayHandle) -> Result<Vec<i32>, FfiErro
     unsafe { ffi::mlx_array_copy_to_i32(&handle.ptr, out.as_mut_ptr(), n) };
     Ok(out)
 }
+
+/// Generate a `mlx_array_to_<t>_vec` readback wrapper mirroring
+/// `mlx_array_to_i32_vec`: row-major-contiguous memcpy after eval. Callers
+/// are responsible for ensuring the handle's dtype matches `$t` (the
+/// subgraph builder checks via `MlxArrayHandle::dtype()` before dispatch).
+macro_rules! impl_to_vec {
+    ($fn_name:ident, $t:ty, $ffi:path) => {
+        #[doc = concat!("Read a materialized array back to a host `Vec<", stringify!($t), ">`. Call after `mlx_array_eval`.")]
+        pub fn $fn_name(handle: &MlxArrayHandle) -> Result<Vec<$t>, FfiError> {
+            let n: usize = handle.shape().iter().product();
+            if n == 0 {
+                return Ok(Vec::new());
+            }
+            let mut out = vec![0 as $t; n];
+            // SAFETY: `out` has exactly `n` slots; the array is eval'd and of
+            // the matching dtype (caller contract). `arr->data<T>()` is valid
+            // for `n` elements.
+            unsafe { $ffi(&handle.ptr, out.as_mut_ptr(), n) };
+            Ok(out)
+        }
+    };
+}
+impl_to_vec!(mlx_array_to_i8_vec, i8, ffi::mlx_array_copy_to_i8);
+impl_to_vec!(mlx_array_to_i16_vec, i16, ffi::mlx_array_copy_to_i16);
+impl_to_vec!(mlx_array_to_i64_vec, i64, ffi::mlx_array_copy_to_i64);
+impl_to_vec!(mlx_array_to_u8_vec, u8, ffi::mlx_array_copy_to_u8);
+impl_to_vec!(mlx_array_to_u16_vec, u16, ffi::mlx_array_copy_to_u16);
+impl_to_vec!(mlx_array_to_u32_vec, u32, ffi::mlx_array_copy_to_u32);
+impl_to_vec!(mlx_array_to_u64_vec, u64, ffi::mlx_array_copy_to_u64);
 
 /// Copy an eval'd F32 array's contents directly into a caller-owned slice,
 /// returning the number of elements written. This is the output-zero-copy
