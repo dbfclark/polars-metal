@@ -60,7 +60,7 @@ inline void radix_dispatch(uint r, thread float2* x, thread float2* y) {
         case 6: radix6(x, y); break;
         case 7: radix7(x, y); break;
         case 8: radix8(x, y); break;
-        default: break;
+        default: break;  // unreachable: factorize only ever emits radices in 2..8
     }
 }
 

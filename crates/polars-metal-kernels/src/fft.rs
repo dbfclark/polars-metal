@@ -28,9 +28,12 @@ pub const FFT_BASE_MAX: i64 = 1024;
 /// whose product is `n`. Returns `None` if any prime factor `> 7` remains
 /// (such sizes route to Bluestein in a later task) or for `n <= 0`.
 ///
-/// Greedy largest-first over `{8,7,6,5,4,3,2}`, preferring large radices (8, 4)
-/// for the pow2 portion. Any valid factorization (product == n, every factor
-/// <= 8) is correct for the mixed-radix kernel; the differential test confirms.
+/// True powers of two are handled by the dedicated radix-2 path in `fft_gpu`
+/// *before* `factorize` is called; `factorize` is used only for composite
+/// (non-pow2) `n`. Greedy largest-first over `{8,7,6,5,4,3,2}` is a perf
+/// preference for the radix factors it emits — any valid factorization
+/// (product == n, every factor <= 8) is correct for the mixed-radix kernel;
+/// the differential test confirms.
 pub fn factorize(n: i64) -> Option<Vec<u32>> {
     if n <= 0 {
         return None;

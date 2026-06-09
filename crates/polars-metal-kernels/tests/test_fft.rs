@@ -49,6 +49,32 @@ fn mixed_radix_small_composite_matches_dft() {
 }
 
 #[test]
+fn mixed_radix_inverse_and_roundtrip() {
+    let device = MetalDevice::system_default().expect("device");
+    // composite (non-pow2) sizes route through fft_mixed_radix_f32, whose
+    // inverse-by-conjugation path is otherwise untested.
+    for &n in &[6usize, 12, 35, 360, 1000] {
+        let sig = interleaved_signal(n, 500 + n as u64);
+        // inverse vs the CPU idft oracle
+        let inv = fft_gpu(&device, &sig, n as i64, true).expect("ifft");
+        let exp = dft_reference(&sig, n, true);
+        assert!(
+            l2_rel_err(&inv, &exp) < 1e-4,
+            "n={n} ifft L2 {}",
+            l2_rel_err(&inv, &exp)
+        );
+        // round-trip ifft(fft(x)) ≈ x
+        let fwd = fft_gpu(&device, &sig, n as i64, false).expect("fft");
+        let back = fft_gpu(&device, &fwd, n as i64, true).expect("ifft");
+        assert!(
+            l2_rel_err(&back, &sig) < 1e-4,
+            "n={n} roundtrip L2 {}",
+            l2_rel_err(&back, &sig)
+        );
+    }
+}
+
+#[test]
 fn radix2_inverse_and_roundtrip() {
     let device = MetalDevice::system_default().expect("device");
     // sizes within the single-threadgroup base path (n <= FFT_BASE_MAX = 1024);
