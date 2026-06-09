@@ -683,7 +683,8 @@ def _build_select_reduction_fused(plan: dict) -> Any:
             out_pl_dtype = _wire_str_to_polars_dtype(out_dtype_str)
 
             if not is_chain:
-                # Bare single Float32 column (enforced by `analyze_ir_reduction`).
+                # Bare single column (F32 or an admitted int width), enforced
+                # by `analyze_ir_reduction`.
                 col_name = descriptors[0][1]
                 series = upstream.get_column(col_name)
                 # MLX over `to_numpy()` turns nulls into NaN (Polars skips

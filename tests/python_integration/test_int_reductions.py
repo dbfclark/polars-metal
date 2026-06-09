@@ -107,3 +107,174 @@ def test_int64_chain_sum_routes_to_gpu_and_matches():
     got, want = lf.collect(engine=eng), lf.collect()
     assert got.equals(want)
     assert got["s"].dtype == pl.Int64
+
+
+_SUM_DTYPES = [pl.Int32, pl.Int64, pl.UInt32, pl.UInt64]
+_MINMAX_DTYPES = [
+    pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+    pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
+]
+
+
+def _vals_for(dtype) -> list[int]:
+    # Small, in-range, mixed-sign where signed. Chosen so +/* in a chain stay
+    # in range for the narrowest min/max types (Int8/UInt8).
+    if dtype in (pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
+        return [0, 1, 2, 7, 9, 3]
+    return [-3, 0, 1, 2, 7, -2]
+
+
+@pytest.mark.parametrize("dtype", _SUM_DTYPES)
+def test_int_sum_byte_exact_no_nulls(dtype):
+    eng = MetalEngine()
+    df = pl.DataFrame({"x": pl.Series(_vals_for(dtype), dtype=dtype)})
+    lf = df.lazy().select(pl.col("x").sum().alias("r"))
+    got, want = lf.collect(engine=eng), lf.collect()
+    assert got.equals(want), f"{dtype}: {got} != {want}"
+    assert got["r"].dtype == dtype
+
+
+@pytest.mark.parametrize("dtype", _MINMAX_DTYPES)
+@pytest.mark.parametrize("op", ["min", "max"])
+def test_int_minmax_byte_exact_no_nulls(dtype, op):
+    eng = MetalEngine()
+    df = pl.DataFrame({"x": pl.Series(_vals_for(dtype), dtype=dtype)})
+    lf = df.lazy().select(getattr(pl.col("x"), op)().alias("r"))
+    got, want = lf.collect(engine=eng), lf.collect()
+    assert got.equals(want), f"{op} {dtype}: {got} != {want}"
+    assert got["r"].dtype == dtype
+
+
+# UInt64 is admitted by the B2 reduction analyzer (sum/min/max → "U64"), but a
+# UInt64 *input column* never reaches the fused path: `_walker._map_dtype` has no
+# UInt64 arm (it maps UInt8..UInt32 but stops short of UInt64), so the upstream
+# DataFrameScan node falls back to CPU before the fused reduction can dispatch.
+# Result: byte-exact (CPU fallback is correct) but dispatch==0, not 1. Fixing it
+# safely is out of B2 Task 5's (test-only, Python-only) scope — `_map_dtype` is
+# shared with the non-fused execute_plan/filter/groupby paths whose Rust side
+# (`udf.rs::str_to_dtype`) also lacks "U64", so a blanket map edit would route a
+# plain UInt64 projection into Rust and raise instead of falling back. Tracked as
+# a follow-up (add a UInt64 arm to `_map_dtype` + the Rust dtype tag, or a
+# fused-only Scan-gate). Int32/Int64/UInt32 still genuinely exercise the GPU int
+# path, satisfying the B2 exit bar's "≥1 GPU case".
+_GPU_PATH_XFAIL = {pl.UInt64}
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(
+            d,
+            marks=pytest.mark.xfail(
+                reason="UInt64 input column falls back at the DataFrameScan gate "
+                "(_walker._map_dtype has no UInt64 arm); admitted by the reduction "
+                "analyzer but never reaches the fused path — byte-exact via CPU, "
+                "but dispatch==0. See comment above.",
+                strict=True,
+            ),
+        )
+        if d in _GPU_PATH_XFAIL
+        else d
+        for d in _SUM_DTYPES
+    ],
+)
+def test_int_chain_sum_gpu_path(dtype):
+    # Chain → is_chain=True → routes to GPU. Proves the GPU int-reduction path
+    # (dispatch count == 1) AND byte-exact dtype/value.
+    eng = MetalEngine()
+    df = pl.DataFrame({"x": pl.Series(_vals_for(dtype), dtype=dtype)})
+    lf = df.lazy().select(((pl.col("x") + 1) * 2).sum().alias("r"))
+    assert _reduction_dispatches(lf, eng) == 1, f"chain sum {dtype} should use GPU"
+    got, want = lf.collect(engine=eng), lf.collect()
+    assert got.equals(want), f"chain {dtype}: {got} != {want}"
+
+
+@pytest.mark.parametrize("op", ["min", "max"])
+def test_int_chain_minmax_gpu_path(op):
+    eng = MetalEngine()
+    df = pl.DataFrame({"x": pl.Series([-3, 0, 1, 2, 7], dtype=pl.Int64)})
+    lf = df.lazy().select(getattr((pl.col("x") + 1), op)().alias("r"))
+    assert _reduction_dispatches(lf, eng) == 1, f"chain {op} should use GPU"
+    got, want = lf.collect(engine=eng), lf.collect()
+    assert got.equals(want)
+
+
+@pytest.mark.parametrize("dtype", _SUM_DTYPES)
+def test_int_chain_sum_with_nulls_drop_nulls_path(dtype):
+    # Null-bearing chain → walker stamps _drop_nulls → CPU drop + GPU reduce of
+    # survivors. Byte-exact vs Polars (which skips nulls).
+    eng = MetalEngine()
+    vals = _vals_for(dtype)
+    vals_n = [*vals[:2], None, *vals[2:]]
+    df = pl.DataFrame({"x": pl.Series(vals_n, dtype=dtype)})
+    lf = df.lazy().select(((pl.col("x") + 1) * 2).sum().alias("r"))
+    got, want = lf.collect(engine=eng), lf.collect()
+    assert got.equals(want), f"null chain {dtype}: {got} != {want}"
+
+
+@pytest.mark.parametrize("dtype", _SUM_DTYPES)
+def test_int_sum_empty(dtype):
+    eng = MetalEngine()
+    df = pl.DataFrame({"x": pl.Series([], dtype=dtype)})
+    lf = df.lazy().select(pl.col("x").sum().alias("r"))
+    got, want = lf.collect(engine=eng), lf.collect()
+    assert got.equals(want), f"empty {dtype}: {got} != {want}"
+
+
+@pytest.mark.parametrize("dtype", _SUM_DTYPES)
+def test_int_sum_single_element(dtype):
+    eng = MetalEngine()
+    df = pl.DataFrame({"x": pl.Series([5], dtype=dtype)})
+    lf = df.lazy().select(pl.col("x").sum().alias("r"))
+    got, want = lf.collect(engine=eng), lf.collect()
+    assert got.equals(want), f"single {dtype}: {got} != {want}"
+
+
+@pytest.mark.parametrize("op", ["min", "max"])
+def test_int_minmax_empty_and_single(op):
+    eng = MetalEngine()
+    for vals in ([], [5]):
+        df = pl.DataFrame({"x": pl.Series(vals, dtype=pl.Int64)})
+        lf = df.lazy().select(getattr(pl.col("x"), op)().alias("r"))
+        got, want = lf.collect(engine=eng), lf.collect()
+        assert got.equals(want), f"{op} {vals}: {got} != {want}"
+
+
+@pytest.mark.parametrize("dtype", [pl.Int8, pl.Int16, pl.UInt8, pl.UInt16])
+def test_narrow_int_sum_falls_back_to_cpu_and_matches(dtype):
+    eng = MetalEngine()
+    df = pl.DataFrame({"x": pl.Series([1, 2, 3, 4], dtype=dtype)})
+    # Bare AND chain forms: narrow sum is never admitted (analyzer aborts).
+    for lf in (
+        df.lazy().select(pl.col("x").sum().alias("r")),
+        df.lazy().select(((pl.col("x") + 1)).sum().alias("r")),
+    ):
+        assert _reduction_dispatches(lf, eng) == 0, f"narrow sum {dtype} must stay CPU"
+        got, want = lf.collect(engine=eng), lf.collect()
+        assert got.equals(want), f"narrow sum {dtype}: {got} != {want}"
+
+
+@pytest.mark.parametrize("dtype", [pl.Int32, pl.Int64, pl.UInt32, pl.UInt64])
+def test_int_mean_falls_back_to_cpu_and_matches(dtype):
+    eng = MetalEngine()
+    df = pl.DataFrame({"x": pl.Series([1, 2, 3, 4], dtype=dtype)})
+    for lf in (
+        df.lazy().select(pl.col("x").mean().alias("r")),
+        df.lazy().select(((pl.col("x") + 1)).mean().alias("r")),
+    ):
+        assert _reduction_dispatches(lf, eng) == 0, f"int mean {dtype} must stay CPU"
+        got, want = lf.collect(engine=eng), lf.collect()
+        assert got.equals(want), f"int mean {dtype}: {got} != {want}"
+
+
+def test_wire_str_to_polars_matches_walker_table():
+    # Drift guard: _udf._WIRE_STR_TO_POLARS must agree with
+    # _walker._INT_TAG_TO_POLARS (both map wire str -> the same Polars dtype).
+    from polars_metal._udf import _WIRE_STR_TO_POLARS
+    from polars_metal._walker import _INT_TAG_TO_POLARS
+
+    for wire, pl_str in _INT_TAG_TO_POLARS.items():
+        assert wire in _WIRE_STR_TO_POLARS, f"{wire} missing from _WIRE_STR_TO_POLARS"
+        assert str(_WIRE_STR_TO_POLARS[wire]) == pl_str, (
+            f"{wire}: {_WIRE_STR_TO_POLARS[wire]} != {pl_str}"
+        )
