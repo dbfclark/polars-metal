@@ -634,6 +634,51 @@ _REDUCTION_OP: dict[str, str] = {
 }
 
 
+# B2: GPU-admissible integer reductions. The fused reduction output dtype must
+# equal the Polars output dtype with NO fold-back cast (there is no CastI64 /
+# CastU64 op), so we admit exactly the (op, dtype) pairs where MLX's native
+# reduction dtype already matches Polars:
+#   - sum: MLX keeps the input width; Polars keeps it ONLY for the 32/64-bit
+#     widths (Int32→Int32, Int64→Int64, UInt32→UInt32, UInt64→UInt64). Polars
+#     upcasts narrow-int sum to Int64/UInt64 while MLX widens to int32/uint32 →
+#     mismatch → those stay CPU.
+#   - min/max: both MLX and Polars preserve the input width for all 8 widths.
+#   - mean/std/var: MLX→float32, Polars→Float64 → mismatch → CPU.
+_SUM_ADMIT: dict[Any, str] = {
+    pl.Int32: "I32",
+    pl.Int64: "I64",
+    pl.UInt32: "U32",
+    pl.UInt64: "U64",
+}
+_MINMAX_ADMIT: dict[Any, str] = {
+    pl.Int8: "I8",
+    pl.Int16: "I16",
+    pl.Int32: "I32",
+    pl.Int64: "I64",
+    pl.UInt8: "U8",
+    pl.UInt16: "U16",
+    pl.UInt32: "U32",
+    pl.UInt64: "U64",
+}
+
+
+def _int_reduction_out_dtype(agg_kind: str, col_dtype: Any) -> str | None:
+    """Wire output-dtype string for a GPU-admissible integer reduction, or
+    ``None`` when the (op, dtype) pair is not GPU-admissible (→ CPU fallback).
+
+    Admits int ``sum`` for {Int32, Int64, UInt32, UInt64} and int ``min``/
+    ``max`` for all 8 integer widths — exactly the pairs where MLX's native
+    reduction dtype equals the Polars output dtype (no fold-back cast). All
+    other int reductions (narrow ``sum``, ``mean``/``std``/``var``) return
+    ``None`` so the caller aborts to CPU.
+    """
+    if agg_kind == "sum":
+        return _SUM_ADMIT.get(col_dtype)
+    if agg_kind in ("min", "max"):
+        return _MINMAX_ADMIT.get(col_dtype)
+    return None
+
+
 def analyze_ir_reduction(
     nt: Any, agg_node_id: int, schema: dict[str, Any]
 ) -> tuple[PyFusionScope, list[tuple[str, str | float]], str, bool, int] | None:
