@@ -165,3 +165,55 @@ dispatching the kernel) and `tests/python_integration/test_fft.py` (engine path)
   `mlx_complex` only if the complex-staging path reuses it.
 - **Recursive four-step depth / transpose strategy** — tiled vs naive transpose for the inter-pass
   shuffle; pick the differential-correct version first, optimize the transpose after profiling.
+
+---
+
+## Delivered (2026-06-09)
+
+**What shipped.** A from-scratch MSL 1-D FFT (`shaders/fft.metal` + the header-only
+`shaders/_fft_radix.metal`, driven by the planner/dispatcher in
+`crates/polars-metal-kernels/src/fft.rs`) backing `.metal.fft()` / `.metal.ifft()` for **all sizes
+on-GPU** — removing MLX's 2^20 ceiling (`ml-explore/mlx#1800`). Algorithm set actually landed:
+- **radix-2 Stockham base** for small pow2 in threadgroup memory;
+- **mixed-radix (3–8) base** for composite N ≤ 1024;
+- **Bailey four-step** for large pow2;
+- **recursive batched four-step** for N > 2^20 — this is what fixes the previously-garbage 2^21–2^25
+  band that MLX got wrong;
+- **Bluestein chirp-z** for primes / non-smooth N (the DFT as a length-`M = next_pow2(2N−1)` pow2
+  convolution).
+- `ifft` via conjugated twiddles + `1/N` scale; real `F32` and `Struct{real,imag}` input both
+  supported; output always `Struct{real,imag}`, length-preserving.
+
+Supported range `n ∈ [1, 2^30]` (guarded; Bluestein's `M = next_pow2(2N−1)` is itself kept ≤ 2^30).
+
+**Correctness.** Differentially verified against three oracles: the CPU O(N²) DFT (`dft_reference`,
+small N), an f64 radix-2 host oracle (large pow2), and `numpy.fft` at the engine level. L2 relative
+error **< 1e-3** across the sweep (≤ 1e-4 at small sizes), over
+`[8, 1024, 4096, 2^21..2^25, 1000, 100003, 3_000_000, 8_000_000] × {fft, ifft} × {real, struct}`,
+plus fft→ifft round-trip recovery. No silent garbage at any size — the band MLX returned garbage on
+is now correct.
+
+**Performance (honest, M2 Ultra, full engine `collect` path vs `numpy.fft`).** The GPU **wins** at
+the large-pow2 regime — `metal/numpy ≈ 0.23–0.26` at 2^23 and 2^24 (~3.8–4.3×), run-to-run band
+~0.23–0.36. The bench (`tests/bench/m4_survey/bench_fft.py`) gates `ratio < 0.6` at 2^23 / 2^24 —
+the honest measured win with headroom, not an aspirational number. This large-pow2 win is the
+headline this whole effort was for.
+
+**Rader's algorithm (Task 7): SKIPPED.** Bluestein already covers prime / non-smooth N **correctly**;
+Rader is a perf-only optimization for prime sizes, which are not this milestone's headline workload
+(the headline — large pow2 — is delivered by the recursive four-step). The added complexity
+(primitive-root finding, modular index permutations, its own (n−1)-point convolution) was not
+justified for a non-headline path. Decision recorded per the plan's explicit "skip and record"
+authorization.
+
+**MLX FFT FFI removed.** `polars-metal-mlx-sys` no longer wraps `mlx_op_fft_1d` / `ifft_1d` /
+`real` / `imag` / `complex` (dead after the kernel landed). The fused-subgraph `Fft` / `Ifft` arms in
+`crates/polars-metal-core/src/fusion/subgraph.rs` now return `UnsupportedOp` — those arms are
+unreachable from the NodeTraverser walker anyway; the **live FFT path is the `.metal` namespace**
+backed by the hand-rolled kernel.
+
+**Deferred (future optimization).** Bluestein's chirp/filter build, the pointwise `FFT·FFT` product,
+and the post-multiply are done host-side for simplicity, costing extra host↔device round-trips around
+the three GPU FFTs. A fused premul/postmul MSL kernel (the plan's `fft_chirp_premul` /
+`fft_chirp_postmul`) would keep that O(M) work on-device — deferred, as Bluestein is the non-headline
+path. (Noted in `fft.rs` near `bluestein`.)

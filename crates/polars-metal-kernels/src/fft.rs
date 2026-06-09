@@ -220,6 +220,14 @@ fn bluestein_dispatch(
 /// three length-`M` pow2 FFTs run on the GPU. `M` is pow2, so each FFT routes to
 /// the four-step path and never re-enters Bluestein (no recursion).
 ///
+/// Perf note (future optimization): the chirp/filter build, the `FFT·FFT`
+/// pointwise product, and the final post-multiply are done host-side for
+/// simplicity, which costs extra host↔device round-trips around the three GPU
+/// FFTs. A fused premul/postmul MSL kernel (à la the plan's `fft_chirp_premul` /
+/// `fft_chirp_postmul`) would keep this O(M) work on-device and cut those
+/// round-trips. Bluestein is the non-headline (prime / non-smooth N) path, so
+/// this is deferred; the large-pow2 four-step regime is already fully on-GPU.
+///
 /// Input `input` is interleaved-complex length `2n`; output is interleaved
 /// length `2n`.
 fn bluestein(device: &MetalDevice, input: &[f32], n: usize) -> Result<Vec<f32>, FftError> {
@@ -486,6 +494,7 @@ pub fn l2_rel_err(got: &[f32], exp: &[f32]) -> f64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::factorize;
 

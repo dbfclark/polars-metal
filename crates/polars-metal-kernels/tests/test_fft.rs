@@ -1,6 +1,7 @@
 //! M6 A3: differential tests for the hand-rolled MSL FFT.
 //! Populated by later tasks (radix kernel, four-step, Bluestein) against the
 //! CPU DFT oracle in `polars_metal_kernels::fft`.
+#![allow(clippy::expect_used)]
 
 use polars_metal_buffer::MetalDevice;
 use polars_metal_kernels::fft::{dft_reference, fft_gpu, l2_rel_err};
