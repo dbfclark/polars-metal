@@ -43,15 +43,23 @@ pub enum MlxDtype {
     F64 = 1,
     I32 = 2,
     Bool = 3,
+    I8 = 4,
+    I16 = 5,
+    I64 = 6,
+    U8 = 7,
+    U16 = 8,
+    U32 = 9,
+    U64 = 10,
 }
 
 impl MlxDtype {
     /// Size of one element in bytes.
     pub fn element_size(self) -> usize {
         match self {
-            MlxDtype::F32 | MlxDtype::I32 => 4,
-            MlxDtype::F64 => 8,
-            MlxDtype::Bool => 1,
+            MlxDtype::Bool | MlxDtype::I8 | MlxDtype::U8 => 1,
+            MlxDtype::I16 | MlxDtype::U16 => 2,
+            MlxDtype::F32 | MlxDtype::I32 | MlxDtype::U32 => 4,
+            MlxDtype::F64 | MlxDtype::I64 | MlxDtype::U64 => 8,
         }
     }
 }
@@ -308,4 +316,31 @@ pub fn mlx_array_view_metal_buffer(
         ptr: handle,
         _input_refs: vec![buf],
     })
+}
+
+#[cfg(test)]
+mod dtype_tests {
+    use super::MlxDtype;
+
+    #[test]
+    fn int_dtype_tags_are_stable() {
+        assert_eq!(MlxDtype::I8 as u32, 4);
+        assert_eq!(MlxDtype::I16 as u32, 5);
+        assert_eq!(MlxDtype::I64 as u32, 6);
+        assert_eq!(MlxDtype::U8 as u32, 7);
+        assert_eq!(MlxDtype::U16 as u32, 8);
+        assert_eq!(MlxDtype::U32 as u32, 9);
+        assert_eq!(MlxDtype::U64 as u32, 10);
+    }
+
+    #[test]
+    fn int_element_sizes() {
+        assert_eq!(MlxDtype::I8.element_size(), 1);
+        assert_eq!(MlxDtype::I16.element_size(), 2);
+        assert_eq!(MlxDtype::I64.element_size(), 8);
+        assert_eq!(MlxDtype::U8.element_size(), 1);
+        assert_eq!(MlxDtype::U16.element_size(), 2);
+        assert_eq!(MlxDtype::U32.element_size(), 4);
+        assert_eq!(MlxDtype::U64.element_size(), 8);
+    }
 }
