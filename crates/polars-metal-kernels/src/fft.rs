@@ -90,7 +90,16 @@ pub fn fft_gpu(
             }
             return fft_recursive_fourstep(device, input, n, inverse);
         }
-        return Err(FftError::Unsupported(n));
+        // Composite smooth n <= FFT_BASE_MAX is handled below; composite smooth
+        // n > FFT_BASE_MAX and primes both fall through to Bluestein. Smooth
+        // sizes > 1024 would also work via Bluestein here; the four-step path
+        // already claimed pow2, and the mixed-radix kernel is single-threadgroup
+        // (n <= 1024), so anything non-pow2 above 1024 routes to Bluestein.
+        return bluestein_dispatch(device, input, n, inverse);
+    }
+    if (n & (n - 1)) != 0 && factorize(n).is_none() {
+        // Small non-smooth n (prime factor > 7, e.g. 101 .. 1024) → Bluestein.
+        return bluestein_dispatch(device, input, n, inverse);
     }
 
     let in_buf = MetalBuffer::from_f32_slice(device, input)?;
@@ -136,12 +145,142 @@ pub fn fft_gpu(
             tg,
         )?;
     } else {
-        // leftover prime factor > 7 → Bluestein (Task 6).
+        // Unreachable: small non-smooth n was routed to Bluestein above before
+        // reaching the single-threadgroup base path. Kept as a defensive guard.
         return Err(FftError::Unsupported(n));
     }
 
     queue.wait_until_complete()?;
     Ok(out_buf.to_f32_vec())
+}
+
+/// Smallest power of two `>= x` (with `next_pow2(0) == 1`). Used to size the
+/// Bluestein convolution length `M = next_pow2(2N-1)`.
+fn next_pow2(x: u64) -> u64 {
+    if x <= 1 {
+        return 1;
+    }
+    1u64 << (64 - (x - 1).leading_zeros())
+}
+
+/// Bluestein boundary wrapper: dispatches the FORWARD chirp-z [`bluestein`]
+/// and handles inverse the same way the four-step path does —
+/// `ifft(x) = conj(fft(conj(x)))/N`. Conjugate the input host-side, run the
+/// forward Bluestein, then conjugate + scale by `1/N` on readback.
+///
+/// Guards `M = next_pow2(2N-1) <= 2^30` so the internal pow2 FFTs stay within
+/// the four-step path's supported range; otherwise [`FftError::Unsupported`].
+fn bluestein_dispatch(
+    device: &MetalDevice,
+    input: &[f32],
+    n: i64,
+    inverse: bool,
+) -> Result<Vec<f32>, FftError> {
+    if n < 2 {
+        return Err(FftError::Unsupported(n));
+    }
+    let m = next_pow2(2 * n as u64 - 1);
+    if m > (1 << 30) {
+        return Err(FftError::Unsupported(n));
+    }
+    let nn = n as usize;
+
+    if !inverse {
+        return bluestein(device, input, nn);
+    }
+
+    // ifft via forward Bluestein on the conjugated input.
+    let mut staged = input.to_vec();
+    for c in staged.chunks_exact_mut(2) {
+        c[1] = -c[1];
+    }
+    let mut out = bluestein(device, &staged, nn)?;
+    let scale = 1.0f32 / n as f32;
+    for c in out.chunks_exact_mut(2) {
+        c[0] *= scale;
+        c[1] = -c[1] * scale;
+    }
+    Ok(out)
+}
+
+/// Forward length-`n` DFT via Bluestein's chirp-z transform, for arbitrary
+/// `n >= 2` (in particular primes and large-prime-factor composites the smooth
+/// paths reject). Reduces the DFT to a length-`M = next_pow2(2n-1)` circular
+/// convolution evaluated by the (verified) pow2 four-step FFT.
+///
+/// Math: `X[k] = b[k] * (a ∗ h)[k]` where the chirp `b[m] = e^{-iπ m²/n}`,
+/// `a[n_] = x[n_]·b[n_]`, and the filter `h[m] = conj(b[m]) = e^{+iπ m²/n}`
+/// (even: `h[-m]=h[m]`). The linear convolution `a ∗ h` is computed as a
+/// zero-padded length-`M` circular convolution:
+/// `conv = IFFT_M(FFT_M(A) · FFT_M(H))`.
+///
+/// The chirp is built host-side in f64 using the period-`2n` reduction of `m²`
+/// (`mm = (m·m) mod 2n`) so `m²` never overflows for large `n`. All O(M) work
+/// (chirp/filter build, pointwise product, post-multiply) is host-side; only the
+/// three length-`M` pow2 FFTs run on the GPU. `M` is pow2, so each FFT routes to
+/// the four-step path and never re-enters Bluestein (no recursion).
+///
+/// Input `input` is interleaved-complex length `2n`; output is interleaved
+/// length `2n`.
+fn bluestein(device: &MetalDevice, input: &[f32], n: usize) -> Result<Vec<f32>, FftError> {
+    use std::f64::consts::PI;
+    let m = next_pow2(2 * n as u64 - 1) as usize;
+    let two_n = 2 * n as u64;
+
+    // Chirp b[m_] = e^{-iπ m_²/n}, built in f64 via mm = m_² mod 2n.
+    let mut b_re = vec![0f64; n];
+    let mut b_im = vec![0f64; n];
+    for (mi, (br, bi)) in b_re.iter_mut().zip(b_im.iter_mut()).enumerate() {
+        let mm = (mi as u64 * mi as u64) % two_n;
+        let angle = -PI * (mm as f64) / (n as f64);
+        *br = angle.cos();
+        *bi = angle.sin();
+    }
+
+    // A: a[n_] = x[n_]·b[n_], zero-padded to M (interleaved length 2M).
+    let mut a = vec![0f32; 2 * m];
+    for i in 0..n {
+        let (xr, xi) = (input[2 * i] as f64, input[2 * i + 1] as f64);
+        let (br, bi) = (b_re[i], b_im[i]);
+        a[2 * i] = (xr * br - xi * bi) as f32;
+        a[2 * i + 1] = (xr * bi + xi * br) as f32;
+    }
+
+    // H: filter h[m_] = conj(b[m_]) = (b_re, -b_im). H[0]=h[0]; for m_ in [1,n):
+    // H[m_]=h[m_] and H[M-m_]=h[m_] (even symmetry, negative lags wrap to the top).
+    let mut h = vec![0f32; 2 * m];
+    h[0] = b_re[0] as f32; // h[0] = conj(b[0]); b[0] = 1, imag 0.
+    h[1] = -b_im[0] as f32;
+    for mi in 1..n {
+        let (hr, hi) = (b_re[mi] as f32, -b_im[mi] as f32);
+        h[2 * mi] = hr;
+        h[2 * mi + 1] = hi;
+        let w = m - mi;
+        h[2 * w] = hr;
+        h[2 * w + 1] = hi;
+    }
+
+    // FFT_M(A) · FFT_M(H), then IFFT_M. M is pow2 → four-step path.
+    let fa = fft_gpu(device, &a, m as i64, false)?;
+    let fh = fft_gpu(device, &h, m as i64, false)?;
+    let mut c = vec![0f32; 2 * m];
+    for i in 0..m {
+        let (ar, ai) = (fa[2 * i] as f64, fa[2 * i + 1] as f64);
+        let (hr, hi) = (fh[2 * i] as f64, fh[2 * i + 1] as f64);
+        c[2 * i] = (ar * hr - ai * hi) as f32;
+        c[2 * i + 1] = (ar * hi + ai * hr) as f32;
+    }
+    let conv = fft_gpu(device, &c, m as i64, true)?;
+
+    // X[k] = b[k] · conv[k] for k in [0,n).
+    let mut out = vec![0f32; 2 * n];
+    for k in 0..n {
+        let (cr, ci) = (conv[2 * k] as f64, conv[2 * k + 1] as f64);
+        let (br, bi) = (b_re[k], b_im[k]);
+        out[2 * k] = (br * cr - bi * ci) as f32;
+        out[2 * k + 1] = (br * ci + bi * cr) as f32;
+    }
+    Ok(out)
 }
 
 /// Maximum four-step recursion depth before bailing to [`FftError::Unsupported`].

@@ -210,6 +210,40 @@ fn recursive_fourstep_inverse_broken_band() {
 }
 
 #[test]
+fn bluestein_prime_matches_dft_and_roundtrips() {
+    let device = MetalDevice::system_default().expect("device");
+    // Moderate primes: forward vs the O(N^2) DFT oracle (feasible at these sizes).
+    for &n in &[101usize, 251, 509, 1021] {
+        let sig = interleaved_signal(n, 200 + n as u64);
+        let got = fft_gpu(&device, &sig, n as i64, false).expect("fft");
+        let exp = dft_reference(&sig, n, false);
+        assert!(
+            l2_rel_err(&got, &exp) < 1e-4,
+            "n={n} fwd L2 {}",
+            l2_rel_err(&got, &exp)
+        );
+        // inverse vs idft oracle too (exercises inverse-boundary Bluestein)
+        let inv = fft_gpu(&device, &sig, n as i64, true).expect("ifft");
+        let iexp = dft_reference(&sig, n, true);
+        assert!(
+            l2_rel_err(&inv, &iexp) < 1e-4,
+            "n={n} inv L2 {}",
+            l2_rel_err(&inv, &iexp)
+        );
+    }
+    // Large prime: O(N^2) oracle is infeasible — verify via round-trip self-consistency.
+    let n = 100003usize;
+    let sig = interleaved_signal(n, 999);
+    let fwd = fft_gpu(&device, &sig, n as i64, false).expect("fft");
+    let back = fft_gpu(&device, &fwd, n as i64, true).expect("ifft");
+    assert!(
+        l2_rel_err(&back, &sig) < 1e-3,
+        "n={n} roundtrip L2 {}",
+        l2_rel_err(&back, &sig)
+    );
+}
+
+#[test]
 fn radix2_inverse_and_roundtrip() {
     let device = MetalDevice::system_default().expect("device");
     // sizes within the single-threadgroup base path (n <= FFT_BASE_MAX = 1024);
