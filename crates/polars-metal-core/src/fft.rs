@@ -1,11 +1,9 @@
-//! M6 A3: 1-D FFT over a whole column, composed from MLX FFT FFI.
-use std::sync::Arc;
+//! M6 A3: 1-D FFT over a whole column, run on the hand-rolled MSL FFT kernel
+//! (`polars_metal_kernels::fft::fft_gpu`). The kernel handles all sizes on-GPU
+//! (pow2 four-step/recursive, mixed-radix composites, Bluestein for primes /
+//! non-smooth), replacing the MLX FFT FFI (which was correct only to 2^20).
 
-use polars_metal_buffer::{MetalBuffer, MetalDevice};
-use polars_metal_mlx_sys::array::{
-    mlx_array_eval, mlx_array_to_f32_vec, mlx_array_view_metal_buffer, MlxArrayHandle, MlxDtype,
-};
-use polars_metal_mlx_sys::fft::{mlx_complex, mlx_fft, mlx_ifft, mlx_imag, mlx_real};
+use polars_metal_buffer::MetalDevice;
 use polars_metal_mlx_sys::FfiError;
 
 /// Input to `fft_core`: a real F32 signal, or a complex signal as two F32 streams.
@@ -14,46 +12,44 @@ pub enum FftInput<'a> {
     Complex(&'a [f32], &'a [f32]),
 }
 
-/// View a host F32 slice as a 1-D `(n,)` MLX array (mirrors `vector_search::view2d`).
-fn view1d(data: &[f32], n: i64) -> Result<MlxArrayHandle, FfiError> {
-    let device = MetalDevice::system_default()
-        .map_err(|e| FfiError::Runtime(format!("metal device unavailable: {e}")))?;
-    // SAFETY: `data` outlives every use of the returned handle within this fn's callers,
-    // which eval and read back before returning. MetalBuffer borrows, does not own.
-    // `f32` has no invalid bit patterns.
-    let buf = unsafe { MetalBuffer::from_borrowed_f32(&device, data.as_ptr(), data.len()) }
-        .map(Arc::new)
-        .map_err(|e| FfiError::Runtime(format!("metal buffer staging: {e}")))?;
-    mlx_array_view_metal_buffer(buf, &[n], MlxDtype::F32)
-}
-
 /// Run a 1-D FFT (or inverse) over the whole signal. Returns `(real_out, imag_out)`,
-/// each length `n`, row order = MLX bin order (matches numpy.fft).
+/// each length `n`, row order = bin order (matches numpy.fft).
 pub fn fft_core(
     input: FftInput<'_>,
     n: i64,
     inverse: bool,
 ) -> Result<(Vec<f32>, Vec<f32>), FfiError> {
-    let arr = match input {
-        FftInput::Real(re) => view1d(re, n)?,
-        FftInput::Complex(re, im) => {
-            let r = view1d(re, n)?;
-            let i = view1d(im, n)?;
-            mlx_complex(&r, &i)?
+    let len = n as usize;
+    // Build the interleaved-complex `[re,im,...]` host buffer (length 2n) the
+    // kernel expects.
+    let mut interleaved = vec![0.0f32; 2 * len];
+    match input {
+        FftInput::Real(re) => {
+            for (i, &v) in re.iter().enumerate() {
+                interleaved[2 * i] = v;
+            }
         }
-    };
-    let transformed = if inverse {
-        mlx_ifft(&arr)?
-    } else {
-        mlx_fft(&arr)?
-    };
-    let re_out = mlx_real(&transformed)?;
-    let im_out = mlx_imag(&transformed)?;
-    mlx_array_eval(&[re_out.clone(), im_out.clone()])?;
-    Ok((
-        mlx_array_to_f32_vec(&re_out)?,
-        mlx_array_to_f32_vec(&im_out)?,
-    ))
+        FftInput::Complex(re, im) => {
+            for i in 0..len {
+                interleaved[2 * i] = re[i];
+                interleaved[2 * i + 1] = im[i];
+            }
+        }
+    }
+
+    let device = MetalDevice::system_default()
+        .map_err(|e| FfiError::Runtime(format!("metal device unavailable: {e}")))?;
+    let out = polars_metal_kernels::fft::fft_gpu(&device, &interleaved, n, inverse)
+        .map_err(|e| FfiError::Runtime(format!("fft kernel: {e}")))?;
+
+    // Split the interleaved transform (length 2n) back into separate streams.
+    let mut re_out = vec![0.0f32; len];
+    let mut im_out = vec![0.0f32; len];
+    for i in 0..len {
+        re_out[i] = out[2 * i];
+        im_out[i] = out[2 * i + 1];
+    }
+    Ok((re_out, im_out))
 }
 
 use pyo3::prelude::*;

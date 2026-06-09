@@ -17,17 +17,12 @@ from polars_metal import _native
 from polars_metal._fft_detect import FftBinding
 from polars_metal._fft_namespace import OP_IFFT
 
-# MLX's Metal FFT is correct only up to 2^20 (ml-explore/mlx#1800, a known/open upstream bug
-# unfixed through MLX 0.31): 2^21/2^22 fail to load a kernel, and >=2^23 SILENTLY returns
-# garbage (we verified L2 rel err ~1.4). Non-power-of-2 sizes route through Bluestein, whose
-# internal padding can itself exceed 2^20 and break. So we route ONLY power-of-2 sizes <= 2^20
-# (the safe Stockham regime) to the GPU; everything else falls back to numpy on CPU, which is
-# correct and fast at these sizes. The hand-rolled MSL FFT (future) will replace this ceiling.
-_GPU_FFT_MAX = 1 << 20
-
-
-def _is_pow2(n: int) -> bool:
-    return n > 0 and (n & (n - 1)) == 0
+# The hand-rolled MSL FFT kernel (polars_metal_kernels::fft) handles ALL sizes on-GPU —
+# pow2 (four-step/recursive, to 2^30), mixed-radix composites, and Bluestein for primes /
+# non-smooth sizes — so there is no longer a 2^20 ceiling (the old MLX-FFT limitation,
+# ml-explore/mlx#1800). We route every size through the GPU and fall back to numpy on CPU
+# only on error (GPU OOM, or n beyond the kernel's supported 2^30 range), which is still
+# correct.
 
 
 def _cpu_fft(re: np.ndarray, im: np.ndarray | None, inverse: bool) -> tuple[np.ndarray, np.ndarray]:
@@ -77,15 +72,15 @@ def _run_binding(df: pl.DataFrame, b: FftBinding) -> pl.Series:
             {"real": np.empty(0, np.float32), "imag": np.empty(0, np.float32)}
         ).to_struct(b.out_name)
     inverse = b.op == OP_IFFT
-    if _is_pow2(n) and n <= _GPU_FFT_MAX:
+    try:
         imag_arg = None if im is None else (im.ctypes.data, im.size)
         real_bytes, imag_bytes = _native.execute_fft(
             (re.ctypes.data, re.size), imag_arg, n, inverse
         )
         real_out = np.frombuffer(real_bytes, dtype=np.float32)
         imag_out = np.frombuffer(imag_bytes, dtype=np.float32)
-    else:
-        # Outside MLX's reliable FFT regime → CPU fallback for correctness (see _GPU_FFT_MAX).
+    except Exception:
+        # GPU OOM or n beyond the kernel's supported range → CPU fallback (still correct).
         real_out, imag_out = _cpu_fft(re, im, inverse)
     return pl.DataFrame({"real": real_out, "imag": imag_out}).to_struct(b.out_name)
 

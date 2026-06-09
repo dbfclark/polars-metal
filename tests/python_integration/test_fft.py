@@ -105,9 +105,10 @@ def test_fft_nulls_raise():
         df.lazy().with_columns(pl.col("sig").metal.fft().alias("o")).collect(engine=MetalEngine())
 
 
-def test_fft_large_n_falls_back_to_cpu_correctly():
-    # N > 2^20: MLX's Metal FFT is broken (ml-explore/mlx#1800) — it silently returns garbage
-    # at this size. The engine must fall back to CPU and return the CORRECT numpy result.
+def test_fft_large_n_correct_on_gpu():
+    # N = 3,000,000 is non-pow2 and > 1024 → the hand-rolled MSL kernel routes it through
+    # Bluestein (M = next_pow2(2N-1) = 2^23) and computes it CORRECTLY on-GPU. (Previously this
+    # size fell back to CPU because MLX's Metal FFT was broken above 2^20, ml-explore/mlx#1800.)
     n = 3_000_000
     sig = np.random.default_rng(7).standard_normal(n).astype(np.float32)
     df = pl.DataFrame({"sig": sig}, schema={"sig": pl.Float32})
@@ -122,7 +123,7 @@ def test_fft_large_n_falls_back_to_cpu_correctly():
     )
     exp = np.fft.fft(sig.astype(np.float64))
     l2 = np.linalg.norm(got - exp) / np.linalg.norm(exp)
-    assert l2 < 1e-3, f"large-N FFT not correct via CPU fallback: L2={l2}"
+    assert l2 < 1e-3, f"large-N FFT not correct on GPU: L2={l2}"
 
 
 def test_fft_empty_column():
