@@ -42,11 +42,18 @@ pub fn fft_core(
             mlx_complex(&r, &i)?
         }
     };
-    let transformed = if inverse { mlx_ifft(&arr)? } else { mlx_fft(&arr)? };
+    let transformed = if inverse {
+        mlx_ifft(&arr)?
+    } else {
+        mlx_fft(&arr)?
+    };
     let re_out = mlx_real(&transformed)?;
     let im_out = mlx_imag(&transformed)?;
     mlx_array_eval(&[re_out.clone(), im_out.clone()])?;
-    Ok((mlx_array_to_f32_vec(&re_out)?, mlx_array_to_f32_vec(&im_out)?))
+    Ok((
+        mlx_array_to_f32_vec(&re_out)?,
+        mlx_array_to_f32_vec(&im_out)?,
+    ))
 }
 
 use pyo3::prelude::*;
@@ -100,7 +107,10 @@ pub fn execute_fft(
         unsafe { std::slice::from_raw_parts(re_out.as_ptr() as *const u8, re_out.len() * 4) };
     let im_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(im_out.as_ptr() as *const u8, im_out.len() * 4) };
-    Ok((PyBytes::new_bound(py, re_bytes), PyBytes::new_bound(py, im_bytes)))
+    Ok((
+        PyBytes::new_bound(py, re_bytes),
+        PyBytes::new_bound(py, im_bytes),
+    ))
 }
 
 #[cfg(test)]

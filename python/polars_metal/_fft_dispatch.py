@@ -30,9 +30,7 @@ def _is_pow2(n: int) -> bool:
     return n > 0 and (n & (n - 1)) == 0
 
 
-def _cpu_fft(
-    re: np.ndarray, im: np.ndarray | None, inverse: bool
-) -> tuple[np.ndarray, np.ndarray]:
+def _cpu_fft(re: np.ndarray, im: np.ndarray | None, inverse: bool) -> tuple[np.ndarray, np.ndarray]:
     """CPU fallback (numpy) for sizes MLX's Metal FFT can't do correctly. Returns
     (real_out f32, imag_out f32), matching the GPU path's F32 Struct output."""
     signal = re if im is None else (re.astype(np.float64) + 1j * im.astype(np.float64))

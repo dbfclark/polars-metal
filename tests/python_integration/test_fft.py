@@ -44,8 +44,10 @@ def test_fft_matches_numpy_end_to_end():
     rng = np.random.default_rng(0)
     sig = rng.standard_normal(64).astype(np.float32)
     df = pl.DataFrame({"sig": sig}, schema={"sig": pl.Float32})
-    out = df.lazy().with_columns(pl.col("sig").metal.fft().alias("spec")).collect(
-        engine=MetalEngine()
+    out = (
+        df.lazy()
+        .with_columns(pl.col("sig").metal.fft().alias("spec"))
+        .collect(engine=MetalEngine())
     )
     spec = out.get_column("spec")
     got_re = np.asarray(spec.struct.field("real").to_numpy(), dtype=np.float32)
@@ -59,8 +61,10 @@ def test_ifft_matches_numpy_real_input():
     rng = np.random.default_rng(1)
     sig = rng.standard_normal(128).astype(np.float32)
     df = pl.DataFrame({"sig": sig}, schema={"sig": pl.Float32})
-    out = df.lazy().with_columns(pl.col("sig").metal.ifft().alias("out")).collect(
-        engine=MetalEngine()
+    out = (
+        df.lazy()
+        .with_columns(pl.col("sig").metal.ifft().alias("out"))
+        .collect(engine=MetalEngine())
     )
     spec = out.get_column("out")
     got = np.asarray(spec.struct.field("real").to_numpy(), np.float32) + 1j * np.asarray(
@@ -75,11 +79,15 @@ def test_fft_then_ifft_round_trip_struct_input():
     rng = np.random.default_rng(2)
     sig = rng.standard_normal(256).astype(np.float32)
     df = pl.DataFrame({"sig": sig}, schema={"sig": pl.Float32})
-    spec_df = df.lazy().with_columns(pl.col("sig").metal.fft().alias("spec")).collect(
-        engine=MetalEngine()
+    spec_df = (
+        df.lazy()
+        .with_columns(pl.col("sig").metal.fft().alias("spec"))
+        .collect(engine=MetalEngine())
     )
-    rec = spec_df.lazy().with_columns(pl.col("spec").metal.ifft().alias("rec")).collect(
-        engine=MetalEngine()
+    rec = (
+        spec_df.lazy()
+        .with_columns(pl.col("spec").metal.ifft().alias("rec"))
+        .collect(engine=MetalEngine())
     )
     got = np.asarray(rec.get_column("rec").struct.field("real").to_numpy(), np.float32)
     assert np.allclose(got, sig, rtol=1e-3, atol=1e-3)
@@ -103,8 +111,10 @@ def test_fft_large_n_falls_back_to_cpu_correctly():
     n = 3_000_000
     sig = np.random.default_rng(7).standard_normal(n).astype(np.float32)
     df = pl.DataFrame({"sig": sig}, schema={"sig": pl.Float32})
-    out = df.lazy().with_columns(pl.col("sig").metal.fft().alias("spec")).collect(
-        engine=MetalEngine()
+    out = (
+        df.lazy()
+        .with_columns(pl.col("sig").metal.fft().alias("spec"))
+        .collect(engine=MetalEngine())
     )
     spec = out.get_column("spec")
     got = np.asarray(spec.struct.field("real").to_numpy(), np.float64) + 1j * np.asarray(

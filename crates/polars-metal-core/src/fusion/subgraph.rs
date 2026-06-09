@@ -391,8 +391,12 @@ fn build_op(node: &OpNode, handles: &[MlxArrayHandle]) -> Result<MlxArrayHandle,
         // Matmul - inputs must be 2-D; Phase 10 (List/Array dot) sets that up.
         MatMul => ffi(mlx_matmul(args[0], args[1])),
 
-        // FFT (Phase 11 surface; needs the metal.fft() namespace before it's
-        // reachable from the analyzer, but the dispatch is wired now).
+        // FFT. UNREACHABLE from this fused-walker path: `fft` is not a NodeTraverser-viewable
+        // expression, so the analyzer never builds this arm, and folding a complex FFT result
+        // back into an F32 Series here would be wrong anyway. The LIVE FFT path is the `.metal`
+        // namespace (python/polars_metal/_fft_*; docs/superpowers/specs/2026-06-08-m6-a3-fft*).
+        // That path also guards to MLX's reliable size (pow2 ≤ 2^20, ml-explore/mlx#1800) and
+        // CPU-falls-back above it. Do not rely on / extend these arms.
         Fft => ffi(mlx_fft(args[0])),
         Ifft => ffi(mlx_ifft(args[0])),
 

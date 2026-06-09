@@ -55,7 +55,7 @@ def _binding_from_expr_json(expr_json: dict, out_name: str) -> FftBinding | None
         for fld in _struct_fields(expr_json):
             alias_name = _alias_name(fld)
             if alias_name and alias_name.startswith(FFT_SENTINEL_TAG):
-                input_col = alias_name[len(FFT_SENTINEL_TAG):]
+                input_col = alias_name[len(FFT_SENTINEL_TAG) :]
                 op = _literal_int(fld)
         if input_col is None or op is None:
             return None
