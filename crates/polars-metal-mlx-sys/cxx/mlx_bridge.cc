@@ -118,6 +118,7 @@ bool mlx_array_is_f32(const std::shared_ptr<MlxArray>& arr) {
     return arr->dtype() == mlx::core::float32;
 }
 
+// INVARIANT: keep in sync with MlxDtype (array.rs, canonical) and its inverse mlx_array_dtype below.
 mlx::core::Dtype mlx_dtype_from_tag(uint32_t tag) {
     switch (tag) {
         case 0:  return mlx::core::float32;
@@ -138,6 +139,7 @@ mlx::core::Dtype mlx_dtype_from_tag(uint32_t tag) {
     }
 }
 
+// INVARIANT: exact inverse of mlx_dtype_from_tag above; canonical tag list is MlxDtype (array.rs).
 uint32_t mlx_array_dtype(const std::shared_ptr<MlxArray>& arr) {
     mlx::core::Dtype dt = arr->dtype();
     if (dt == mlx::core::float32) return 0;
