@@ -37,6 +37,7 @@ fn convert_dtype(d: IrMetalDtype) -> KMetalDtype {
         IrMetalDtype::U8 => KMetalDtype::U8,
         IrMetalDtype::U16 => KMetalDtype::U16,
         IrMetalDtype::U32 => KMetalDtype::U32,
+        IrMetalDtype::U64 => KMetalDtype::U64,
         IrMetalDtype::Utf8 => KMetalDtype::Utf8,
     }
 }

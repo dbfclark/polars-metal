@@ -52,6 +52,13 @@ pub enum MetalDtype {
     U8,
     U16,
     U32,
+    // M6: completes the 8 integer widths to stay in sync with the IR enum.
+    // UInt64 reductions land via the Python select-reduction path, not this
+    // (conformance-only) groupby signature/emitter, so a U64 agg value column
+    // is not observed here in practice — `signature_supported_by_fused`
+    // reports it unsupported (like I64/F64) so the groupby path falls back to
+    // CPU-finalize rather than mis-accumulating 64-bit values.
+    U64,
     // M3 Phase 7: dictionary-encoded Utf8. Present in this mirror only to
     // stay in sync with the IR enum; Utf8 columns are never agg value cols,
     // so the fused signature will never observe this variant in practice.

@@ -728,7 +728,9 @@ def _build_select_reduction_fused(plan: dict) -> Any:
                         col = frame.get_column(payload)
                         col_dtype_str = _series_input_dtype_str(col)
                         col_np_dtype, col_tag = _np_dtype_and_tag(col_dtype_str)
-                        input_arrays.append(np.ascontiguousarray(col.to_numpy(), dtype=col_np_dtype))
+                        input_arrays.append(
+                            np.ascontiguousarray(col.to_numpy(), dtype=col_np_dtype)
+                        )
                         input_tags.append(col_tag)
                     elif d_kind == "lit":
                         input_arrays.append(np.asarray([payload], dtype=out_np_dtype))

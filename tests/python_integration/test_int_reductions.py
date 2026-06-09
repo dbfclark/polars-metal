@@ -111,8 +111,14 @@ def test_int64_chain_sum_routes_to_gpu_and_matches():
 
 _SUM_DTYPES = [pl.Int32, pl.Int64, pl.UInt32, pl.UInt64]
 _MINMAX_DTYPES = [
-    pl.Int8, pl.Int16, pl.Int32, pl.Int64,
-    pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
+    pl.Int8,
+    pl.Int16,
+    pl.Int32,
+    pl.Int64,
+    pl.UInt8,
+    pl.UInt16,
+    pl.UInt32,
+    pl.UInt64,
 ]
 
 
@@ -220,7 +226,7 @@ def test_narrow_int_sum_falls_back_to_cpu_and_matches(dtype):
     # Bare AND chain forms: narrow sum is never admitted (analyzer aborts).
     for lf in (
         df.lazy().select(pl.col("x").sum().alias("r")),
-        df.lazy().select(((pl.col("x") + 1)).sum().alias("r")),
+        df.lazy().select((pl.col("x") + 1).sum().alias("r")),
     ):
         assert _reduction_dispatches(lf, eng) == 0, f"narrow sum {dtype} must stay CPU"
         got, want = lf.collect(engine=eng), lf.collect()
@@ -233,7 +239,7 @@ def test_int_mean_falls_back_to_cpu_and_matches(dtype):
     df = pl.DataFrame({"x": pl.Series([1, 2, 3, 4], dtype=dtype)})
     for lf in (
         df.lazy().select(pl.col("x").mean().alias("r")),
-        df.lazy().select(((pl.col("x") + 1)).mean().alias("r")),
+        df.lazy().select((pl.col("x") + 1).mean().alias("r")),
     ):
         assert _reduction_dispatches(lf, eng) == 0, f"int mean {dtype} must stay CPU"
         got, want = lf.collect(engine=eng), lf.collect()
