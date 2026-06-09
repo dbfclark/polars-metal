@@ -31,3 +31,21 @@ fn radix2_small_pow2_forward_matches_dft() {
         assert!(err < 1e-4, "n={n}: L2 rel err {err} too high");
     }
 }
+
+#[test]
+fn radix2_inverse_and_roundtrip() {
+    let device = MetalDevice::system_default().expect("device");
+    // sizes within the single-threadgroup base path (n <= FFT_BASE_MAX = 1024);
+    // n > 1024 is exercised once the four-step path lands (Task 4).
+    for &n in &[8usize, 64, 256, 1024] {
+        let sig = interleaved_signal(n, 7 + n as u64);
+        // inverse matches reference idft
+        let inv = fft_gpu(&device, &sig, n as i64, true).expect("ifft");
+        let exp = dft_reference(&sig, n, true);
+        assert!(l2_rel_err(&inv, &exp) < 1e-4, "n={n} ifft");
+        // round-trip: ifft(fft(x)) ≈ x
+        let fwd = fft_gpu(&device, &sig, n as i64, false).expect("fft");
+        let back = fft_gpu(&device, &fwd, n as i64, true).expect("ifft");
+        assert!(l2_rel_err(&back, &sig) < 1e-4, "n={n} roundtrip");
+    }
+}
