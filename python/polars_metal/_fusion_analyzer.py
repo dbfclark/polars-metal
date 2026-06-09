@@ -296,16 +296,32 @@ def _extract_literal_value(payload: Any) -> Any:
     raise _Aborted
 
 
+# Polars dtype -> PyFusionScope input-dtype string, for the integer family.
+# Used by both `_dtype_to_input_str` (leaf staging) and the monomorphic
+# output-dtype inference (`_scan_binding_col_dtype`).
+_INT_DTYPE_TO_STR: dict[Any, str] = {
+    pl.Int8: "I8",
+    pl.Int16: "I16",
+    pl.Int32: "I32",
+    pl.Int64: "I64",
+    pl.UInt8: "U8",
+    pl.UInt16: "U16",
+    pl.UInt32: "U32",
+    pl.UInt64: "U64",
+}
+
+
 def _dtype_to_input_str(dtype: Any) -> str:
     """Map a Polars dtype to the input-dtype string the PyFusionScope accepts."""
     if dtype == pl.Float32:
         return "F32"
     if dtype == pl.Float64:
         return "F64"
-    if dtype == pl.Int32:
-        return "I32"
     if dtype == pl.Boolean:
         return "Bool"
+    for pl_dtype, s in _INT_DTYPE_TO_STR.items():
+        if dtype == pl_dtype:
+            return s
     s = str(dtype)
     if s.startswith("Array(Float32"):
         inner_d = _extract_array_dim(s)
@@ -472,20 +488,110 @@ def analyze_ir_expression(nt: Any, node_id: int, schema: dict[str, Any]) -> PyFu
     return None if result is None else result[0]
 
 
+# Input-dtype strings the B1 monomorphic-int fused path can produce as output.
+# Float32 is handled by the legacy F32-only path; B1 extends recognition to a
+# chain whose every column leaf shares one of these integer dtypes. A mixed
+# int/F32 chain (or a chain with no columns) aborts -> CPU fallback (B2 owns
+# generalization), so B1 never returns a wrong answer on a shape it can't
+# statically infer the output dtype for.
+_MONOMORPHIC_OUT_DTYPES: frozenset[str] = frozenset(
+    {"I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64"}
+)
+
+
+def _scan_binding_col_dtype(nt: Any, node_id: int, schema: dict[str, Any]) -> str | None:
+    """Walk the expr subtree and return the single common column-leaf
+    InputDtype string, or ``None`` if the chain has zero columns, mixes
+    multiple column dtypes, or contains a node we don't recognize.
+
+    This drives B1's monomorphic-output inference: for a chain like
+    ``col + 1`` where every Column leaf shares one dtype, the fused output
+    dtype equals that dtype. Literals are skipped (they're staged at the
+    column width, not their own). A heterogeneous chain (mixed int/F32, or an
+    explicit non-F32 Cast) returns ``None`` so the caller falls back to CPU —
+    B2 will generalize promotion semantics.
+
+    Returns the wire dtype string (e.g. ``"I64"``) or ``None``."""
+    found: set[str] = set()
+
+    def walk(nid: int) -> bool:
+        """Return False to signal an unrecognized node (caller aborts)."""
+        try:
+            node = nt.view_expression(nid)
+        except Exception:
+            return False
+        cls = type(node).__name__
+        if cls == "Column":
+            name = getattr(node, "name", None)
+            if name is None:
+                return False
+            dtype = schema.get(str(name))
+            if dtype is None:
+                return False
+            try:
+                found.add(_dtype_to_input_str(dtype))
+            except _Aborted:
+                return False
+            return True
+        if cls == "Literal":
+            return True
+        if cls == "BinaryExpr":
+            return walk(node.left) and walk(node.right)
+        if cls == "Cast":
+            # Only an F32 Cast is honored by `_visit_ir_ops`; a non-F32 Cast
+            # already aborts there, so we don't need to model it. An F32 Cast
+            # makes the output F32 (handled by the legacy path), so a chain
+            # containing one is not monomorphic-int — signal "unrecognized"
+            # for this inference, which routes it via the F32 path / CPU.
+            return False
+        if cls == "Ternary":
+            return walk(node.predicate) and walk(node.truthy) and walk(node.falsy)
+        if cls == "Agg":
+            args = list(getattr(node, "arguments", []))
+            return bool(args) and all(walk(a) for a in args)
+        if cls == "Function":
+            return all(walk(cid) for cid in list(getattr(node, "input", [])))
+        return False
+
+    if not walk(node_id):
+        return None
+    if len(found) != 1:
+        # Zero columns (literal-only) or mixed column dtypes: not monomorphic.
+        return None
+    return next(iter(found))
+
+
 def analyze_ir_with_columns(
     nt: Any, node_id: int, schema: dict[str, Any]
-) -> tuple[PyFusionScope, list[tuple[str, str | float]]] | None:
+) -> tuple[PyFusionScope, list[tuple[str, str | float]], str] | None:
     """Like `analyze_ir_expression`, but also returns the ordered list of
-    input descriptors. Each descriptor is `("col", column_name)` for real
-    columns or `("lit", value)` for literal scalars. Order matches the
-    scope's input order, so the executor can construct input buffers in the
-    correct sequence.
+    input descriptors AND the statically-inferred output dtype string. Each
+    descriptor is `("col", column_name)` for real columns or `("lit", value)`
+    for literal scalars. Order matches the scope's input order, so the executor
+    can construct input buffers in the correct sequence.
+
+    The third return element ``out_dtype_str`` is the wire dtype the fused
+    output will carry. For a monomorphic-int chain (every column leaf shares
+    one integer dtype, e.g. ``col + 1`` over Int64) it is that dtype (``"I64"``)
+    and the integer literal is staged at the column width (so MLX doesn't
+    promote ``int + f32_literal`` to f32). Otherwise it is ``"F32"`` — the
+    legacy float path, where literals stage at F32 as before.
 
     Two-pass: pass 1 collects every leaf (Column/Literal) into the scope in
     DFS order so input NodeIdxs are contiguous from 0. Pass 2 walks the tree
     again and pushes ops; on a leaf it returns the precomputed input idx.
     Single-pass interleaving doesn't work because the executor assumes a
     flat `[inputs..., ops...]` layout (see fusion/subgraph.rs build_op)."""
+    # Statically infer the output dtype. A monomorphic-int chain reports its
+    # column dtype (and stages literals at that width); everything else
+    # (F32 chains, mixed, F32-cast) stays on the F32 path with F32 literals.
+    col_dtype = _scan_binding_col_dtype(nt, node_id, schema)
+    if col_dtype in _MONOMORPHIC_OUT_DTYPES:
+        out_dtype_str = col_dtype
+        lit_dtype_str = col_dtype
+    else:
+        out_dtype_str = "F32"
+        lit_dtype_str = "F32"
     try:
         scope = PyFusionScope()
         descriptors: list[tuple[str, str | float]] = []
@@ -497,10 +603,20 @@ def analyze_ir_with_columns(
         # would similarly stage N copies through the FFI boundary.
         col_dedup: dict[str, int] = {}
         lit_dedup: dict[float, int] = {}
-        _gather_leaves_ir(nt, node_id, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup)
+        _gather_leaves_ir(
+            nt,
+            node_id,
+            schema,
+            scope,
+            descriptors,
+            leaf_idx,
+            col_dedup,
+            lit_dedup,
+            lit_dtype_str,
+        )
         idx = _visit_ir_ops(nt, node_id, schema, scope, leaf_idx)
         scope.mark_output(idx)
-        return scope, descriptors
+        return scope, descriptors, out_dtype_str
     except _Aborted:
         return None
 
@@ -1096,6 +1212,7 @@ def _gather_leaves_ir(
     leaf_idx: dict[int, int],
     col_dedup: dict[str, int],
     lit_dedup: dict[float, int],
+    lit_dtype_str: str = "F32",
 ) -> None:
     """Pass 1: DFS-walk the IR tree and `add_input` every Column/Literal,
     recording arena-id -> input-NodeIdx in `leaf_idx`.
@@ -1106,6 +1223,13 @@ def _gather_leaves_ir(
     stage three independent F32 broadcast buffers (3 * n_rows * 4 bytes)
     through the FFI for each call. `leaf_idx[node_id]` still maps every
     arena id to its (possibly shared) input idx so pass 2 can resolve.
+
+    `lit_dtype_str` is the width at which literal leaves are staged. It is
+    ``"F32"`` for the legacy float path (and the reduction / validity callers,
+    which keep their existing behavior). For a B1 monomorphic-int chain the
+    HStack caller passes the column dtype (e.g. ``"I64"``) so the integer
+    literal in ``col + 1`` is staged at the column width — otherwise MLX would
+    promote ``int_col + f32_literal`` to f32, producing the wrong output dtype.
 
     Aborts on the same unsupported-node set as `_visit_ir_ops`."""
     try:
@@ -1139,7 +1263,11 @@ def _gather_leaves_ir(
         val_f = float(val)
         existing = lit_dedup.get(val_f)
         if existing is None:
-            idx = scope.add_input(f"__lit_{val_f}", "F32")
+            # Stage the literal at `lit_dtype_str` (the column width for a
+            # monomorphic-int chain, else F32). Keeps `int_col + lit` integer
+            # rather than letting MLX promote it to f32. The descriptor carries
+            # the value; the dispatch stages it at the binding's output dtype.
+            idx = scope.add_input(f"__lit_{val_f}", lit_dtype_str)
             descriptors.append(("lit", val_f))
             lit_dedup[val_f] = idx
         else:
@@ -1148,9 +1276,19 @@ def _gather_leaves_ir(
         return
 
     if cls == "BinaryExpr":
-        _gather_leaves_ir(nt, node.left, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup)
         _gather_leaves_ir(
-            nt, node.right, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup
+            nt, node.left, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup, lit_dtype_str
+        )
+        _gather_leaves_ir(
+            nt,
+            node.right,
+            schema,
+            scope,
+            descriptors,
+            leaf_idx,
+            col_dedup,
+            lit_dedup,
+            lit_dtype_str,
         )
         return
 
@@ -1160,7 +1298,9 @@ def _gather_leaves_ir(
         # leaves for a tree that pass 2 will reject.
         if getattr(node, "dtype", None) != pl.Float32:
             raise _Aborted
-        _gather_leaves_ir(nt, node.expr, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup)
+        _gather_leaves_ir(
+            nt, node.expr, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup, lit_dtype_str
+        )
         return
 
     if cls == "Function":
@@ -1174,7 +1314,15 @@ def _gather_leaves_ir(
             # compile-time param (validated in pass 2), not an input leaf.
             _shift_offset(nt, fn_inputs)  # validate now so pass 1/2 agree
             _gather_leaves_ir(
-                nt, fn_inputs[0], schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup
+                nt,
+                fn_inputs[0],
+                schema,
+                scope,
+                descriptors,
+                leaf_idx,
+                col_dedup,
+                lit_dedup,
+                lit_dtype_str,
             )
             return
         if fn_name == _INT_RANGE_FN:
@@ -1186,7 +1334,9 @@ def _gather_leaves_ir(
         if _is_reverse_cumulative(fn_name, fd):
             raise _Aborted
         for cid in fn_inputs:
-            _gather_leaves_ir(nt, cid, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup)
+            _gather_leaves_ir(
+                nt, cid, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup, lit_dtype_str
+            )
         return
 
     if cls == "Agg":
@@ -1196,18 +1346,44 @@ def _gather_leaves_ir(
         args = list(getattr(node, "arguments", []))
         if not args:
             raise _Aborted
-        _gather_leaves_ir(nt, args[0], schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup)
+        _gather_leaves_ir(
+            nt, args[0], schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup, lit_dtype_str
+        )
         return
 
     if cls == "Ternary":
         _gather_leaves_ir(
-            nt, node.predicate, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup
+            nt,
+            node.predicate,
+            schema,
+            scope,
+            descriptors,
+            leaf_idx,
+            col_dedup,
+            lit_dedup,
+            lit_dtype_str,
         )
         _gather_leaves_ir(
-            nt, node.truthy, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup
+            nt,
+            node.truthy,
+            schema,
+            scope,
+            descriptors,
+            leaf_idx,
+            col_dedup,
+            lit_dedup,
+            lit_dtype_str,
         )
         _gather_leaves_ir(
-            nt, node.falsy, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup
+            nt,
+            node.falsy,
+            schema,
+            scope,
+            descriptors,
+            leaf_idx,
+            col_dedup,
+            lit_dedup,
+            lit_dtype_str,
         )
         return
 

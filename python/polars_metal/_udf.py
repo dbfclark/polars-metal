@@ -134,6 +134,55 @@ def _dispatch(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
     return pl.DataFrame._from_pydf(result_pydf)
 
 
+# B1: wire dtype string -> (numpy dtype name, MlxDtype u32 tag). Mirrors the
+# `MlxDtype` enum discriminants in `crates/polars-metal-mlx-sys/src/array.rs`
+# (F32=0, F64=1, I32=2, Bool=3, I8=4, I16=5, I64=6, U8=7, U16=8, U32=9, U64=10).
+# Only the dtypes the fused output-zero-copy path produces are listed; the
+# analyzer never reports F64/Bool as a fused output dtype.
+_DTYPE_STR_TO_NP_AND_TAG: dict[str, tuple[str, int]] = {
+    "F32": ("float32", 0),
+    "I8": ("int8", 4),
+    "I16": ("int16", 5),
+    "I32": ("int32", 2),
+    "I64": ("int64", 6),
+    "U8": ("uint8", 7),
+    "U16": ("uint16", 8),
+    "U32": ("uint32", 9),
+    "U64": ("uint64", 10),
+}
+
+# Polars dtype string -> wire dtype string, for staging a column at its native
+# width. Anything not listed (F64, Bool, …) stages at F32 (legacy float path).
+_POLARS_DTYPE_TO_WIRE: dict[str, str] = {
+    "Float32": "F32",
+    "Int8": "I8",
+    "Int16": "I16",
+    "Int32": "I32",
+    "Int64": "I64",
+    "UInt8": "U8",
+    "UInt16": "U16",
+    "UInt32": "U32",
+    "UInt64": "U64",
+}
+
+
+def _np_dtype_and_tag(dtype_str: str) -> tuple[Any, int]:
+    """Map a wire dtype string to its ``(numpy.dtype, MlxDtype u32 tag)``."""
+    import numpy as np
+
+    entry = _DTYPE_STR_TO_NP_AND_TAG.get(dtype_str)
+    if entry is None:
+        raise RuntimeError(f"polars_metal: no numpy/tag mapping for dtype {dtype_str!r}")
+    np_name, tag = entry
+    return np.dtype(np_name), tag
+
+
+def _series_input_dtype_str(series: pl.Series) -> str:
+    """Wire dtype string at which a column should be staged. Native integer
+    width for the int family, else F32 (the legacy float path casts to F32)."""
+    return _POLARS_DTYPE_TO_WIRE.get(str(series.dtype), "F32")
+
+
 def _dispatch_hstack_fused(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
     """Execute an HStack whose every binding carries a `_fused_scope`
     side-channel. Recurses on the upstream input, then runs each binding
@@ -141,10 +190,14 @@ def _dispatch_hstack_fused(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
 
     For each binding, the analyzer returned a `_fused_columns` list of
     descriptors: ``("col", name)`` for real columns or ``("lit", value)``
-    for literal scalars. Column inputs are passed as F32-cast NumPy bytes
-    (n_rows-wide). Literal inputs are passed as a single F32 (4 bytes);
-    the executor builds a shape=[1] MLX array and MLX broadcasts in any
-    elementwise op — no need to materialize n_rows*4 bytes per literal.
+    for literal scalars, plus a `_fused_out_dtype` wire string. Column inputs
+    are staged at their native width (F32 columns as float32; integer columns
+    at their own integer width — B1). Literal inputs are staged at the
+    binding's output dtype (so `int_col + 1` keeps the literal integer rather
+    than letting MLX promote to f32); the executor builds a shape=[1] MLX
+    array and MLX broadcasts in any elementwise op. The output is
+    pre-allocated at the binding's output width so the eval writes directly
+    into it (output-zero-copy).
     """
     import numpy as np
 
@@ -155,39 +208,51 @@ def _dispatch_hstack_fused(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
         scope = binding["_fused_scope"]
         descriptors: list[tuple[str, str | float]] = binding["_fused_columns"]
         name = binding["name"]
+        out_dtype_str = binding.get("_fused_out_dtype", "F32")
+        out_np_dtype, out_tag = _np_dtype_and_tag(out_dtype_str)
+        # Literals stage at the output dtype (keeps int chains integer).
+        lit_np_dtype, lit_tag = out_np_dtype, out_tag
 
         input_arrays: list[np.ndarray] = []
+        input_tags: list[int] = []
         for kind, payload in descriptors:
             if kind == "col":
                 series = upstream.get_column(payload)
-                # Pass the column as a float32 numpy view. For a dense,
-                # single-chunk F32 column `to_numpy()` is zero-copy and already
-                # C-contiguous F32, so `ascontiguousarray` is a no-op view; the
-                # Rust ingest then takes the zero-copy bytesNoCopy path when the
-                # buffer is page-aligned (numpy-origin / large allocations) and
-                # a single copy otherwise. Columns with nulls / multiple chunks
-                # copy here (correctness preserved), then ingest-copy.
-                input_arrays.append(np.ascontiguousarray(series.to_numpy(), dtype=np.float32))
+                col_dtype_str = _series_input_dtype_str(series)
+                col_np_dtype, col_tag = _np_dtype_and_tag(col_dtype_str)
+                # Stage the column at its native width. For a dense, single-chunk
+                # column whose numpy dtype already matches, `ascontiguousarray`
+                # is a no-op view and the Rust ingest takes the zero-copy
+                # bytesNoCopy path (page-aligned numpy-origin allocations).
+                # Columns with nulls / multiple chunks copy here (correctness
+                # preserved), then ingest-copy.
+                input_arrays.append(np.ascontiguousarray(series.to_numpy(), dtype=col_np_dtype))
+                input_tags.append(col_tag)
             elif kind == "lit":
                 # Single scalar — executor builds a shape=[1] MLX array, which
                 # broadcasts in elementwise ops. No n_rows-wide materialization.
-                input_arrays.append(np.asarray([payload], dtype=np.float32))
+                input_arrays.append(np.asarray([payload], dtype=lit_np_dtype))
+                input_tags.append(lit_tag)
             else:
                 raise RuntimeError(f"polars_metal: unknown input descriptor {kind!r}")
 
-        # Output-zero-copy: pre-allocate the result array and let the executor
-        # write the MLX output directly into it (one MLX->numpy copy, no PyBytes
-        # round-trip). `pl.Series` then wraps it without copying.
-        out_arr = np.empty(n_rows, dtype=np.float32)
+        # Output-zero-copy: pre-allocate the result array at the inferred width
+        # and let the executor write the MLX output directly into it (one
+        # MLX->numpy copy, no PyBytes round-trip). `pl.Series` then wraps it
+        # without copying.
+        out_arr = np.empty(n_rows, dtype=out_np_dtype)
         # The buffer protocol isn't available under abi3, so hand the executor
-        # raw (ptr, n_elements) pairs. `input_arrays` and `out_arr` are held in
-        # these locals across the fully synchronous call, keeping the borrowed
-        # memory alive (the executor's safety contract).
-        inputs = [(int(a.__array_interface__["data"][0]), int(a.size)) for a in input_arrays]
+        # raw (ptr, n_elements, dtype_tag) triples. `input_arrays` and `out_arr`
+        # are held in these locals across the fully synchronous call, keeping
+        # the borrowed memory alive (the executor's safety contract).
+        inputs = [
+            (int(a.__array_interface__["data"][0]), int(a.size), tag)
+            for a, tag in zip(input_arrays, input_tags, strict=True)
+        ]
         written = _native.execute_fused_expr(
             scope=scope,
             inputs=inputs,
-            out=(int(out_arr.__array_interface__["data"][0]), int(out_arr.size)),
+            out=(int(out_arr.__array_interface__["data"][0]), int(out_arr.size), out_tag),
         )
         # Literal-only expressions produce a length-1 output (scalar broadcast
         # never widened by an n_rows-shaped column). Polars requires the new
@@ -255,11 +320,12 @@ def _fused_null_mask(
             else:
                 raise RuntimeError(f"polars_metal: unknown validity descriptor {kind!r}")
         mask_out = np.empty(n_rows, dtype=np.float32)
-        v_inputs = [(int(a.__array_interface__["data"][0]), int(a.size)) for a in v_arrays]
+        # Validity subgraph is always F32 (1.0/0.0 mask); tag 0 = MlxDtype::F32.
+        v_inputs = [(int(a.__array_interface__["data"][0]), int(a.size), 0) for a in v_arrays]
         _native.execute_fused_expr(
             scope=v_scope,
             inputs=v_inputs,
-            out=(int(mask_out.__array_interface__["data"][0]), int(mask_out.size)),
+            out=(int(mask_out.__array_interface__["data"][0]), int(mask_out.size), 0),
         )
         return mask_out < 0.5
 
@@ -477,10 +543,11 @@ def _build_sort_fused(inner_udf: Any, fused_sort: dict, by_columns: list[str]) -
         else:
             arr = np.ascontiguousarray(series.to_numpy(), dtype=np.float32)
             out_arr = np.empty(arr.size, dtype=np.float32)
+            # F32 sort path; tag 0 = MlxDtype::F32 for both input and output.
             _native.execute_fused_expr(
                 scope=scope,
-                inputs=[(int(arr.__array_interface__["data"][0]), int(arr.size))],
-                out=(int(out_arr.__array_interface__["data"][0]), int(out_arr.size)),
+                inputs=[(int(arr.__array_interface__["data"][0]), int(arr.size), 0)],
+                out=(int(out_arr.__array_interface__["data"][0]), int(out_arr.size), 0),
             )
             # `out_arr` is ascending. Apply descending + slice at the array
             # level so a top_k (descending + slice=(0,k)) reverses only k
@@ -619,11 +686,12 @@ def _build_select_reduction_fused(plan: dict) -> Any:
                         raise RuntimeError(f"polars_metal: unknown reduction descriptor {d_kind!r}")
 
             out_arr = np.empty(1, dtype=np.float32)
-            inputs = [(int(a.__array_interface__["data"][0]), int(a.size)) for a in input_arrays]
+            # F32 reduction path; tag 0 = MlxDtype::F32 for inputs and output.
+            inputs = [(int(a.__array_interface__["data"][0]), int(a.size), 0) for a in input_arrays]
             _native.execute_fused_expr(
                 scope=scope,
                 inputs=inputs,
-                out=(int(out_arr.__array_interface__["data"][0]), int(out_arr.size)),
+                out=(int(out_arr.__array_interface__["data"][0]), int(out_arr.size), 0),
             )
             val = float(out_arr[0])
             # Bessel: MLX uses population variance (ddof=0); Polars defaults to

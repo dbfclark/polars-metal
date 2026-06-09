@@ -15,13 +15,14 @@ def _f32(series: pl.Series) -> np.ndarray:
     return np.ascontiguousarray(series.to_numpy(), dtype=np.float32)
 
 
-def _ptr(arr: np.ndarray) -> tuple[int, int]:
-    """(data pointer, element count) — the executor's zero-copy input form."""
-    return (int(arr.__array_interface__["data"][0]), int(arr.size))
+def _ptr(arr: np.ndarray) -> tuple[int, int, int]:
+    """(data pointer, element count, dtype tag) — the executor's zero-copy
+    input form. These tests are all F32; tag 0 = MlxDtype::F32."""
+    return (int(arr.__array_interface__["data"][0]), int(arr.size), 0)
 
 
 def _run(scope, in_arrays, out):
-    """Call the executor with (ptr, len) pairs, keeping arrays alive in scope."""
+    """Call the executor with (ptr, len, tag) triples, keeping arrays alive."""
     return native.execute_fused_expr(
         scope=scope,
         inputs=[_ptr(a) for a in in_arrays],

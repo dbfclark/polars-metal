@@ -13,10 +13,10 @@
 
 use polars_metal_buffer::{MetalBuffer, MetalDevice};
 use polars_metal_mlx_sys::array::{
-    mlx_array_copy_to_f32_slice, mlx_array_eval, mlx_array_from_f32_slice, mlx_array_to_f32_vec,
-    mlx_array_to_i16_vec, mlx_array_to_i32_vec, mlx_array_to_i64_vec, mlx_array_to_i8_vec,
-    mlx_array_to_u16_vec, mlx_array_to_u32_vec, mlx_array_to_u64_vec, mlx_array_to_u8_vec,
-    mlx_array_view_metal_buffer, MlxArrayHandle, MlxDtype,
+    mlx_array_eval, mlx_array_from_f32_slice, mlx_array_to_f32_vec, mlx_array_to_i16_vec,
+    mlx_array_to_i32_vec, mlx_array_to_i64_vec, mlx_array_to_i8_vec, mlx_array_to_u16_vec,
+    mlx_array_to_u32_vec, mlx_array_to_u64_vec, mlx_array_to_u8_vec, mlx_array_view_metal_buffer,
+    MlxArrayHandle, MlxDtype,
 };
 use polars_metal_mlx_sys::elementwise::{
     mlx_abs, mlx_acos, mlx_add, mlx_asin, mlx_atan, mlx_atan2, mlx_cbrt, mlx_ceil, mlx_cos,
@@ -164,27 +164,81 @@ impl MlxSubgraph {
         Ok(outs)
     }
 
-    /// Eval the subgraph and copy each output directly into the matching
-    /// caller-owned slice (output-zero-copy: no intermediate `Vec`). `dsts[i]`
-    /// receives output `i` and must hold at least its element count. Returns
-    /// the per-output element counts written.
+    /// Eval the single-output subgraph and write the output into the caller's
+    /// raw buffer at `out_ptr` (output-zero-copy), interpreting it as
+    /// `out_dtype`. Returns the element count written.
     ///
-    /// The number of destination slices must equal the number of outputs.
-    pub fn eval_into(&self, dsts: &mut [&mut [f32]]) -> Result<Vec<usize>, BuildError> {
-        if dsts.len() != self.outputs.len() {
+    /// The caller pre-allocates an output array of the statically-inferred width
+    /// (the analyzer reports it), and this writer copies the eval'd MLX array
+    /// into it width-aware. It hard-errors if the eval'd dtype != `out_dtype`
+    /// (an analyzer mis-inference guard — refuse before corrupting the caller's
+    /// bytes) or if the output doesn't fit `out_cap`.
+    ///
+    /// # Safety contract (caller)
+    /// `out_ptr` addresses `out_cap` writable, contiguous elements of
+    /// `out_dtype`, alive for the whole call.
+    pub fn eval_into_typed(
+        &self,
+        _device: &MetalDevice,
+        out_ptr: usize,
+        out_cap: usize,
+        out_dtype: MlxDtype,
+    ) -> Result<usize, BuildError> {
+        if self.outputs.len() != 1 {
             return Err(BuildError::InputCountMismatch {
-                expected: self.outputs.len(),
-                actual: dsts.len(),
+                expected: 1,
+                actual: self.outputs.len(),
             });
         }
         mlx_array_eval(&self.outputs).map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
-        let mut counts = Vec::with_capacity(self.outputs.len());
-        for (h, dst) in self.outputs.iter().zip(dsts.iter_mut()) {
-            let n = mlx_array_copy_to_f32_slice(h, dst)
-                .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
-            counts.push(n);
+        let h = &self.outputs[0];
+        let got = h
+            .dtype()
+            .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+        if got != out_dtype {
+            return Err(BuildError::MlxError(format!(
+                "output dtype mismatch: declared {out_dtype:?}, eval'd {got:?}"
+            )));
         }
-        Ok(counts)
+        let n: usize = h.shape().iter().product();
+        if n > out_cap {
+            return Err(BuildError::MlxError(format!(
+                "output too large: {n} > capacity {out_cap}"
+            )));
+        }
+        if n == 0 {
+            return Ok(0);
+        }
+        // Local macro to DRY the per-width arms. This is the SECOND
+        // exhaustive `match out_dtype` site (the first is
+        // `eval_to_metal_buffers`); both are exhaustive over `MlxDtype`, so a
+        // new dtype forces a compile error in BOTH — they can't silently drift.
+        macro_rules! write_back {
+            ($to_vec:path, $t:ty) => {{
+                let data = $to_vec(h).map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+                // SAFETY: `out_ptr` addresses `out_cap >= n` writable, contiguous
+                // elements of `out_dtype` (caller contract); we copy exactly `n`.
+                let dst = unsafe { std::slice::from_raw_parts_mut(out_ptr as *mut $t, n) };
+                dst.copy_from_slice(&data);
+            }};
+        }
+        match out_dtype {
+            MlxDtype::F32 => write_back!(mlx_array_to_f32_vec, f32),
+            MlxDtype::I32 => write_back!(mlx_array_to_i32_vec, i32),
+            MlxDtype::I8 => write_back!(mlx_array_to_i8_vec, i8),
+            MlxDtype::I16 => write_back!(mlx_array_to_i16_vec, i16),
+            MlxDtype::I64 => write_back!(mlx_array_to_i64_vec, i64),
+            MlxDtype::U8 => write_back!(mlx_array_to_u8_vec, u8),
+            MlxDtype::U16 => write_back!(mlx_array_to_u16_vec, u16),
+            MlxDtype::U32 => write_back!(mlx_array_to_u32_vec, u32),
+            MlxDtype::U64 => write_back!(mlx_array_to_u64_vec, u64),
+            MlxDtype::Bool | MlxDtype::F64 => {
+                return Err(BuildError::UnsupportedInputDtype(format!(
+                    "output {out_dtype:?}"
+                )))
+            }
+        }
+        Ok(n)
     }
 
     /// Production-path constructor: build the subgraph over zero-copy views
