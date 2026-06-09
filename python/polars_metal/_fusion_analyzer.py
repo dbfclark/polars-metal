@@ -736,7 +736,26 @@ def analyze_ir_reduction(
         leaf_idx: dict[int, int] = {}
         col_dedup: dict[str, int] = {}
         lit_dedup: dict[float, int] = {}
-        _gather_leaves_ir(nt, arg_id, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup)
+        # Stage literals at the chain's column width for a monomorphic-int
+        # reduction (e.g. `int_col + 1`) so MLX keeps the chain integer rather
+        # than promoting `int_col + f32_lit` to f32 — which would make the
+        # scope's declared literal-input width (F32, 4B) disagree with the
+        # int-width buffer the dispatch stages (B2 T4), and the Rust ingest
+        # would mis-derive the literal's element count from byte length. F32
+        # chains keep F32 literals (the legacy path).
+        scanned = _scan_binding_col_dtype(nt, arg_id, schema)
+        lit_dtype_str = scanned if scanned in _MONOMORPHIC_OUT_DTYPES else "F32"
+        _gather_leaves_ir(
+            nt,
+            arg_id,
+            schema,
+            scope,
+            descriptors,
+            leaf_idx,
+            col_dedup,
+            lit_dedup,
+            lit_dtype_str,
+        )
         inner_idx = _visit_ir_ops(nt, arg_id, schema, scope, leaf_idx)
         is_chain = scope.n_ops() > 0
         # Need at least one real column (literal-only reductions are degenerate).

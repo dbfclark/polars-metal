@@ -183,6 +183,29 @@ def _series_input_dtype_str(series: pl.Series) -> str:
     return _POLARS_DTYPE_TO_WIRE.get(str(series.dtype), "F32")
 
 
+# Wire dtype string -> Polars dtype, for building int reduction result Series.
+# Mirrors _DTYPE_STR_TO_NP_AND_TAG; F32 maps to Float32. Drift-guarded against
+# _walker._INT_TAG_TO_POLARS by test_wire_str_to_polars_matches_walker_table.
+_WIRE_STR_TO_POLARS: dict[str, pl.DataType] = {
+    "F32": pl.Float32,
+    "I8": pl.Int8,
+    "I16": pl.Int16,
+    "I32": pl.Int32,
+    "I64": pl.Int64,
+    "U8": pl.UInt8,
+    "U16": pl.UInt16,
+    "U32": pl.UInt32,
+    "U64": pl.UInt64,
+}
+
+
+def _wire_str_to_polars_dtype(dtype_str: str) -> pl.DataType:
+    dt = _WIRE_STR_TO_POLARS.get(dtype_str)
+    if dt is None:
+        raise RuntimeError(f"polars_metal: no Polars dtype for wire dtype {dtype_str!r}")
+    return dt
+
+
 def _dispatch_hstack_fused(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
     """Execute an HStack whose every binding carries a `_fused_scope`
     side-channel. Recurses on the upstream input, then runs each binding
@@ -655,6 +678,9 @@ def _build_select_reduction_fused(plan: dict) -> Any:
             name = agg["name"]
             kind = agg["_agg_kind"]
             is_chain = agg.get("_is_chain", False)
+            out_dtype_str = agg.get("_fused_out_dtype", "F32")
+            out_np_dtype, out_tag = _np_dtype_and_tag(out_dtype_str)
+            out_pl_dtype = _wire_str_to_polars_dtype(out_dtype_str)
 
             if not is_chain:
                 # Bare single Float32 column (enforced by `analyze_ir_reduction`).
@@ -668,7 +694,10 @@ def _build_select_reduction_fused(plan: dict) -> Any:
                     value = getattr(series, kind)()
                     out_series.append(pl.Series(name, [value], dtype=series.dtype))
                     continue
-                input_arrays = [np.ascontiguousarray(series.to_numpy(), dtype=np.float32)]
+                col_dtype_str = _series_input_dtype_str(series)
+                col_np_dtype, col_tag = _np_dtype_and_tag(col_dtype_str)
+                input_arrays = [np.ascontiguousarray(series.to_numpy(), dtype=col_np_dtype)]
+                input_tags = [col_tag]
                 count = n
             else:
                 # Chain reduction. For an elementwise chain over a null column
@@ -685,39 +714,52 @@ def _build_select_reduction_fused(plan: dict) -> Any:
                     frame = upstream
                 count = frame.height
                 if count == 0:
-                    val0 = 0.0 if kind == "sum" else None
-                    out_series.append(pl.Series(name, [val0], dtype=pl.Float32))
+                    val0 = 0 if kind == "sum" else None
+                    out_series.append(pl.Series(name, [val0], dtype=out_pl_dtype))
                     continue
                 if kind in ("std", "var") and count < 2:
                     out_series.append(pl.Series(name, [None], dtype=pl.Float32))
                     continue
                 input_arrays = []
+                input_tags = []
                 for d_kind, payload in descriptors:
                     if d_kind == "col":
                         col = frame.get_column(payload)
-                        input_arrays.append(np.ascontiguousarray(col.to_numpy(), dtype=np.float32))
+                        col_dtype_str = _series_input_dtype_str(col)
+                        col_np_dtype, col_tag = _np_dtype_and_tag(col_dtype_str)
+                        input_arrays.append(np.ascontiguousarray(col.to_numpy(), dtype=col_np_dtype))
+                        input_tags.append(col_tag)
                     elif d_kind == "lit":
-                        input_arrays.append(np.asarray([payload], dtype=np.float32))
+                        input_arrays.append(np.asarray([payload], dtype=out_np_dtype))
+                        input_tags.append(out_tag)
                     else:
                         raise RuntimeError(f"polars_metal: unknown reduction descriptor {d_kind!r}")
 
-            out_arr = np.empty(1, dtype=np.float32)
-            # F32 reduction path; tag 0 = MlxDtype::F32 for inputs and output.
-            inputs = [(int(a.__array_interface__["data"][0]), int(a.size), 0) for a in input_arrays]
+            out_arr = np.empty(1, dtype=out_np_dtype)
+            inputs = [
+                (int(a.__array_interface__["data"][0]), int(a.size), tag)
+                for a, tag in zip(input_arrays, input_tags, strict=True)
+            ]
             _native.execute_fused_expr(
                 scope=scope,
                 inputs=inputs,
-                out=(int(out_arr.__array_interface__["data"][0]), int(out_arr.size), 0),
+                out=(int(out_arr.__array_interface__["data"][0]), int(out_arr.size), out_tag),
             )
-            val = float(out_arr[0])
             # Bessel: MLX uses population variance (ddof=0); Polars defaults to
             # sample (ddof=1). `count` is the non-null row count. Only std/var
-            # need the correction.
-            if kind == "var":
-                val *= count / (count - 1)
-            elif kind == "std":
-                val *= math.sqrt(count / (count - 1))
-            out_series.append(pl.Series(name, [val], dtype=pl.Float32))
+            # need the correction — and those are F32-only (never an int output).
+            if out_dtype_str == "F32":
+                val = float(out_arr[0])
+                if kind == "var":
+                    val *= count / (count - 1)
+                elif kind == "std":
+                    val *= math.sqrt(count / (count - 1))
+                out_series.append(pl.Series(name, [val], dtype=pl.Float32))
+            else:
+                # Integer reduction: the scalar is already the exact Polars dtype
+                # (MLX-native == Polars for the admitted combos). item() yields a
+                # Python int — no float round-trip touches the integer value.
+                out_series.append(pl.Series(name, [out_arr[0].item()], dtype=out_pl_dtype))
 
         result = pl.DataFrame(out_series)
         if should_time:
