@@ -131,3 +131,93 @@ def test_fft_empty_column():
     out = df.lazy().with_columns(pl.col("sig").metal.fft().alias("o")).collect(engine=MetalEngine())
     assert out.get_column("o").len() == 0
     assert isinstance(out.get_column("o").dtype, pl.Struct)
+
+
+# ---------------------------------------------------------------------------
+# Engine-level differential sweep vs numpy.fft (M6 A3, Task 9).
+#
+# The hand-rolled MSL FFT now backs .metal.fft()/.metal.ifft() for ALL sizes
+# on-GPU (pow2 to 2^30, composite <= 1024, primes / non-smooth via Bluestein).
+# This sweep drives the full engine collect path (detect + dispatch + readback
+# + struct build) and asserts L2-relative error < 1e-3 vs numpy for every
+# {size} x {fft, ifft} x {real-F32 input, struct-complex input}.
+# ---------------------------------------------------------------------------
+
+
+def _l2_rel(got: np.ndarray, exp: np.ndarray) -> float:
+    num = np.linalg.norm(got - exp)
+    den = np.linalg.norm(exp)
+    return float(num / den) if den > 0 else float(num)
+
+
+def _engine_complex(out: pl.DataFrame, name: str) -> np.ndarray:
+    """Read an engine Struct{real,imag} output column as a numpy complex128 array."""
+    col = out.get_column(name)
+    re = np.asarray(col.struct.field("real").to_numpy(), dtype=np.float64)
+    im = np.asarray(col.struct.field("imag").to_numpy(), dtype=np.float64)
+    return re + 1j * im
+
+
+def _run_engine_fft(sig_complex: np.ndarray, *, op: str, kind: str) -> np.ndarray:
+    """Run .metal.fft/.metal.ifft via the engine on `sig_complex`.
+
+    kind="real": feed only the real part as an F32 column.
+    kind="struct": feed a Struct{real:F32, imag:F32} complex column.
+    Returns the engine result as numpy complex128.
+    """
+    verb = "fft" if op == "fft" else "ifft"
+    if kind == "real":
+        df = pl.DataFrame({"sig": sig_complex.real.astype(np.float32)}, schema={"sig": pl.Float32})
+        expr = getattr(pl.col("sig").metal, verb)().alias("spec")
+    else:
+        re = sig_complex.real.astype(np.float32)
+        im = sig_complex.imag.astype(np.float32)
+        sig_struct = pl.DataFrame({"real": re, "imag": im}).to_struct("sig")
+        df = pl.DataFrame([sig_struct])
+        expr = getattr(pl.col("sig").metal, verb)().alias("spec")
+    out = df.lazy().with_columns(expr).collect(engine=MetalEngine())
+    return _engine_complex(out, "spec")
+
+
+# Sizes spanning: tiny pow2, composite (<=1024), large pow2 (the regime the
+# hand-rolled kernel now handles that MLX could not), and non-smooth / prime /
+# arbitrary composite that route through Bluestein.
+_SWEEP_SIZES = [
+    8,
+    1024,
+    4096,
+    2**21,
+    2**22,
+    2**23,
+    2**24,
+    2**25,
+    1000,
+    100003,
+    3_000_000,
+    8_000_000,
+]
+
+# The three largest cases (2^25 = 33M, 8M, 3M) run only {real} x {fft, ifft}
+# to keep the sweep tractable in time/memory — the full 4-way cross-product at
+# 33M transiently allocates several GB per case. The struct (complex-input)
+# path is already exercised at the large pow2 sizes <= 2^24 below, so this is a
+# bounded reduction, not a silent gap.
+_HUGE_SIZES = {2**25, 8_000_000, 3_000_000}
+
+
+def _kinds_for(n: int) -> list[str]:
+    return ["real"] if n in _HUGE_SIZES else ["real", "struct"]
+
+
+@pytest.mark.parametrize("n", _SWEEP_SIZES)
+@pytest.mark.parametrize("op", ["fft", "ifft"])
+def test_fft_engine_sweep_matches_numpy(n: int, op: str) -> None:
+    rng = np.random.default_rng(0xA3 ^ n)
+    # Complex signal; for real-input kinds only the real part is used.
+    sig = (rng.standard_normal(n) + 1j * rng.standard_normal(n)).astype(np.complex128)
+    for kind in _kinds_for(n):
+        src = sig if kind == "struct" else sig.real.astype(np.complex128)
+        exp = np.fft.fft(src) if op == "fft" else np.fft.ifft(src)
+        got = _run_engine_fft(sig, op=op, kind=kind)
+        l2 = _l2_rel(got, exp)
+        assert l2 < 1e-3, f"{op} kind={kind} N={n}: L2_rel={l2:.3e} >= 1e-3"
