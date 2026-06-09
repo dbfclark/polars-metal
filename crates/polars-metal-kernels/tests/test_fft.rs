@@ -33,6 +33,22 @@ fn radix2_small_pow2_forward_matches_dft() {
 }
 
 #[test]
+fn mixed_radix_small_composite_matches_dft() {
+    let device = MetalDevice::system_default().expect("device");
+    // composite smooth sizes exercising radix 3,4,5,6,7,8 factor paths
+    for &n in &[3usize, 5, 6, 7, 9, 12, 15, 24, 35, 120, 360, 1000] {
+        let sig = interleaved_signal(n, 100 + n as u64);
+        let got = fft_gpu(&device, &sig, n as i64, false).expect("fft");
+        let exp = dft_reference(&sig, n, false);
+        assert!(
+            l2_rel_err(&got, &exp) < 1e-4,
+            "n={n}: L2 {}",
+            l2_rel_err(&got, &exp)
+        );
+    }
+}
+
+#[test]
 fn radix2_inverse_and_roundtrip() {
     let device = MetalDevice::system_default().expect("device");
     // sizes within the single-threadgroup base path (n <= FFT_BASE_MAX = 1024);
