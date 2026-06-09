@@ -78,6 +78,25 @@ mod ffi {
         // SAFETY: `out` must point to a buffer of at least `n` i32 values.
         unsafe fn mlx_array_copy_to_i32(arr: &SharedPtr<MlxArray>, out: *mut i32, n: usize);
 
+        // M6 Track B (B1): integer dtype query + per-width readback.
+        //
+        // Return the MlxDtype tag of `arr`'s dtype (0=f32, 2=i32, 3=bool,
+        // 4=i8, 5=i16, 6=i64, 7=u8, 8=u16, 9=u32, 10=u64). Throws on an
+        // unmapped dtype (e.g. float64), which cxx surfaces as Err.
+        fn mlx_array_dtype(arr: &SharedPtr<MlxArray>) -> Result<u32>;
+
+        // Per-width integer readback. Each copies `n` values of the matching
+        // width into the caller buffer. Array must be eval'd and have the
+        // matching dtype (caller contract).
+        // SAFETY: `out` must point to a buffer of at least `n` elements.
+        unsafe fn mlx_array_copy_to_i8(arr: &SharedPtr<MlxArray>, out: *mut i8, n: usize);
+        unsafe fn mlx_array_copy_to_i16(arr: &SharedPtr<MlxArray>, out: *mut i16, n: usize);
+        unsafe fn mlx_array_copy_to_i64(arr: &SharedPtr<MlxArray>, out: *mut i64, n: usize);
+        unsafe fn mlx_array_copy_to_u8(arr: &SharedPtr<MlxArray>, out: *mut u8, n: usize);
+        unsafe fn mlx_array_copy_to_u16(arr: &SharedPtr<MlxArray>, out: *mut u16, n: usize);
+        unsafe fn mlx_array_copy_to_u32(arr: &SharedPtr<MlxArray>, out: *mut u32, n: usize);
+        unsafe fn mlx_array_copy_to_u64(arr: &SharedPtr<MlxArray>, out: *mut u64, n: usize);
+
         // Force evaluation (materialize) of a single array. Wraps
         // `mlx::core::eval(*arr)`. Returns Err on any MLX exception.
         fn mlx_array_eval_one(arr: &SharedPtr<MlxArray>) -> Result<()>;

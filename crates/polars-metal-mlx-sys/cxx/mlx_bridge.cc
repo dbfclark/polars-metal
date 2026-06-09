@@ -118,6 +118,41 @@ bool mlx_array_is_f32(const std::shared_ptr<MlxArray>& arr) {
     return arr->dtype() == mlx::core::float32;
 }
 
+mlx::core::Dtype mlx_dtype_from_tag(uint32_t tag) {
+    switch (tag) {
+        case 0:  return mlx::core::float32;
+        case 1:
+            throw std::invalid_argument(
+                "mlx_dtype_from_tag: float64 is not supported on Metal");
+        case 2:  return mlx::core::int32;
+        case 3:  return mlx::core::bool_;
+        case 4:  return mlx::core::int8;
+        case 5:  return mlx::core::int16;
+        case 6:  return mlx::core::int64;
+        case 7:  return mlx::core::uint8;
+        case 8:  return mlx::core::uint16;
+        case 9:  return mlx::core::uint32;
+        case 10: return mlx::core::uint64;
+        default:
+            throw std::invalid_argument("mlx_dtype_from_tag: unknown dtype tag");
+    }
+}
+
+uint32_t mlx_array_dtype(const std::shared_ptr<MlxArray>& arr) {
+    mlx::core::Dtype dt = arr->dtype();
+    if (dt == mlx::core::float32) return 0;
+    if (dt == mlx::core::int32)   return 2;
+    if (dt == mlx::core::bool_)   return 3;
+    if (dt == mlx::core::int8)    return 4;
+    if (dt == mlx::core::int16)   return 5;
+    if (dt == mlx::core::int64)   return 6;
+    if (dt == mlx::core::uint8)   return 7;
+    if (dt == mlx::core::uint16)  return 8;
+    if (dt == mlx::core::uint32)  return 9;
+    if (dt == mlx::core::uint64)  return 10;
+    throw std::invalid_argument("mlx_array_dtype: unmapped dtype");
+}
+
 void mlx_array_copy_to_f32(
     const std::shared_ptr<MlxArray>& arr, float* out, size_t n) {
     // Caller guarantees the array has been eval'd and `out` holds at least n
@@ -133,6 +168,23 @@ void mlx_array_copy_to_i32(
     const int32_t* src = arr->data<int32_t>();
     std::memcpy(out, src, n * sizeof(int32_t));
 }
+
+// Per-width integer readback. Same raw-memcpy contract as copy_to_i32:
+// caller guarantees the array is eval'd, has the matching dtype, and `out`
+// holds at least n elements.
+#define MLX_WRAP_READBACK(fn_name, ctype, mlx_ctype)                       \
+void fn_name(const std::shared_ptr<MlxArray>& arr, ctype* out, size_t n) { \
+    const mlx_ctype* src = arr->data<mlx_ctype>();                         \
+    std::memcpy(out, src, n * sizeof(ctype));                              \
+}
+MLX_WRAP_READBACK(mlx_array_copy_to_i8,  int8_t,   int8_t)
+MLX_WRAP_READBACK(mlx_array_copy_to_i16, int16_t,  int16_t)
+MLX_WRAP_READBACK(mlx_array_copy_to_i64, int64_t,  int64_t)
+MLX_WRAP_READBACK(mlx_array_copy_to_u8,  uint8_t,  uint8_t)
+MLX_WRAP_READBACK(mlx_array_copy_to_u16, uint16_t, uint16_t)
+MLX_WRAP_READBACK(mlx_array_copy_to_u32, uint32_t, uint32_t)
+MLX_WRAP_READBACK(mlx_array_copy_to_u64, uint64_t, uint64_t)
+#undef MLX_WRAP_READBACK
 
 void mlx_array_eval_one(const std::shared_ptr<MlxArray>& arr) {
     // mlx::core::eval's variadic template checks is_arrays_v<T> which only
@@ -172,23 +224,8 @@ std::shared_ptr<MlxArray> mlx_array_view_mtl_buffer(
     // ensures it does nothing and leaves the MTLBuffer untouched.
     mlx::core::Deleter no_op_deleter = [](mlx::core::allocator::Buffer) {};
 
-    // Map the dtype tag to mlx::core::Dtype.
-    // MLX 0.22.0 has no float64; tag 1 throws rather than silently mapping
-    // to a wrong type.  Tags: 0=float32, 1=float64 (unsupported), 2=int32,
-    // 3=bool_.
-    mlx::core::Dtype dt = mlx::core::float32; // initialise to satisfy compiler
-    switch (dtype) {
-        case 0: dt = mlx::core::float32; break;
-        case 1:
-            throw std::invalid_argument(
-                "mlx_array_view_mtl_buffer: float64 is not supported by "
-                "MLX 0.22.0; use float32");
-        case 2: dt = mlx::core::int32;   break;
-        case 3: dt = mlx::core::bool_;   break;
-        default:
-            throw std::invalid_argument(
-                "mlx_array_view_mtl_buffer: unknown dtype tag");
-    }
+    // Map the dtype tag to mlx::core::Dtype (shared helper covers all widths).
+    mlx::core::Dtype dt = mlx_dtype_from_tag(dtype);
 
     // Construct via the buffer-accepting array constructor:
     //   explicit array(allocator::Buffer data, Shape shape, Dtype dtype,
