@@ -14,6 +14,8 @@
 use polars_metal_buffer::{MetalBuffer, MetalDevice};
 use polars_metal_mlx_sys::array::{
     mlx_array_copy_to_f32_slice, mlx_array_eval, mlx_array_from_f32_slice, mlx_array_to_f32_vec,
+    mlx_array_to_i16_vec, mlx_array_to_i32_vec, mlx_array_to_i64_vec, mlx_array_to_i8_vec,
+    mlx_array_to_u16_vec, mlx_array_to_u32_vec, mlx_array_to_u64_vec, mlx_array_to_u8_vec,
     mlx_array_view_metal_buffer, MlxArrayHandle, MlxDtype,
 };
 use polars_metal_mlx_sys::elementwise::{
@@ -33,7 +35,7 @@ use polars_metal_mlx_sys::scan::{
 use polars_metal_mlx_sys::sort::mlx_sort;
 use thiserror::Error;
 
-use super::scope::{FusionScope, OpNode};
+use super::scope::{FusionScope, InputDtype, OpNode};
 use super::supported_ops::OpId;
 
 #[derive(Debug, Error)]
@@ -52,6 +54,29 @@ pub enum BuildError {
         expected: usize,
         actual: usize,
     },
+    #[error("unsupported input dtype for buffer path: {0}")]
+    UnsupportedInputDtype(String),
+}
+
+/// Map a fused-scope `InputDtype` to the `MlxDtype` used to wrap its buffer.
+/// Composite / unsupported dtypes (`ArrayF32`/`ListF32`/`F64`) are not flat
+/// 1-D numeric columns the buffer path ingests → `UnsupportedInputDtype`.
+fn input_dtype_to_mlx(dtype: InputDtype) -> Result<MlxDtype, BuildError> {
+    Ok(match dtype {
+        InputDtype::F32 => MlxDtype::F32,
+        InputDtype::I32 => MlxDtype::I32,
+        InputDtype::Bool => MlxDtype::Bool,
+        InputDtype::I8 => MlxDtype::I8,
+        InputDtype::I16 => MlxDtype::I16,
+        InputDtype::I64 => MlxDtype::I64,
+        InputDtype::U8 => MlxDtype::U8,
+        InputDtype::U16 => MlxDtype::U16,
+        InputDtype::U32 => MlxDtype::U32,
+        InputDtype::U64 => MlxDtype::U64,
+        InputDtype::F64 | InputDtype::ArrayF32(_) | InputDtype::ListF32 => {
+            return Err(BuildError::UnsupportedInputDtype(format!("{dtype:?}")))
+        }
+    })
 }
 
 /// Stand-in for `polars_metal_buffer::MetalBuffer` used by tests. The
@@ -179,11 +204,14 @@ impl MlxSubgraph {
         }
         let mut handles: Vec<MlxArrayHandle> = inputs
             .iter()
-            .map(|buf| {
-                // Derive 1-D shape from buffer byte length (F32 = 4 bytes each).
-                let n_elements = (buf.len() / 4) as i64;
+            .zip(scope.inputs.iter())
+            .map(|(buf, input_ref)| {
+                // Derive 1-D shape from buffer byte length and the input's
+                // declared dtype (element width is dtype-dependent).
+                let mlx_dtype = input_dtype_to_mlx(input_ref.dtype)?;
+                let n_elements = (buf.len() / mlx_dtype.element_size()) as i64;
                 let shape = [n_elements];
-                mlx_array_view_metal_buffer(buf.clone(), &shape, MlxDtype::F32)
+                mlx_array_view_metal_buffer(buf.clone(), &shape, mlx_dtype)
                     .map_err(|e| BuildError::MlxError(format!("{e:?}")))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -223,10 +251,62 @@ impl MlxSubgraph {
         mlx_array_eval(&self.outputs).map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
         let mut outs = Vec::with_capacity(self.outputs.len());
         for h in &self.outputs {
-            let data =
-                mlx_array_to_f32_vec(h).map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
-            let buf = MetalBuffer::from_f32_slice(device, &data)
+            let dtype = h
+                .dtype()
                 .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+            let buf = match dtype {
+                MlxDtype::F32 => {
+                    let data = mlx_array_to_f32_vec(h)
+                        .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+                    MetalBuffer::from_f32_slice(device, &data)
+                }
+                MlxDtype::I32 => {
+                    let data = mlx_array_to_i32_vec(h)
+                        .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+                    MetalBuffer::from_i32_slice(device, &data)
+                }
+                MlxDtype::I8 => {
+                    let data = mlx_array_to_i8_vec(h)
+                        .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+                    MetalBuffer::from_i8_slice(device, &data)
+                }
+                MlxDtype::I16 => {
+                    let data = mlx_array_to_i16_vec(h)
+                        .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+                    MetalBuffer::from_i16_slice(device, &data)
+                }
+                MlxDtype::I64 => {
+                    let data = mlx_array_to_i64_vec(h)
+                        .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+                    MetalBuffer::from_i64_slice(device, &data)
+                }
+                MlxDtype::U8 => {
+                    let data = mlx_array_to_u8_vec(h)
+                        .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+                    MetalBuffer::from_u8_slice(device, &data)
+                }
+                MlxDtype::U16 => {
+                    let data = mlx_array_to_u16_vec(h)
+                        .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+                    MetalBuffer::from_u16_slice(device, &data)
+                }
+                MlxDtype::U32 => {
+                    let data = mlx_array_to_u32_vec(h)
+                        .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+                    MetalBuffer::from_u32_slice(device, &data)
+                }
+                MlxDtype::U64 => {
+                    let data = mlx_array_to_u64_vec(h)
+                        .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+                    MetalBuffer::from_u64_slice(device, &data)
+                }
+                MlxDtype::Bool | MlxDtype::F64 => {
+                    return Err(BuildError::UnsupportedInputDtype(format!(
+                        "output {dtype:?}"
+                    )))
+                }
+            }
+            .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
             outs.push(buf);
         }
         Ok(outs)
