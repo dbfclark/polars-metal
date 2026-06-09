@@ -139,7 +139,11 @@ fn host_fft_f64(input: &[f32], n: usize, inverse: bool) -> Vec<f32> {
 #[test]
 fn fourstep_large_pow2_matches_reference() {
     let device = MetalDevice::system_default().expect("device");
-    for pow in [12u32, 16, 20] {
+    // Odd powers (13, 17) make the planner's split give p1 != p2, so n1 != n2 —
+    // exercising the transpose dim-swap / row<->col paths that an even-only pow
+    // list (n1 == n2 always) would never catch. 13 -> n1=64,n2=128;
+    // 17 -> n1=256,n2=512 (both factors <= 1024).
+    for pow in [12u32, 13, 16, 17, 20] {
         // (2^10, 2^20]: n1, n2 <= 1024
         let n = 1usize << pow;
         let sig = interleaved_signal(n, pow as u64);
@@ -153,7 +157,9 @@ fn fourstep_large_pow2_matches_reference() {
 #[test]
 fn fourstep_inverse_and_roundtrip() {
     let device = MetalDevice::system_default().expect("device");
-    for pow in [12u32, 16] {
+    // Include odd powers (13, 15) so the inverse path is checked on a
+    // non-square n1 != n2 shape too.
+    for pow in [12u32, 13, 15, 16] {
         let n = 1usize << pow;
         let sig = interleaved_signal(n, 1000 + pow as u64);
         // inverse vs the f64 oracle

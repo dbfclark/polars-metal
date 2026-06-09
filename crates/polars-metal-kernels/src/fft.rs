@@ -161,6 +161,9 @@ fn fft_fourstep(
     let p2 = p - p1;
     let n1 = 1u32 << p1;
     let n2 = 1u32 << p2;
+    // n1*n2 == n by construction (p1 + p2 == p); assert it to document the
+    // invariant the column/row/transpose passes rely on.
+    debug_assert_eq!((n1 as i64) * (n2 as i64), n);
     if i64::from(n1) > FFT_BASE_MAX || i64::from(n2) > FFT_BASE_MAX {
         // p > 20: a factor exceeds the base cap; recursive path is Task 5.
         return Err(FftError::Unsupported(n));

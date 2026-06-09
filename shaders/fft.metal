@@ -12,6 +12,10 @@ constant uint FFT_BASE_MAX = 1024;
 // FORWARD only (no inverse flag, no 1/n scaling) — the four-step driver handles
 // inverse purely by boundary conjugation + a single 1/N at the very end.
 //
+// NOTE: this butterfly body is intentionally duplicated from the standalone
+// kernel `fft_stockham_pow2_f32` below (which adds the inverse flag + scaling).
+// A change to the radix-2 Stockham butterfly math must touch BOTH.
+//
 // Contract: on return the result is always in `a[0..len)`. After log2(len)
 // stages the data may land in `a` or `b` depending on parity; we copy back to
 // `a` when it ends in `b` so the caller has one fixed read location. The caller
@@ -141,6 +145,10 @@ kernel void fft_transpose(
 // into contiguous sub-transform slots of `dst`, so the final pass lands in
 // natural order — no bit-reversal permutation. `ns` is the current
 // sub-transform size (1,2,4,…,n/2); `j` is the twiddle index within it.
+//
+// NOTE: the butterfly body below is intentionally duplicated by the forward-only
+// device variant `stockham_pow2_tg` (above), used by the four-step kernels. A
+// change to the radix-2 Stockham butterfly math must touch BOTH.
 kernel void fft_stockham_pow2_f32(
     device const float2* in   [[buffer(0)]],
     device float2*       out  [[buffer(1)]],
