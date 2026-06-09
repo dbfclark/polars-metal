@@ -104,7 +104,7 @@ kernel void fft_fourstep_cols(
     uint tgid           [[threadgroup_position_in_grid]],
     uint tid            [[thread_position_in_threadgroup]],
     uint tg_size        [[threads_per_threadgroup]]) {
-    (void)batch;
+    (void)batch;  // unused: signal index is tgid/l2; arg kept for uniform binding layout across batched kernels
     threadgroup float2 a[FFT_BASE_MAX];
     threadgroup float2 b[FFT_BASE_MAX];
     uint s   = tgid / l2;       // signal index

@@ -80,6 +80,14 @@ pub fn fft_gpu(
         // the single-level band (2^11..2^20) and the previously-broken
         // 2^21..2^25 band (where MLX returns garbage, ml-explore/mlx#1800).
         if (n & (n - 1)) == 0 {
+            // All kernel scalars (len, batch, count) and the in-kernel twiddle
+            // index i*j (< len <= n) are 32-bit. Cap n at 2^30 so neither the
+            // u32 scalars (batch*len == n) nor the i32 twiddle index can
+            // overflow; larger N would silently truncate. (The differential
+            // tests run to 2^25; this leaves margin.)
+            if n > (1 << 30) {
+                return Err(FftError::Unsupported(n));
+            }
             return fft_recursive_fourstep(device, input, n, inverse);
         }
         return Err(FftError::Unsupported(n));
