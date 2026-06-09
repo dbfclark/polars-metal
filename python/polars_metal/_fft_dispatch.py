@@ -17,6 +17,31 @@ from polars_metal import _native
 from polars_metal._fft_detect import FftBinding
 from polars_metal._fft_namespace import OP_IFFT
 
+# MLX's Metal FFT is correct only up to 2^20 (ml-explore/mlx#1800, a known/open upstream bug
+# unfixed through MLX 0.31): 2^21/2^22 fail to load a kernel, and >=2^23 SILENTLY returns
+# garbage (we verified L2 rel err ~1.4). Non-power-of-2 sizes route through Bluestein, whose
+# internal padding can itself exceed 2^20 and break. So we route ONLY power-of-2 sizes <= 2^20
+# (the safe Stockham regime) to the GPU; everything else falls back to numpy on CPU, which is
+# correct and fast at these sizes. The hand-rolled MSL FFT (future) will replace this ceiling.
+_GPU_FFT_MAX = 1 << 20
+
+
+def _is_pow2(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def _cpu_fft(
+    re: np.ndarray, im: np.ndarray | None, inverse: bool
+) -> tuple[np.ndarray, np.ndarray]:
+    """CPU fallback (numpy) for sizes MLX's Metal FFT can't do correctly. Returns
+    (real_out f32, imag_out f32), matching the GPU path's F32 Struct output."""
+    signal = re if im is None else (re.astype(np.float64) + 1j * im.astype(np.float64))
+    out = np.fft.ifft(signal) if inverse else np.fft.fft(signal)
+    return (
+        np.ascontiguousarray(out.real, dtype=np.float32),
+        np.ascontiguousarray(out.imag, dtype=np.float32),
+    )
+
 
 def _input_streams(s: pl.Series) -> tuple[np.ndarray, np.ndarray | None, int]:
     """Return (real f32 contiguous, imag f32 contiguous or None, n) for a signal column.
@@ -54,10 +79,16 @@ def _run_binding(df: pl.DataFrame, b: FftBinding) -> pl.Series:
             {"real": np.empty(0, np.float32), "imag": np.empty(0, np.float32)}
         ).to_struct(b.out_name)
     inverse = b.op == OP_IFFT
-    imag_arg = None if im is None else (im.ctypes.data, im.size)
-    real_bytes, imag_bytes = _native.execute_fft((re.ctypes.data, re.size), imag_arg, n, inverse)
-    real_out = np.frombuffer(real_bytes, dtype=np.float32)
-    imag_out = np.frombuffer(imag_bytes, dtype=np.float32)
+    if _is_pow2(n) and n <= _GPU_FFT_MAX:
+        imag_arg = None if im is None else (im.ctypes.data, im.size)
+        real_bytes, imag_bytes = _native.execute_fft(
+            (re.ctypes.data, re.size), imag_arg, n, inverse
+        )
+        real_out = np.frombuffer(real_bytes, dtype=np.float32)
+        imag_out = np.frombuffer(imag_bytes, dtype=np.float32)
+    else:
+        # Outside MLX's reliable FFT regime → CPU fallback for correctness (see _GPU_FFT_MAX).
+        real_out, imag_out = _cpu_fft(re, im, inverse)
     return pl.DataFrame({"real": real_out, "imag": imag_out}).to_struct(b.out_name)
 
 

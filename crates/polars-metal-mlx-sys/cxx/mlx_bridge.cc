@@ -510,8 +510,23 @@ std::shared_ptr<MlxArray> mlx_op_ifft_1d(const std::shared_ptr<MlxArray>& a) {
     return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
 }
 
-MLX_WRAP_UNOP(mlx_op_real, real)
-MLX_WRAP_UNOP(mlx_op_imag, imag)
+// real/imag of a large FFT result can be NON-CONTIGUOUS: MLX's four-step FFT
+// (used for large sizes, e.g. >= 2^23) produces a strided output, and real()/
+// imag() inherit that layout. Our raw row-major readback (mlx_array_copy_to_f32)
+// assumes contiguous storage, so without forcing contiguity here it misreads a
+// strided buffer and returns garbage (verified: L2 rel err ~1.41 at 2^23).
+// Wrap in contiguous(), matching mlx_op_transpose / mlx_op_slice. Cheap no-op
+// when the input is already contiguous (small Stockham FFTs).
+std::shared_ptr<MlxArray> mlx_op_real(const std::shared_ptr<MlxArray>& a) {
+    auto base = std::make_shared<mlx::core::array>(
+        mlx::core::contiguous(mlx::core::real(static_cast<const mlx::core::array&>(*a))));
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+std::shared_ptr<MlxArray> mlx_op_imag(const std::shared_ptr<MlxArray>& a) {
+    auto base = std::make_shared<mlx::core::array>(
+        mlx::core::contiguous(mlx::core::imag(static_cast<const mlx::core::array&>(*a))));
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
 
 std::shared_ptr<MlxArray> mlx_op_complex(
     const std::shared_ptr<MlxArray>& re,

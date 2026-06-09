@@ -97,6 +97,24 @@ def test_fft_nulls_raise():
         df.lazy().with_columns(pl.col("sig").metal.fft().alias("o")).collect(engine=MetalEngine())
 
 
+def test_fft_large_n_falls_back_to_cpu_correctly():
+    # N > 2^20: MLX's Metal FFT is broken (ml-explore/mlx#1800) — it silently returns garbage
+    # at this size. The engine must fall back to CPU and return the CORRECT numpy result.
+    n = 3_000_000
+    sig = np.random.default_rng(7).standard_normal(n).astype(np.float32)
+    df = pl.DataFrame({"sig": sig}, schema={"sig": pl.Float32})
+    out = df.lazy().with_columns(pl.col("sig").metal.fft().alias("spec")).collect(
+        engine=MetalEngine()
+    )
+    spec = out.get_column("spec")
+    got = np.asarray(spec.struct.field("real").to_numpy(), np.float64) + 1j * np.asarray(
+        spec.struct.field("imag").to_numpy(), np.float64
+    )
+    exp = np.fft.fft(sig.astype(np.float64))
+    l2 = np.linalg.norm(got - exp) / np.linalg.norm(exp)
+    assert l2 < 1e-3, f"large-N FFT not correct via CPU fallback: L2={l2}"
+
+
 def test_fft_empty_column():
     df = pl.DataFrame({"sig": []}, schema={"sig": pl.Float32})
     out = df.lazy().with_columns(pl.col("sig").metal.fft().alias("o")).collect(engine=MetalEngine())
