@@ -6,6 +6,132 @@ using namespace metal;
 // safely under Apple Silicon's 32 KB limit. (4096 would need 64 KB — too big.)
 constant uint FFT_BASE_MAX = 1024;
 
+// ---- Shared forward radix-2 Stockham core (used by the four-step kernels). ----
+// Transforms `len` (pow2, <= FFT_BASE_MAX) interleaved float2 points already
+// cooperatively loaded into `a[0..len)`, using `b[0..len)` as ping-pong scratch.
+// FORWARD only (no inverse flag, no 1/n scaling) — the four-step driver handles
+// inverse purely by boundary conjugation + a single 1/N at the very end.
+//
+// Contract: on return the result is always in `a[0..len)`. After log2(len)
+// stages the data may land in `a` or `b` depending on parity; we copy back to
+// `a` when it ends in `b` so the caller has one fixed read location. The caller
+// must barrier after its load into `a` before calling, and barrier after this
+// returns before reading `a` (this routine ends each stage with a barrier, and
+// the final copy-back ends with a barrier too).
+inline void stockham_pow2_tg(threadgroup float2* a, threadgroup float2* b,
+                             uint len, uint tid, uint tg_size) {
+    threadgroup float2* src = a;
+    threadgroup float2* dst = b;
+    uint lhalf = len >> 1;
+    uint stages = 0;
+    for (uint ns = 1; ns < len; ns <<= 1) {
+        for (uint i = tid; i < lhalf; i += tg_size) {
+            uint j = i & (ns - 1);
+            uint block = i / ns;
+            float2 u = src[i];
+            float2 v = cmul(src[i + lhalf], twiddle(int(j), int(2 * ns), false));
+            uint out0 = block * (2 * ns) + j;
+            dst[out0]      = u + v;
+            dst[out0 + ns] = u - v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float2* t = src; src = dst; dst = t;
+        ++stages;
+    }
+    // After the swap, `src` points at the buffer holding the result. If that is
+    // `b` (odd number of stages), copy back to `a`.
+    if ((stages & 1u) != 0u) {
+        for (uint i = tid; i < len; i += tg_size) a[i] = b[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// ============================ Four-step FFT ============================
+// For N = n1*n2 (both pow2, each <= FFT_BASE_MAX), view interleaved input as an
+// n1 x n2 row-major matrix M[i][j] = x[i*n2 + j]. Bailey's four-step:
+//   1. fft_fourstep_cols : length-n1 FFT down each of the n2 columns (stride n2)
+//   2. fft_twiddle_mul   : multiply element at flat idx=i*n2+j by W_N^{i*j}
+//   3. fft_fourstep_rows : length-n2 FFT across each of the n1 rows (contiguous)
+//   4. fft_transpose     : out[j*n1 + i] = in[i*n2 + j]   (n1 x n2 -> n2 x n1)
+// All sub-FFTs are FORWARD-only; the driver applies inverse via boundary
+// conjugation (host-side) + a single 1/N on readback.
+//
+// Each of cols/rows is dispatched as (n_groups * tg_width) threads with
+// threadgroup width tg_width, so threadgroup_position_in_grid selects the
+// column/row. Each threadgroup owns a disjoint column/row, loads it fully into
+// tg memory before writing, so in-place over the shared data buffer is safe.
+
+// One threadgroup per column j (0..n2). Loads its n1 elements at stride n2,
+// base offset j, runs a forward length-n1 Stockham, writes back strided.
+kernel void fft_fourstep_cols(
+    device float2*  data [[buffer(0)]],
+    constant uint&  n1   [[buffer(1)]],
+    constant uint&  n2   [[buffer(2)]],
+    uint tgid           [[threadgroup_position_in_grid]],
+    uint tid            [[thread_position_in_threadgroup]],
+    uint tg_size        [[threads_per_threadgroup]]) {
+    threadgroup float2 a[FFT_BASE_MAX];
+    threadgroup float2 b[FFT_BASE_MAX];
+    uint col = tgid;  // column index in [0, n2)
+    // strided load: M[i][col] = data[i*n2 + col]
+    for (uint i = tid; i < n1; i += tg_size) a[i] = data[i * n2 + col];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    stockham_pow2_tg(a, b, n1, tid, tg_size);
+    // strided store back
+    for (uint i = tid; i < n1; i += tg_size) data[i * n2 + col] = a[i];
+}
+
+// Elementwise twiddle: data[idx] *= W_N^{i*j}, i=idx/n2, j=idx%n2, forward sign.
+// Grid-strided one thread per element over all N = n1*n2 elements.
+kernel void fft_twiddle_mul(
+    device float2*  data [[buffer(0)]],
+    constant uint&  n2   [[buffer(1)]],
+    constant uint&  ntot [[buffer(2)]],
+    uint gid            [[thread_position_in_grid]],
+    uint grid_size      [[threads_per_grid]]) {
+    for (uint idx = gid; idx < ntot; idx += grid_size) {
+        uint i = idx / n2;
+        uint j = idx % n2;
+        data[idx] = cmul(data[idx], twiddle(int(i * j), int(ntot), false));
+    }
+}
+
+// One threadgroup per row i (0..n1). Loads its contiguous n2 elements at
+// base i*n2, runs a forward length-n2 Stockham, writes back contiguous.
+kernel void fft_fourstep_rows(
+    device float2*  data [[buffer(0)]],
+    constant uint&  n1   [[buffer(1)]],
+    constant uint&  n2   [[buffer(2)]],
+    uint tgid           [[threadgroup_position_in_grid]],
+    uint tid            [[thread_position_in_threadgroup]],
+    uint tg_size        [[threads_per_threadgroup]]) {
+    threadgroup float2 a[FFT_BASE_MAX];
+    threadgroup float2 b[FFT_BASE_MAX];
+    uint row = tgid;          // row index in [0, n1)
+    uint base = row * n2;
+    for (uint j = tid; j < n2; j += tg_size) a[j] = data[base + j];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    stockham_pow2_tg(a, b, n2, tid, tg_size);
+    for (uint j = tid; j < n2; j += tg_size) data[base + j] = a[j];
+}
+
+// Transpose n1 x n2 -> n2 x n1: out[j*n1 + i] = in[i*n2 + j]. One thread per
+// element, grid-strided over the n1*n2 source elements (simple, correct).
+kernel void fft_transpose(
+    device const float2* in   [[buffer(0)]],
+    device float2*       out  [[buffer(1)]],
+    constant uint&       n1   [[buffer(2)]],
+    constant uint&       n2   [[buffer(3)]],
+    uint gid                  [[thread_position_in_grid]],
+    uint grid_size            [[threads_per_grid]]) {
+    uint ntot = n1 * n2;
+    for (uint idx = gid; idx < ntot; idx += grid_size) {
+        uint i = idx / n2;   // source row
+        uint j = idx % n2;   // source col
+        out[j * n1 + i] = in[idx];
+    }
+}
+
 // One threadgroup transforms one length-n pow2 signal (n <= FFT_BASE_MAX),
 // iterative Stockham radix-2. Input/output interleaved float2 in global mem.
 // `n` and `inv` (0/1) are scalar buffers. tg memory holds 2 working buffers.

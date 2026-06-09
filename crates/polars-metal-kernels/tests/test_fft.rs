@@ -74,6 +74,101 @@ fn mixed_radix_inverse_and_roundtrip() {
     }
 }
 
+/// Iterative in-place radix-2 Cooley-Tukey FFT in f64 over interleaved-complex
+/// input; returns interleaved f32. Correct reference for large pow2 where the
+/// O(N^2) DFT is too slow. `inverse` applies +sign twiddles and 1/N scaling.
+/// Requires `n` be a power of two.
+fn host_fft_f64(input: &[f32], n: usize, inverse: bool) -> Vec<f32> {
+    assert!(n.is_power_of_two(), "host_fft_f64 requires pow2 n");
+    let mut re = vec![0f64; n];
+    let mut im = vec![0f64; n];
+    for i in 0..n {
+        re[i] = input[2 * i] as f64;
+        im[i] = input[2 * i + 1] as f64;
+    }
+    // bit-reversal permutation
+    let mut j = 0usize;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    // butterflies
+    let sign = if inverse { 1.0f64 } else { -1.0f64 };
+    let mut len = 2usize;
+    while len <= n {
+        let ang = sign * 2.0 * std::f64::consts::PI / (len as f64);
+        let (wre, wim) = (ang.cos(), ang.sin());
+        let half = len / 2;
+        let mut start = 0;
+        while start < n {
+            let (mut cre, mut cim) = (1.0f64, 0.0f64);
+            for k in 0..half {
+                let a = start + k;
+                let b = start + k + half;
+                let tre = re[b] * cre - im[b] * cim;
+                let tim = re[b] * cim + im[b] * cre;
+                re[b] = re[a] - tre;
+                im[b] = im[a] - tim;
+                re[a] += tre;
+                im[a] += tim;
+                let ncre = cre * wre - cim * wim;
+                cim = cre * wim + cim * wre;
+                cre = ncre;
+            }
+            start += len;
+        }
+        len <<= 1;
+    }
+    let scale = if inverse { 1.0 / n as f64 } else { 1.0 };
+    let mut out = vec![0f32; 2 * n];
+    for i in 0..n {
+        out[2 * i] = (re[i] * scale) as f32;
+        out[2 * i + 1] = (im[i] * scale) as f32;
+    }
+    out
+}
+
+#[test]
+fn fourstep_large_pow2_matches_reference() {
+    let device = MetalDevice::system_default().expect("device");
+    for pow in [12u32, 16, 20] {
+        // (2^10, 2^20]: n1, n2 <= 1024
+        let n = 1usize << pow;
+        let sig = interleaved_signal(n, pow as u64);
+        let got = fft_gpu(&device, &sig, n as i64, false).expect("fft");
+        let exp = host_fft_f64(&sig, n, false);
+        let err = l2_rel_err(&got, &exp);
+        assert!(err < 1e-3, "n=2^{pow}: L2 {err}");
+    }
+}
+
+#[test]
+fn fourstep_inverse_and_roundtrip() {
+    let device = MetalDevice::system_default().expect("device");
+    for pow in [12u32, 16] {
+        let n = 1usize << pow;
+        let sig = interleaved_signal(n, 1000 + pow as u64);
+        // inverse vs the f64 oracle
+        let inv = fft_gpu(&device, &sig, n as i64, true).expect("ifft");
+        let exp = host_fft_f64(&sig, n, true);
+        let err = l2_rel_err(&inv, &exp);
+        assert!(err < 1e-3, "n=2^{pow} ifft L2 {err}");
+        // round-trip ifft(fft(x)) ≈ x
+        let fwd = fft_gpu(&device, &sig, n as i64, false).expect("fft");
+        let back = fft_gpu(&device, &fwd, n as i64, true).expect("ifft");
+        let rerr = l2_rel_err(&back, &sig);
+        assert!(rerr < 1e-3, "n=2^{pow} roundtrip L2 {rerr}");
+    }
+}
+
 #[test]
 fn radix2_inverse_and_roundtrip() {
     let device = MetalDevice::system_default().expect("device");

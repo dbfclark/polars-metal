@@ -71,8 +71,15 @@ pub fn fft_gpu(
     inverse: bool,
 ) -> Result<Vec<f32>, FftError> {
     debug_assert_eq!(input.len() as i64, 2 * n);
-    if n <= 0 || n > FFT_BASE_MAX {
-        // n > FFT_BASE_MAX routes to four-step (Task 4); not yet supported.
+    if n <= 0 {
+        return Err(FftError::Unsupported(n));
+    }
+    if n > FFT_BASE_MAX {
+        // Larger sizes route to the four-step path (this task) when pow2 and
+        // both factors fit; otherwise unsupported until later tasks.
+        if (n & (n - 1)) == 0 {
+            return fft_fourstep(device, input, n, inverse);
+        }
         return Err(FftError::Unsupported(n));
     }
 
@@ -125,6 +132,99 @@ pub fn fft_gpu(
 
     queue.wait_until_complete()?;
     Ok(out_buf.to_f32_vec())
+}
+
+/// Bailey's four-step FFT for power-of-two `n` with `FFT_BASE_MAX < n <=
+/// FFT_BASE_MAX^2` (= 2^20). Factor `n = 2^p` as `n1 = 2^(p/2)`,
+/// `n2 = 2^(p - p/2)`, so both factors are `<= FFT_BASE_MAX` for `p <= 20`.
+///
+/// View the input as an `n1 x n2` row-major matrix and run:
+/// (1) length-`n1` column FFTs, (2) the `W_N^{i*j}` cross-twiddle,
+/// (3) length-`n2` row FFTs, (4) an `n1 x n2 -> n2 x n1` transpose. The
+/// sub-FFTs are forward-only; inverse is handled by conjugating the input
+/// host-side, running the forward four-step, then conjugating and scaling by
+/// `1/N` on readback (`ifft(x) = conj(fft(conj(x)))/N`).
+///
+/// The four passes are data-dependent, so we `wait_until_complete` after each
+/// dispatch before issuing the next — both for correctness (later passes read
+/// the prior pass's output) and so per-pass GPU errors surface (the queue only
+/// tracks the most-recently-committed command buffer; see `command.rs`).
+fn fft_fourstep(
+    device: &MetalDevice,
+    input: &[f32],
+    n: i64,
+    inverse: bool,
+) -> Result<Vec<f32>, FftError> {
+    // p = log2(n); split p into p1 = p/2, p2 = p - p1.
+    let p = (n as u64).trailing_zeros();
+    let p1 = p / 2;
+    let p2 = p - p1;
+    let n1 = 1u32 << p1;
+    let n2 = 1u32 << p2;
+    if i64::from(n1) > FFT_BASE_MAX || i64::from(n2) > FFT_BASE_MAX {
+        // p > 20: a factor exceeds the base cap; recursive path is Task 5.
+        return Err(FftError::Unsupported(n));
+    }
+    let ntot = n as usize;
+
+    // Stage the (optionally conjugated) input into the data buffer.
+    let mut staged = input.to_vec();
+    if inverse {
+        for c in staged.chunks_exact_mut(2) {
+            c[1] = -c[1];
+        }
+    }
+    let data_buf = MetalBuffer::from_f32_slice(device, &staged)?;
+    let trans_buf = device.new_buffer_zeroed(2 * ntot * std::mem::size_of::<f32>())?;
+    let n1_buf = device.new_buffer_from_bytes(&n1.to_le_bytes())?;
+    let n2_buf = device.new_buffer_from_bytes(&n2.to_le_bytes())?;
+    let ntot_buf = device.new_buffer_from_bytes(&(ntot as u32).to_le_bytes())?;
+
+    let lib = shared_library(device)?;
+    let mut queue = CommandQueue::new(device)?;
+
+    // Pass 1: column FFTs — n2 threadgroups, each width <= n1 (the column len).
+    let cols_pso = lib.pipeline("fft_fourstep_cols")?;
+    let col_tg = n1 as usize;
+    queue.dispatch_1d_with_tg(
+        &cols_pso,
+        &[&data_buf, &n1_buf, &n2_buf],
+        n2 as usize * col_tg,
+        col_tg,
+    )?;
+    queue.wait_until_complete()?;
+
+    // Pass 2: elementwise cross-twiddle over all N elements.
+    let tw_pso = lib.pipeline("fft_twiddle_mul")?;
+    queue.dispatch_1d(&tw_pso, &[&data_buf, &n2_buf, &ntot_buf], ntot)?;
+    queue.wait_until_complete()?;
+
+    // Pass 3: row FFTs — n1 threadgroups, each width <= n2 (the row len).
+    let rows_pso = lib.pipeline("fft_fourstep_rows")?;
+    let row_tg = n2 as usize;
+    queue.dispatch_1d_with_tg(
+        &rows_pso,
+        &[&data_buf, &n1_buf, &n2_buf],
+        n1 as usize * row_tg,
+        row_tg,
+    )?;
+    queue.wait_until_complete()?;
+
+    // Pass 4: transpose n1 x n2 -> n2 x n1 into the scratch buffer.
+    let tr_pso = lib.pipeline("fft_transpose")?;
+    queue.dispatch_1d(&tr_pso, &[&data_buf, &trans_buf, &n1_buf, &n2_buf], ntot)?;
+    queue.wait_until_complete()?;
+
+    let mut out = trans_buf.to_f32_vec();
+    if inverse {
+        // ifft = conj(fft(conj(x)))/N: conjugate + scale by 1/N on readback.
+        let scale = 1.0f32 / n as f32;
+        for c in out.chunks_exact_mut(2) {
+            c[0] *= scale;
+            c[1] = -c[1] * scale;
+        }
+    }
+    Ok(out)
 }
 
 /// Naive O(N^2) DFT over interleaved-complex input `[re0,im0,re1,im1,...]`.
