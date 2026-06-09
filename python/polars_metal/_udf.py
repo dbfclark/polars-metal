@@ -226,7 +226,23 @@ def _dispatch_hstack_fused(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
                 # bytesNoCopy path (page-aligned numpy-origin allocations).
                 # Columns with nulls / multiple chunks copy here (correctness
                 # preserved), then ingest-copy.
-                input_arrays.append(np.ascontiguousarray(series.to_numpy(), dtype=col_np_dtype))
+                #
+                # Null staging differs by family. For an INTEGER column with
+                # nulls, `series.to_numpy()` renders nulls as NaN in a float
+                # array; casting that to an int dtype raises a RuntimeWarning
+                # ("invalid value encountered in cast"). The conformance suite
+                # runs `filterwarnings = error`, so that warning is fatal — and
+                # the int value in a null slot is irrelevant anyway, since the
+                # `_fused_null_mask` machinery restores nulls in the OUTPUT. Fill
+                # nulls with sentinel 0 BEFORE the int conversion (B1 admits only
+                # add/sub/mul/div/neg/abs/square/cmp/cast for integers — none of
+                # which traps on 0; mod and floor-div are not fusable for ints).
+                # The F32 path keeps NaN + the validity mask (unchanged).
+                if series.null_count() and np.issubdtype(col_np_dtype, np.integer):
+                    staged = series.fill_null(0).to_numpy()
+                else:
+                    staged = series.to_numpy()
+                input_arrays.append(np.ascontiguousarray(staged, dtype=col_np_dtype))
                 input_tags.append(col_tag)
             elif kind == "lit":
                 # Single scalar — executor builds a shape=[1] MLX array, which
