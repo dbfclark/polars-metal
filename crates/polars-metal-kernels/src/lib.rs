@@ -7,6 +7,7 @@
 pub mod aggregate_fused;
 pub mod cmp;
 pub mod command;
+pub mod fft;
 pub mod filter;
 pub mod groupby;
 pub mod groupby_build_partitioned;
