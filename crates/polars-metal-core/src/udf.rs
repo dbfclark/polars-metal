@@ -2582,7 +2582,7 @@ pub fn execute_fused_expr(
     // GPU writes on readback), validates the dtype matches, and bounds-checks
     // against `out_cap`.
     subgraph
-        .eval_into_typed(&device, out_ptr, out_cap, out_dtype)
+        .eval_into_typed(out_ptr, out_cap, out_dtype)
         .map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: subgraph eval: {e}"))
         })

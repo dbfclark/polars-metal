@@ -179,7 +179,6 @@ impl MlxSubgraph {
     /// `out_dtype`, alive for the whole call.
     pub fn eval_into_typed(
         &self,
-        _device: &MetalDevice,
         out_ptr: usize,
         out_cap: usize,
         out_dtype: MlxDtype,
