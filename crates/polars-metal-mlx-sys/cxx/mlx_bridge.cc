@@ -3,7 +3,6 @@
 #include "mlx/allocator.h"
 #include "mlx/array.h"
 #include "mlx/device.h"
-#include "mlx/fft.h"
 #include "mlx/ops.h"
 #include "mlx/transforms.h"
 #include "mlx/utils.h"
@@ -431,7 +430,7 @@ std::shared_ptr<MlxArray> mlx_iota_f32(int64_t n) {
     return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
 }
 
-// ── M4 Phase 1 Task 10: cumulative scans + matmul + fft + real/imag ─────────
+// ── M4 Phase 1 Task 10: cumulative scans + matmul ───────────────────────────
 
 #define MLX_WRAP_SCAN(rust_name, mlx_op)                                                   \
     std::shared_ptr<MlxArray> rust_name(const std::shared_ptr<MlxArray>& a, int32_t axis) { \

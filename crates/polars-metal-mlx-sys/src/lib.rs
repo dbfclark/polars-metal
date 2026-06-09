@@ -259,7 +259,7 @@ mod ffi {
         // MlxArray; Result<> kept for `?`-idiom consistency.
         fn mlx_iota_f32(n: i64) -> Result<SharedPtr<MlxArray>>;
 
-        // M4 Phase 1 Task 10: cumulative scans + matmul + fft.
+        // M4 Phase 1 Task 10: cumulative scans + matmul.
 
         fn mlx_op_cumsum(a: &SharedPtr<MlxArray>, axis: i32) -> Result<SharedPtr<MlxArray>>;
         fn mlx_op_cumprod(a: &SharedPtr<MlxArray>, axis: i32) -> Result<SharedPtr<MlxArray>>;
