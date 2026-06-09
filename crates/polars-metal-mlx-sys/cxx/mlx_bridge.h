@@ -269,15 +269,4 @@ std::shared_ptr<MlxArray> mlx_op_take_along_axis(
 std::shared_ptr<MlxArray> mlx_op_argpartition_axis(
     const std::shared_ptr<MlxArray>& a, int32_t kth, int32_t axis);
 
-std::shared_ptr<MlxArray> mlx_op_fft_1d(const std::shared_ptr<MlxArray>& a);
-std::shared_ptr<MlxArray> mlx_op_ifft_1d(const std::shared_ptr<MlxArray>& a);
-
-std::shared_ptr<MlxArray> mlx_op_real(const std::shared_ptr<MlxArray>& a);
-std::shared_ptr<MlxArray> mlx_op_imag(const std::shared_ptr<MlxArray>& a);
-
-// Assemble a complex64 array from two real F32 streams: re + i*im.
-std::shared_ptr<MlxArray> mlx_op_complex(
-    const std::shared_ptr<MlxArray>& re,
-    const std::shared_ptr<MlxArray>& im);
-
 }  // namespace polars_metal_mlx

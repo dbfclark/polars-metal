@@ -14,7 +14,6 @@ pub use error::FfiError;
 
 pub mod array;
 pub mod elementwise;
-pub mod fft;
 pub mod matmul;
 pub mod reduce;
 pub mod scan;
@@ -285,17 +284,6 @@ mod ffi {
             a: &SharedPtr<MlxArray>,
             indices: &SharedPtr<MlxArray>,
             axis: i32,
-        ) -> Result<SharedPtr<MlxArray>>;
-
-        fn mlx_op_fft_1d(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
-        fn mlx_op_ifft_1d(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
-
-        fn mlx_op_real(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
-        fn mlx_op_imag(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
-
-        fn mlx_op_complex(
-            re: &SharedPtr<MlxArray>,
-            im: &SharedPtr<MlxArray>,
         ) -> Result<SharedPtr<MlxArray>>;
     }
 }

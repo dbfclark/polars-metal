@@ -23,7 +23,6 @@ use polars_metal_mlx_sys::elementwise::{
     mlx_mod_, mlx_mul, mlx_ne, mlx_neg, mlx_pow, mlx_round, mlx_sin, mlx_sinh, mlx_sqrt,
     mlx_square, mlx_sub, mlx_tan, mlx_tanh, mlx_where,
 };
-use polars_metal_mlx_sys::fft::{mlx_fft, mlx_ifft};
 use polars_metal_mlx_sys::matmul::mlx_matmul;
 use polars_metal_mlx_sys::reduce::{
     mlx_argmax, mlx_argmin, mlx_max, mlx_mean, mlx_min, mlx_std, mlx_sum, mlx_var,
@@ -394,11 +393,10 @@ fn build_op(node: &OpNode, handles: &[MlxArrayHandle]) -> Result<MlxArrayHandle,
         // FFT. UNREACHABLE from this fused-walker path: `fft` is not a NodeTraverser-viewable
         // expression, so the analyzer never builds this arm, and folding a complex FFT result
         // back into an F32 Series here would be wrong anyway. The LIVE FFT path is the `.metal`
-        // namespace (python/polars_metal/_fft_*; docs/superpowers/specs/2026-06-08-m6-a3-fft*).
-        // That path also guards to MLX's reliable size (pow2 ≤ 2^20, ml-explore/mlx#1800) and
-        // CPU-falls-back above it. Do not rely on / extend these arms.
-        Fft => ffi(mlx_fft(args[0])),
-        Ifft => ffi(mlx_ifft(args[0])),
+        // namespace backed by the hand-rolled MSL kernel (`shaders/fft.metal` /
+        // `polars_metal_kernels::fft`), which handles all sizes on-GPU. The fused subgraph does
+        // not support FFT, hence `UnsupportedOp`. Do not rely on / extend these arms.
+        Fft | Ifft => Err(BuildError::UnsupportedOp(node.op)),
 
         // Shift (M5 rolling): forward shift with zero-fill; requires a scalar
         // param carrying the shift amount.
