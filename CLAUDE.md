@@ -182,6 +182,7 @@ These were M4 items 9–13, deferred. **All gated on a recognition mechanism** t
 - **One MSL kernel per file.** Filename matches the entry point. Document threadgroup/grid assumptions at the top of the file.
 - **Allocations:** prefer reusing scratch buffers via a per-query arena. The unified-memory model means there's no GPU OOM cliff, but fragmentation still hurts.
 - **Don't introduce a new dependency without a written justification in the PR description.** Especially for the kernel and buffer crates — they should stay lean.
+- **Never patch vendored code (`vendor/`) if it can be avoided.** When an upstream dep (e.g. MLX) is buggy or missing a capability, adapt/port what we need into our own code rather than forking the vendored tree — a vendored patch is maintenance debt that every version bump must re-apply, and it muddies the line between "our code" and "theirs." If upstream genuinely needs the change, upstream it; otherwise own a clean reimplementation. (E.g. MLX's Metal FFT breaks above 2^20 — we hand-roll our own `shaders/fft.metal` rather than patch `vendor/mlx`.)
 
 ## Testing strategy
 
