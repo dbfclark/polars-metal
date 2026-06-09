@@ -681,12 +681,13 @@ def _int_reduction_out_dtype(agg_kind: str, col_dtype: Any) -> str | None:
 
 def analyze_ir_reduction(
     nt: Any, agg_node_id: int, schema: dict[str, Any]
-) -> tuple[PyFusionScope, list[tuple[str, str | float]], str, bool, int] | None:
+) -> tuple[PyFusionScope, list[tuple[str, str | float]], str, bool, int, str] | None:
     """Analyze a full-column reduction `agg(expr)` (the terminus of a
     `select(pl.col(...).std())`-shaped node) into a fused scope whose single
     output is the scalar reduction.
 
-    Returns `(scope, descriptors, agg_kind, is_chain, arg_id)` or None if not
+    Returns `(scope, descriptors, agg_kind, is_chain, arg_id, out_dtype_str)`
+    or None if not
     fusion-eligible. `arg_id` is the reduction argument's arena id, so the
     walker can classify the chain's null mode (a null-bearing *elementwise*
     chain reduces on the GPU after `drop_nulls` — positions don't matter for a
@@ -706,8 +707,14 @@ def analyze_ir_reduction(
         be replayed on the source, so the walker only routes a chain whose
         input columns are null-free (else CPU).
 
-    All column inputs must be Float32 (the fused path emits an F32 scalar;
-    Polars' reduction dtype tracks the input dtype, so non-F32 must fall back).
+    Admit rule (B2): every column input must share ONE dtype that is either
+    Float32 (the legacy float path → ``out_dtype_str == "F32"``) or a
+    GPU-admissible integer reduction (see ``_int_reduction_out_dtype``: int
+    ``sum`` for {Int32, Int64, UInt32, UInt64}, int ``min``/``max`` for all 8
+    widths → ``out_dtype_str`` is the matching int tag, no fold-back cast).
+    Anything else (narrow-int ``sum``, int ``mean``/``std``/``var``, F64, a
+    mixed-dtype chain) falls back to CPU. ``out_dtype_str`` is the 6th return
+    element so the dispatch pre-allocates the right-width output array.
     """
     try:
         agg_node = nt.view_expression(agg_node_id)
@@ -732,20 +739,36 @@ def analyze_ir_reduction(
         _gather_leaves_ir(nt, arg_id, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup)
         inner_idx = _visit_ir_ops(nt, arg_id, schema, scope, leaf_idx)
         is_chain = scope.n_ops() > 0
-        # Every column input must be Float32 (the reduction output is F32).
-        if any(
-            d_kind == "col" and schema.get(payload) != pl.Float32 for d_kind, payload in descriptors
-        ):
-            raise _Aborted
         # Need at least one real column (literal-only reductions are degenerate).
-        if not any(d_kind == "col" for d_kind, _ in descriptors):
+        col_descriptors = [(k, p) for k, p in descriptors if k == "col"]
+        if not col_descriptors:
             raise _Aborted
+
+        # Resolve the binding's single column dtype. B2 admits only monomorphic
+        # reductions (every column leaf shares one dtype); a mixed-dtype chain
+        # falls back so we never mis-infer the output width.
+        col_dtypes = {schema.get(p) for _, p in col_descriptors}
+        if len(col_dtypes) != 1:
+            raise _Aborted
+        col_dtype = next(iter(col_dtypes))
+
+        # Output-dtype inference + GPU-admit gate:
+        #   - Float32 column → "F32" (the existing float path, unchanged).
+        #   - GPU-admissible int (op, dtype) → its wire int dtype (no cast).
+        #   - anything else (narrow int sum, int mean/std/var, F64, …) → CPU.
+        if col_dtype == pl.Float32:
+            out_dtype_str = "F32"
+        else:
+            out_dtype_str = _int_reduction_out_dtype(kind, col_dtype)
+            if out_dtype_str is None:
+                raise _Aborted
+
         if not is_chain and (len(descriptors) != 1 or descriptors[0][0] != "col"):
             # Bare reduction must be a single column.
             raise _Aborted
         red_idx = scope.push_op(op_id, [inner_idx])
         scope.mark_output(red_idx)
-        return scope, descriptors, kind, is_chain, arg_id
+        return scope, descriptors, kind, is_chain, arg_id, out_dtype_str
     except _Aborted:
         return None
 

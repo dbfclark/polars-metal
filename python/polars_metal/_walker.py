@@ -421,7 +421,7 @@ def _try_fused_select_reduction(
         result = analyze_ir_reduction(nt, node_id, in_schema)
         if result is None:
             return None
-        scope, columns, agg_kind, is_chain, arg_id = result
+        scope, columns, agg_kind, is_chain, arg_id, out_dtype_str = result
         _fusion_log.info(
             "FusedReduction candidate column=%r kind=%s n_inputs=%d n_ops=%d chain=%s",
             output_name,
@@ -437,6 +437,11 @@ def _try_fused_select_reduction(
                 "_fused_columns": columns,
                 "_agg_kind": agg_kind,
                 "_is_chain": is_chain,
+                # Statically-inferred wire output dtype ("F32" for the float
+                # path, or an int tag like "I64" for a GPU-admissible int
+                # reduction). The dispatch pre-allocates the right-width output;
+                # the full int_fused_ok routing guard lands in Task 3.
+                "_fused_out_dtype": out_dtype_str,
                 # Null mode of the chain argument (None for bare). An
                 # "elementwise" chain over a null column can reduce on the GPU
                 # after dropping nulls (positions don't matter for a reduction);

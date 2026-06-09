@@ -1,6 +1,8 @@
 import polars as pl
 import pytest
+from polars.testing import assert_frame_equal
 
+from polars_metal import MetalEngine
 from polars_metal._fusion_analyzer import _int_reduction_out_dtype
 
 # (agg_kind, polars dtype) -> expected wire output-dtype string, or None for
@@ -45,3 +47,22 @@ _ADMIT = [
 @pytest.mark.parametrize("kind,dtype,expected", _ADMIT)
 def test_int_reduction_out_dtype_matrix(kind, dtype, expected):
     assert _int_reduction_out_dtype(kind, dtype) == expected
+
+
+def test_int64_sum_returns_int64_dtype_via_engine():
+    # An int sum that is admitted (Int64) must come back as Int64, byte-exact.
+    df = pl.DataFrame({"x": pl.Series([1, 2, 3, 4], dtype=pl.Int64)})
+    lf = df.lazy().select(pl.col("x").sum().alias("s"))
+    got = lf.collect(engine=MetalEngine())
+    want = lf.collect()
+    assert got.equals(want)
+    assert got["s"].dtype == pl.Int64
+
+
+def test_f32_sum_still_works_after_arity_change():
+    # The analyzer-tuple arity grew from 5 to 6; the F32 path must be intact.
+    df = pl.DataFrame({"x": pl.Series([1.0, 2.0, 3.0], dtype=pl.Float32)})
+    lf = df.lazy().select((pl.col("x") * 2.0).sum().alias("s"))  # chain → GPU
+    got = lf.collect(engine=MetalEngine())
+    want = lf.collect()
+    assert_frame_equal(got, want, check_exact=False, abs_tol=1e-4)
