@@ -70,7 +70,7 @@ pub fn execute_fft(
 ) -> PyResult<(Bound<'_, PyBytes>, Bound<'_, PyBytes>)> {
     let (rptr, rlen) = real;
     // Guard: the signal length must match the declared n (Python supplies n independently; a
-    // mismatch would make MLX read past the buffer). Reject clearly instead of risking UB.
+    // mismatch would make the FFT kernel read past the buffer). Reject clearly instead of risking UB.
     if rlen != n as usize {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "fft: real stream len {rlen} != n {n}"
