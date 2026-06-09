@@ -239,8 +239,9 @@ impl MlxSubgraph {
     /// allocator API; extracting the underlying MTL::Buffer\* and wrapping
     /// it as a `MetalBuffer` without copying requires exposing the MLX
     /// allocator surface through the FFI bridge. For Phase 4 we take the
-    /// pragmatic path - read the output as Vec<f32> and stage a fresh
-    /// `MetalBuffer`. This adds one F32 copy at the output, which doesn't
+    /// pragmatic path - read the output as a typed Vec matching the eval'd
+    /// dtype (`f32` / `i*` / `u*`) and stage a fresh `MetalBuffer` of that
+    /// dtype. This adds one copy at the output, which doesn't
     /// affect the input zero-copy path (the dominant cost for large
     /// transcendental chains). Full output-zero-copy is a future
     /// optimization tracked alongside the MLX allocator-surface work.
@@ -300,6 +301,11 @@ impl MlxSubgraph {
                         .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
                     MetalBuffer::from_u64_slice(device, &data)
                 }
+                // B1 ships integer + F32 output only. Bool output would need
+                // repacking to Arrow's bit-packed validity-style layout, and
+                // F64 is unsupported by the MLX-on-Metal view path; both are
+                // out of B1 scope and surface as an error (caller falls back to
+                // CPU). Revisit if a later milestone needs Bool/F64 output.
                 MlxDtype::Bool | MlxDtype::F64 => {
                     return Err(BuildError::UnsupportedInputDtype(format!(
                         "output {dtype:?}"
