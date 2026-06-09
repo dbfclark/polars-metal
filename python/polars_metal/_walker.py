@@ -413,6 +413,15 @@ def _try_fused_select_reduction(
     Bessel correction on std/var).
     """
     bindings: list[dict] = []
+    # The aggregation-argument columns live in the *input* schema, not the
+    # Select's output schema, so ``nt.get_dtype(<agg node>)`` only resolves the
+    # reduction's output dtype while the visitor is positioned at the input
+    # child (mirrors ``_walk_group_by``; at the Select node it raises
+    # ColumnNotFoundError). The B2 dtype-match guard below temporarily navigates
+    # there.
+    select_node = nt.get_node()
+    nav_inputs = nt.get_inputs()
+    input_node = nav_inputs[0] if len(nav_inputs) == 1 else None
     for agg_expr in exprs:
         node_id = getattr(agg_expr, "node", None)
         output_name = getattr(agg_expr, "output_name", None)
@@ -422,6 +431,27 @@ def _try_fused_select_reduction(
         if result is None:
             return None
         scope, columns, agg_kind, is_chain, arg_id, out_dtype_str = result
+        # B2 safety (mirrors the HStack int_fused_ok defense at _walker.py:609):
+        # admit an int reduction onto the GPU only when the analyzer's inferred
+        # wire output tag corresponds to the REAL Polars reduction output dtype.
+        # The F32 path is unconditionally fine. A mismatch (analyzer
+        # mis-inference) aborts the whole fused select to CPU (return None),
+        # preserving Polars' dtype.
+        if out_dtype_str != "F32":
+            if input_node is None:
+                return None
+            nt.set_node(input_node)
+            try:
+                real_out = str(nt.get_dtype(node_id))
+            except Exception:
+                return None
+            finally:
+                nt.set_node(select_node)
+            if (
+                out_dtype_str not in _INT_TAG_TO_POLARS
+                or real_out != _INT_TAG_TO_POLARS[out_dtype_str]
+            ):
+                return None
         _fusion_log.info(
             "FusedReduction candidate column=%r kind=%s n_inputs=%d n_ops=%d chain=%s",
             output_name,
