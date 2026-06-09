@@ -10,6 +10,8 @@ Collect-and-stitch over whole, materialized columns (chunk-safe), mirroring _vec
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import polars as pl
 
@@ -26,7 +28,7 @@ from polars_metal._fft_namespace import OP_IFFT
 
 
 def _cpu_fft(re: np.ndarray, im: np.ndarray | None, inverse: bool) -> tuple[np.ndarray, np.ndarray]:
-    """CPU fallback (numpy) for sizes MLX's Metal FFT can't do correctly. Returns
+    """CPU fallback (numpy) for the rare GPU error / OOM path. Returns
     (real_out f32, imag_out f32), matching the GPU path's F32 Struct output."""
     signal = re if im is None else (re.astype(np.float64) + 1j * im.astype(np.float64))
     out = np.fft.ifft(signal) if inverse else np.fft.fft(signal)
@@ -79,8 +81,16 @@ def _run_binding(df: pl.DataFrame, b: FftBinding) -> pl.Series:
         )
         real_out = np.frombuffer(real_bytes, dtype=np.float32)
         imag_out = np.frombuffer(imag_bytes, dtype=np.float32)
-    except Exception:
-        # GPU OOM or n beyond the kernel's supported range → CPU fallback (still correct).
+    except RuntimeError as e:
+        # Native execute_fft raises PyRuntimeError for the recoverable kernel/OOM/unsupported-size
+        # class (CPU fallback is still correct). The stream-length-mismatch guard raises
+        # PyValueError instead — an internal marshalling bug we deliberately let propagate.
+        # Warn so a masked kernel failure is observable rather than silently slow.
+        warnings.warn(
+            f"polars_metal: GPU FFT failed ({e}); falling back to CPU (n={n}).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         real_out, imag_out = _cpu_fft(re, im, inverse)
     return pl.DataFrame({"real": real_out, "imag": imag_out}).to_struct(b.out_name)
 
