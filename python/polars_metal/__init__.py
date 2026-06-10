@@ -10,6 +10,9 @@ from typing import Any
 import polars.lazyframe.frame as _plf
 
 from polars_metal import (
+    _dt_detect as _dt_detect_module,  # noqa: F401  (installs with_columns patch)
+)
+from polars_metal import (
     _fft_detect as _fft_detect_module,  # noqa: F401  (installs with_columns patch)
 )
 from polars_metal import _native
@@ -295,6 +298,18 @@ def _patch_gpu_engine_callback() -> None:
                     return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
 
                 return _fft_dispatch.apply_fft(self, fft_bindings, _collect_rest_fft)
+            # M6 B3 dt: serialize-detected dt.year/month/day run on the gregorian
+            # Metal kernel via the same collect-and-stitch template. Independent
+            # with_columns patch/cache; coexists with rolling/vector/fft.
+            from polars_metal import _dt_detect, _dt_dispatch
+
+            dt_bindings = [] if streaming else _dt_detect.find_dt_bindings(self)
+            if dt_bindings:
+
+                def _collect_rest_dt(rest_lf: Any) -> Any:
+                    return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
+
+                return _dt_dispatch.apply_dt(self, dt_bindings, _collect_rest_dt)
             # post_opt_callback is an internal bypass that injects a callback
             # directly, skipping _gpu_engine_callback. We run the query on
             # the CPU engine; in M0 our callback falls through, so the result
