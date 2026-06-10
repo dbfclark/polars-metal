@@ -103,3 +103,25 @@ def test_unsupported_field_falls_back_and_matches():
     assert _dt_dispatches(lf, eng) == 0  # not handled -> CPU
     got, want = lf.collect(engine=eng), lf.collect()
     assert got.equals(want)
+
+
+def test_tz_aware_datetime_falls_back_and_matches():
+    eng = MetalEngine()
+    s = pl.Series("t", [datetime.datetime(2020, 3, 15, 12, 0)], dtype=pl.Datetime("us", "UTC"))
+    lf = pl.DataFrame({"t": s}).lazy().with_columns(pl.col("t").dt.year().alias("o"))
+    assert _dt_dispatches(lf, eng) == 0  # tz-aware -> CPU
+    got, want = lf.collect(engine=eng), lf.collect()
+    assert got.equals(want)
+
+
+def test_large_n_with_nulls_byte_exact():
+    eng = MetalEngine()
+    n = 100_000
+    base = datetime.date(1995, 1, 1)
+    dates = [None if i % 4 == 0 else base + datetime.timedelta(days=i) for i in range(n)]
+    df = pl.DataFrame({"d": pl.Series("d", dates)})
+    lf = df.lazy().with_columns(pl.col("d").dt.year().alias("o"))
+    assert _dt_dispatches(lf, eng) == 1
+    got, want = lf.collect(engine=eng), lf.collect()
+    assert got.equals(want)
+    assert got["o"].dtype == pl.Int32
