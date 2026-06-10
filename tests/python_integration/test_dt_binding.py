@@ -19,7 +19,9 @@ def _hinnant(z: int) -> tuple[int, int, int]:
 
 
 def test_execute_dt_year_month_day():
-    days = np.array([18336, -1, -25567, 0, 11016], dtype=np.int32)  # incl negatives, leap (2000-02-29)
+    days = np.array(
+        [18336, -1, -25567, 0, 11016], dtype=np.int32
+    )  # incl negatives, leap (2000-02-29)
     for field in (0, 1, 2):  # year, month, day
         inp = np.ascontiguousarray(days, dtype=np.int32)
         out = np.empty(inp.size, dtype=np.int32)

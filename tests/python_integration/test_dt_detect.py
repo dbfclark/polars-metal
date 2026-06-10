@@ -50,10 +50,10 @@ def test_non_handleable_omitted():
     )
     # Unsupported accessor, sub-expression input, tz-aware datetime, non-date col.
     lf = df.lazy().with_columns(
-        pl.col("d").dt.weekday().alias("wd"),       # unsupported field
+        pl.col("d").dt.weekday().alias("wd"),  # unsupported field
         (pl.col("d") + pl.duration(days=1)).dt.year().alias("expr_in"),  # sub-expr input
-        pl.col("t").dt.year().alias("tz"),          # tz-aware -> CPU
-        (pl.col("v") * 2).alias("plain"),           # not a dt expr
+        pl.col("t").dt.year().alias("tz"),  # tz-aware -> CPU
+        (pl.col("v") * 2).alias("plain"),  # not a dt expr
     )
     assert find_dt_bindings(lf) == []
 
