@@ -21,7 +21,7 @@ from typing import Any
 
 import polars as pl
 
-from polars_metal import _fft_namespace
+from polars_metal import _dtw_namespace, _fft_namespace
 
 _HANDLE_COUNTER = itertools.count(1)
 
@@ -132,3 +132,11 @@ class MetalExprNamespace:
     def ifft(self) -> pl.Expr:
         col = self._input_col()
         return _fft_namespace.build_fft_sentinel(self._expr, col, _fft_namespace.OP_IFFT)
+
+    def dtw(
+        self,
+        reference: Any,
+        window: int | None = None,
+        allow_cpu_fallback: bool = False,
+    ) -> pl.Expr:
+        return _dtw_namespace.make_dtw_expr(self._expr, reference, window, allow_cpu_fallback)
