@@ -21,6 +21,9 @@ dev = [
     "pytest-benchmark>=4",
     "hypothesis>=6",
     "ruff>=0.6",
+    # dtaidistance is the differential oracle + bench bar (and the opt-in
+    # CPU-fallback engine) for the M6 A4 .metal.dtw kernel.
+    "dtaidistance",
     # pyarrow + cloudpickle are needed by Polars' own test suite when we run
     # it through the conformance harness (tests/conformance/test_polars_suite.py).
     "pyarrow>=18",

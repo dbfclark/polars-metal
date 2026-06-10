@@ -13,6 +13,9 @@ from polars_metal import (
     _dt_detect as _dt_detect_module,  # noqa: F401  (installs with_columns patch)
 )
 from polars_metal import (
+    _dtw_detect as _dtw_detect_module,  # noqa: F401  (installs with_columns patch)
+)
+from polars_metal import (
     _fft_detect as _fft_detect_module,  # noqa: F401  (installs with_columns patch)
 )
 from polars_metal import _native
@@ -298,6 +301,18 @@ def _patch_gpu_engine_callback() -> None:
                     return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
 
                 return _fft_dispatch.apply_fft(self, fft_bindings, _collect_rest_fft)
+            # M6 A4 DTW: serialize-detected .metal.dtw sentinels run on the banded
+            # DTW Metal kernel via the same collect-and-stitch template. Independent
+            # with_columns patch/cache; coexists with rolling/vector/fft.
+            from polars_metal import _dtw_detect, _dtw_dispatch
+
+            dtw_bindings = [] if streaming else _dtw_detect.find_dtw_bindings(self)
+            if dtw_bindings:
+
+                def _collect_rest_dtw(rest_lf: Any) -> Any:
+                    return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
+
+                return _dtw_dispatch.apply_dtw(self, dtw_bindings, _collect_rest_dtw)
             # M6 B3 dt: serialize-detected dt.year/month/day run on the gregorian
             # Metal kernel via the same collect-and-stitch template. Independent
             # with_columns patch/cache; coexists with rolling/vector/fft.
