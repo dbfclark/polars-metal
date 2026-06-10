@@ -295,6 +295,15 @@
       "n_rows": 100000000,
       "hardware": "M2 Ultra",
       "_notes": "Bare sum routes to CPU by design — informational, NO gate. The B4 spike measured forced-GPU at ~2.7x SLOWER: a bare reduction is bandwidth-bound and the host->MLX ingest (>=7ms) exceeds Polars' multithreaded scan. routed==cpu because the engine correctly stays on CPU. See memory m6-b4-reduction-routing-spike."
+    },
+    "dtw_metal_n100k_l256": {
+      "cpu_ms": 38039.51,
+      "metal_ms": 2834.25,
+      "ratio_metal_over_cpu": 0.0745,
+      "n_rows": 100000,
+      "hardware": "M2 Ultra",
+      "_notes": "Banded DTW (full, window=None), Array(F32,256), N=100k vs dtaidistance distance_matrix_fast (parallel C). B4-style honest bar. Custom MSL kernel, one threadgroup/pair. Measured 2026-06-10 bench_dtw.py: 2834 ms metal vs 38040 ms dtaidistance = 13.4x. (Other shapes: N=10k/L=64 8.3x, N=100k/L=64 9.7x, N=10k/L=256 14.3x.) Gate ratio_lt=0.2 leaves ~2.7x headroom over the measured 0.0745.",
+      "_gate": {"ratio_lt": 0.2}
     }
   }
 }
