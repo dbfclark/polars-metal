@@ -12,9 +12,11 @@ mod device;
 pub mod dict;
 mod error;
 mod null_bitmap;
+pub mod staging;
 
 pub use alignment::{is_aligned, is_page_aligned, is_ptr_page_aligned, page_size};
 pub use bridge::MetalBuffer;
 pub use device::MetalDevice;
 pub use error::BufferError;
 pub use null_bitmap::{count_valid, get_valid, load_chunk_8, set_valid, validity_bytes};
+pub use staging::StagingPool;
