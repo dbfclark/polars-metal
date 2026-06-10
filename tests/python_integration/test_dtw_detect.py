@@ -6,7 +6,7 @@ import warnings
 import numpy as np
 import polars as pl
 
-from polars_metal import _dtw_namespace
+from polars_metal import _dtw_detect, _dtw_namespace
 
 
 def _serialize(expr):
@@ -32,3 +32,22 @@ def test_dtw_captures_spec():
     assert spec.allow_cpu_fallback is True
     assert spec.query_col == "seq"
     np.testing.assert_array_equal(np.asarray(spec.reference, dtype=np.float32), ref)
+
+
+def test_find_dtw_bindings_recognizes_sentinel():
+    ref = np.arange(4, dtype=np.float32)
+    df = pl.DataFrame(
+        {"seq": [[1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0]]},
+        schema={"seq": pl.Array(pl.Float32, 4)},
+    )
+    lf = df.lazy().with_columns(pl.col("seq").metal.dtw(ref, window=1).alias("d"))
+    bindings = _dtw_detect.find_dtw_bindings(lf)
+    assert len(bindings) == 1
+    assert bindings[0].out_name == "d"
+    assert bindings[0].query_col == "seq"
+
+
+def test_find_dtw_bindings_ignores_plain_exprs():
+    df = pl.DataFrame({"x": [1.0, 2.0]})
+    lf = df.lazy().with_columns((pl.col("x") * 2).alias("y"))
+    assert _dtw_detect.find_dtw_bindings(lf) == []
