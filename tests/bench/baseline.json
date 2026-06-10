@@ -269,6 +269,32 @@
       "_notes": "M4 placeholder: FFT 8M-point 1D F32 via Expr.metal.fft(). Target wall-clock < 3.0 ms; ratio gate set at landing.",
       "_pending": true,
       "_target_ms": 3.0
+    },
+    "reduction_std_f32_100m": {
+      "cpu_ms": 71.35,
+      "metal_ms": 8.88,
+      "ratio_metal_over_cpu": 0.124,
+      "n_rows": 100000000,
+      "hardware": "M2 Ultra",
+      "_notes": "Bare std routes to GPU (compute-bound: Polars CPU is a two-pass Welford, far from bandwidth). B4 end-to-end, 2026-06-10, bench_reductions.py.",
+      "_gate": {"ratio_lt": 0.5}
+    },
+    "reduction_var_f32_100m": {
+      "cpu_ms": 74.10,
+      "metal_ms": 9.49,
+      "ratio_metal_over_cpu": 0.128,
+      "n_rows": 100000000,
+      "hardware": "M2 Ultra",
+      "_notes": "Bare var routes to GPU. B4 end-to-end, 2026-06-10, bench_reductions.py.",
+      "_gate": {"ratio_lt": 0.5}
+    },
+    "reduction_bare_sum_f32_100m": {
+      "cpu_ms": 2.26,
+      "metal_ms": 2.26,
+      "ratio_metal_over_cpu": 1.0,
+      "n_rows": 100000000,
+      "hardware": "M2 Ultra",
+      "_notes": "Bare sum routes to CPU by design — informational, NO gate. The B4 spike measured forced-GPU at ~2.7x SLOWER: a bare reduction is bandwidth-bound and the host->MLX ingest (>=7ms) exceeds Polars' multithreaded scan. routed==cpu because the engine correctly stays on CPU. See memory m6-b4-reduction-routing-spike."
     }
   }
 }
