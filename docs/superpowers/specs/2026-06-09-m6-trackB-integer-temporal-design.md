@@ -162,17 +162,22 @@ build on it.
 
 ### B4 — Reduction routing + re-baselined benchmarks (HEADLINE)
 
-- **End-to-end engine measurement:** bare int (I32/I64) **and** F32 reductions (`sum/mean/min/max`)
-  through the *full* engine path (collect + zero-copy stage + MLX reduce + fold-back) vs Polars CPU,
-  across a size sweep (1M / 10M / 100M). This converts the pure-compute spike into honest engine
-  numbers.
-- **Size-aware per-op routing threshold:** install `N₀(op, dtype)` in the compute-intensity router —
-  route a bare reduction to GPU above the measured crossover, CPU below. Flip F32 routing where it
-  genuinely wins end-to-end; leave it CPU where engine overhead eats the compute win (e.g. F32 `sum`
-  at small N). Measured, not guessed.
-- **Benchmarks + honest gates:** reduction-routing wins (the sleeper headline), the `dt` kernel
-  (~30–40×), int arithmetic chains (parity-ish — labeled honestly). Add int variants of relevant
-  survey workloads; record baselines + `ratio_lt` gates.
+- **Outcome — premise refuted by end-to-end measurement (2026-06-10, M2 Ultra).** The pre-plan
+  spike drove bare int (I32/I64) and F32 reductions through the *full* engine path (collect +
+  zero-copy-view stage + MLX reduce + scalar readback) vs Polars CPU across 1M/10M/100M. **GPU
+  loses 2–5× at every size with no crossover.** A bare reduction is bandwidth-bound (1 flop/element);
+  the host→MLX ingest alone (≥7ms @100M, the unified-memory wall) exceeds Polars' multithreaded SIMD
+  scan (2.4ms). The brainstorm spike's 3.5–10× was an artifact of comparing *resident* MLX (no ingest,
+  0.95ms) against *single-threaded* numpy (~17ms), not real Polars CPU. **`std`/`var` stay on GPU** —
+  they are genuine 5–9× wins (Polars CPU std/var is a slow two-pass Welford, far from bandwidth). The
+  M4 compute-intensity gate (route on FLOPs/row, not op identity) is vindicated, not changed.
+- **No routing flip, no `N₀` threshold.** `_BARE_GPU_WORTHY_REDUCTIONS = {std, var}` is correct as-is;
+  there is no size crossover to gate on. `StagingPool` is moot here — the reduction input is already a
+  zero-copy MLX view (no per-call `newBufferWithBytes` tax, unlike `execute_dt`).
+- **Shipped as guard + re-baseline:** a dispatch-asserted regression test pinning the decision
+  (`tests/python_integration/test_reduction_routing.py`), a permanent end-to-end benchmark
+  (`tests/bench/m4_survey/bench_reductions.py`) with honest `baseline.json` gates (std/var gated,
+  bare reductions informational). Full data: memory `m6-b4-reduction-routing-spike`.
 
 ---
 
