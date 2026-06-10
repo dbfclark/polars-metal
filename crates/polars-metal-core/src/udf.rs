@@ -2839,7 +2839,7 @@ pub fn execute_dt(inp: (usize, usize), out: (usize, usize), field: u32) -> PyRes
     // (`i32` has no invalid bit patterns) and the slice is only read (memcpy
     // source) before this function returns. `in_n * 4` cannot overflow: the
     // `u32::try_from(in_n)` check above bounds `in_n <= u32::MAX`, so
-    // `in_n * 4 <= 4 * 2^32 < usize::MAX` on 64-bit targets.
+    // `in_n * 4 <= 4 * (2^32 - 1) < usize::MAX` on 64-bit targets.
     let in_bytes: &[u8] = unsafe { std::slice::from_raw_parts(in_ptr as *const u8, in_n * 4) };
     let inb = staging.stage(&device, in_bytes).map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: dt input staging: {e}"))

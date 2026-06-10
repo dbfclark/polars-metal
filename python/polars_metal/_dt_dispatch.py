@@ -35,6 +35,10 @@ def _dt_series(src: pl.Series, b: DtBinding) -> pl.Series:
     if b.is_date:
         days = np.ascontiguousarray(phys, dtype=np.int32)
     else:
+        # Floor-div the i64 since-epoch value to days (numpy `//` floors toward
+        # -inf, matching Polars for pre-epoch values). The day count fits i32
+        # for every representable Polars Datetime (its year range bounds days to
+        # ~±3.7M), so the int32 narrowing never overflows in practice.
         days = np.ascontiguousarray((phys // b.units_per_day).astype(np.int32))
 
     out = np.empty(days.shape[0], dtype=np.int32)
