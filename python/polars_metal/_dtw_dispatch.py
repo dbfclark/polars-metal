@@ -17,6 +17,32 @@ from polars_metal import _native
 from polars_metal._dtw_detect import DtwBinding
 from polars_metal._dtw_namespace import DtwSpec, pop_capture
 
+MAX_L = 1024  # keep in sync with crates/polars-metal-kernels/src/dtw.rs
+
+
+def _gpu_supported(s: pl.Series) -> bool:
+    return isinstance(s.dtype, pl.Array) and s.dtype.inner == pl.Float32 and s.dtype.size <= MAX_L
+
+
+def _cpu_fallback(s: pl.Series, spec: DtwSpec, out_name: str) -> pl.Series:
+    try:
+        from dtaidistance import dtw as _dtwlib
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "polars_metal: .metal.dtw allow_cpu_fallback=True needs the 'dtaidistance' "
+            "package for unsupported shapes; install it (pip install dtaidistance)."
+        ) from exc
+    ref = np.asarray(spec.reference, dtype=np.float64)
+    kw = {} if spec.window is None else {"window": int(spec.window) + 1}
+    vals: list[float | None] = []
+    for row in s.to_list():
+        if row is None:
+            vals.append(None)
+            continue
+        q = np.asarray(row, dtype=np.float64)
+        vals.append(float(_dtwlib.distance(q, ref, **kw)))
+    return pl.Series(out_name, vals, dtype=pl.Float32)
+
 
 def _reference_vec(reference) -> np.ndarray:
     r = np.ascontiguousarray(np.asarray(reference, dtype=np.float32)).reshape(-1)
@@ -38,6 +64,13 @@ def _run_binding(frame: pl.DataFrame, b: DtwBinding) -> pl.Series:
     if spec is None:
         raise RuntimeError("polars_metal: dtw spec handle missing (already consumed?)")
     s = frame.get_column(b.query_col).rechunk()
+    if not _gpu_supported(s):
+        if spec.allow_cpu_fallback:
+            return _cpu_fallback(s, spec, b.out_name)
+        raise ValueError(
+            "polars_metal: .metal.dtw requires Array(Float32, L<=1024) on the GPU; "
+            f"got {s.dtype}. Pass allow_cpu_fallback=True to compute unsupported shapes on CPU."
+        )
     mat, n, L = _seq_matrix(s)
     ref = _reference_vec(spec.reference)
     if ref.shape[0] != L:

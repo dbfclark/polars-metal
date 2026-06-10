@@ -90,3 +90,30 @@ def test_dtw_nan_in_non_null_row_raises():
     df = pl.DataFrame({"seq": rows}, schema={"seq": pl.Array(pl.Float32, 8)})
     with pytest.raises(ValueError, match="NaN"):
         df.lazy().with_columns(pl.col("seq").metal.dtw(r).alias("d")).collect(engine=eng)
+
+
+def test_ragged_list_raises_by_default():
+    eng = polars_metal.MetalEngine()
+    df = pl.DataFrame({"seq": [[1.0, 2.0, 3.0], [4.0, 5.0]]})  # List(F32), ragged
+    r = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    lf = df.lazy().with_columns(pl.col("seq").metal.dtw(r).alias("d"))
+    with pytest.raises(ValueError, match="allow_cpu_fallback"):
+        lf.collect(engine=eng)
+
+
+def test_ragged_list_cpu_fallback_computes():
+    eng = polars_metal.MetalEngine()
+    seqs = [[1.0, 2.0, 3.0], [4.0, 5.0]]
+    r = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+    df = pl.DataFrame({"seq": seqs})
+    got = (
+        df.lazy()
+        .with_columns(
+            pl.col("seq").metal.dtw(r.astype(np.float32), allow_cpu_fallback=True).alias("d")
+        )
+        .collect(engine=eng)
+        .get_column("d")
+        .to_numpy()
+    )
+    exp = np.array([_dtw.distance(np.array(s), r) for s in seqs])
+    np.testing.assert_allclose(got, exp, atol=1e-3, rtol=1e-3)
