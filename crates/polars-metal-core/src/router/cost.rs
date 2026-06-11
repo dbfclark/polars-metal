@@ -74,7 +74,7 @@ pub fn decide_scan_initial() -> NodeDecision {
 fn key_width_bits(dtype: MetalDtype) -> usize {
     match dtype {
         MetalDtype::Bool => 1 + 1,
-        MetalDtype::I64 | MetalDtype::F64 => 1 + 64,
+        MetalDtype::I64 | MetalDtype::F64 | MetalDtype::U64 => 1 + 64,
         MetalDtype::I32 | MetalDtype::F32 | MetalDtype::U32 => 1 + 32,
         MetalDtype::I16 | MetalDtype::U16 => 1 + 16,
         MetalDtype::I8 | MetalDtype::U8 => 1 + 8,

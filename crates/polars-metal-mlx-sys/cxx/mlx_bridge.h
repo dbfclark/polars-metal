@@ -79,6 +79,32 @@ bool mlx_array_is_f32(const std::shared_ptr<MlxArray>& arr);
 void mlx_array_copy_to_f32(
     const std::shared_ptr<MlxArray>& arr, float* out, size_t n);
 
+// Copy `n` int32 values from the materialized array into the caller's buffer.
+// Must be called after mlx_array_eval_one. The array must be I32 dtype.
+void mlx_array_copy_to_i32(
+    const std::shared_ptr<MlxArray>& arr, int32_t* out, size_t n);
+
+// Shared tag → mlx::core::Dtype mapping (tags match MlxDtype in array.rs:
+// 0=f32, 1=f64[unsupported], 2=i32, 3=bool, 4=i8, 5=i16, 6=i64,
+// 7=u8, 8=u16, 9=u32, 10=u64). Throws std::invalid_argument on f64/unknown.
+mlx::core::Dtype mlx_dtype_from_tag(uint32_t tag);
+
+// Return the MlxDtype tag (the inverse of mlx_dtype_from_tag) of arr's dtype.
+// Throws std::invalid_argument if arr has a dtype we do not map.
+uint32_t mlx_array_dtype(const std::shared_ptr<MlxArray>& arr);
+
+// Per-width integer readback. Each copies `n` elements of the matching
+// width from the materialized (eval'd) array into the caller's buffer.
+// The array must have the matching dtype (caller contract). Raw memcpy in
+// storage order (row-major-contiguous assumption, same as copy_to_i32).
+void mlx_array_copy_to_i8(const std::shared_ptr<MlxArray>& arr, int8_t* out, size_t n);
+void mlx_array_copy_to_i16(const std::shared_ptr<MlxArray>& arr, int16_t* out, size_t n);
+void mlx_array_copy_to_i64(const std::shared_ptr<MlxArray>& arr, int64_t* out, size_t n);
+void mlx_array_copy_to_u8(const std::shared_ptr<MlxArray>& arr, uint8_t* out, size_t n);
+void mlx_array_copy_to_u16(const std::shared_ptr<MlxArray>& arr, uint16_t* out, size_t n);
+void mlx_array_copy_to_u32(const std::shared_ptr<MlxArray>& arr, uint32_t* out, size_t n);
+void mlx_array_copy_to_u64(const std::shared_ptr<MlxArray>& arr, uint64_t* out, size_t n);
+
 // Force evaluation (materialize) of a single array by calling
 // mlx::core::eval(*arr). Throws std::runtime_error on MLX failure;
 // cxx converts that to a Rust error.
@@ -207,13 +233,10 @@ std::shared_ptr<MlxArray> mlx_op_sort(const std::shared_ptr<MlxArray>& a);
 std::shared_ptr<MlxArray> mlx_op_argpartition(
     const std::shared_ptr<MlxArray>& a, int32_t kth);
 
-// ── M4 Phase 1 Task 10: cumulative scans + matmul + fft + real/imag ─────────
+// ── M4 Phase 1 Task 10: cumulative scans + matmul ───────────────────────────
 //
 // MLX 0.22.0 cumulative ops require an `axis` argument (no default). For
 // 1-D arrays, pass `axis = 0`. Defaults: reverse=false, inclusive=true.
-//
-// FFT output is complex64 (interleaved real / imag F32 pairs). Use real/imag
-// to extract F32 streams for readback.
 
 // ── M5 rolling Task 1: mlx_shift ─────────────────────────────────────────────
 //
@@ -245,10 +268,23 @@ std::shared_ptr<MlxArray> mlx_op_cummin(const std::shared_ptr<MlxArray>& a, int3
 std::shared_ptr<MlxArray> mlx_op_matmul(
     const std::shared_ptr<MlxArray>& a, const std::shared_ptr<MlxArray>& b);
 
-std::shared_ptr<MlxArray> mlx_op_fft_1d(const std::shared_ptr<MlxArray>& a);
-std::shared_ptr<MlxArray> mlx_op_ifft_1d(const std::shared_ptr<MlxArray>& a);
-
-std::shared_ptr<MlxArray> mlx_op_real(const std::shared_ptr<MlxArray>& a);
-std::shared_ptr<MlxArray> mlx_op_imag(const std::shared_ptr<MlxArray>& a);
+// ── M6 vector search: shape ops ──────────────────────────────────────────────
+std::shared_ptr<MlxArray> mlx_op_transpose(
+    const std::shared_ptr<MlxArray>& a,
+    rust::Slice<const int32_t> axes);
+std::shared_ptr<MlxArray> mlx_op_reshape(
+    const std::shared_ptr<MlxArray>& a,
+    rust::Slice<const int32_t> shape);
+std::shared_ptr<MlxArray> mlx_op_slice(
+    const std::shared_ptr<MlxArray>& a,
+    rust::Slice<const int32_t> start,
+    rust::Slice<const int32_t> stop,
+    rust::Slice<const int32_t> strides);
+std::shared_ptr<MlxArray> mlx_op_take_along_axis(
+    const std::shared_ptr<MlxArray>& a,
+    const std::shared_ptr<MlxArray>& indices,
+    int32_t axis);
+std::shared_ptr<MlxArray> mlx_op_argpartition_axis(
+    const std::shared_ptr<MlxArray>& a, int32_t kth, int32_t axis);
 
 }  // namespace polars_metal_mlx

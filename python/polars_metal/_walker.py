@@ -94,6 +94,20 @@ from polars_metal._fusion_analyzer import (
 
 _fusion_log = logging.getLogger("polars_metal.fusion")
 
+# B1: wire integer dtype tag -> Polars dtype string (as `nt.get_dtype(...)`
+# stringifies it). Used to admit a monomorphic-int fused HStack binding whose
+# statically-inferred output tag matches the real output dtype.
+_INT_TAG_TO_POLARS: dict[str, str] = {
+    "I8": "Int8",
+    "I16": "Int16",
+    "I32": "Int32",
+    "I64": "Int64",
+    "U8": "UInt8",
+    "U16": "UInt16",
+    "U32": "UInt32",
+    "U64": "UInt64",
+}
+
 # Dtype tags the predicate path widens to I64 (the cmp_i64 kernel covers
 # all of them; the runtime evaluator casts the underlying buffer). Narrow
 # unsigned integers fit losslessly in i64; Date is stored as i32 days
@@ -399,6 +413,15 @@ def _try_fused_select_reduction(
     Bessel correction on std/var).
     """
     bindings: list[dict] = []
+    # The aggregation-argument columns live in the *input* schema, not the
+    # Select's output schema, so ``nt.get_dtype(<agg node>)`` only resolves the
+    # reduction's output dtype while the visitor is positioned at the input
+    # child (mirrors ``_walk_group_by``; at the Select node it raises
+    # ColumnNotFoundError). The B2 dtype-match guard below temporarily navigates
+    # there.
+    select_node = nt.get_node()
+    nav_inputs = nt.get_inputs()
+    input_node = nav_inputs[0] if len(nav_inputs) == 1 else None
     for agg_expr in exprs:
         node_id = getattr(agg_expr, "node", None)
         output_name = getattr(agg_expr, "output_name", None)
@@ -407,7 +430,28 @@ def _try_fused_select_reduction(
         result = analyze_ir_reduction(nt, node_id, in_schema)
         if result is None:
             return None
-        scope, columns, agg_kind, is_chain, arg_id = result
+        scope, columns, agg_kind, is_chain, arg_id, out_dtype_str = result
+        # B2 safety (mirrors the HStack int_fused_ok defense at _walker.py:609):
+        # admit an int reduction onto the GPU only when the analyzer's inferred
+        # wire output tag corresponds to the REAL Polars reduction output dtype.
+        # The F32 path is unconditionally fine. A mismatch (analyzer
+        # mis-inference) aborts the whole fused select to CPU (return None),
+        # preserving Polars' dtype.
+        if out_dtype_str != "F32":
+            if input_node is None:
+                return None
+            nt.set_node(input_node)
+            try:
+                real_out = str(nt.get_dtype(node_id))
+            except Exception:
+                return None
+            finally:
+                nt.set_node(select_node)
+            if (
+                out_dtype_str not in _INT_TAG_TO_POLARS
+                or real_out != _INT_TAG_TO_POLARS[out_dtype_str]
+            ):
+                return None
         _fusion_log.info(
             "FusedReduction candidate column=%r kind=%s n_inputs=%d n_ops=%d chain=%s",
             output_name,
@@ -423,6 +467,11 @@ def _try_fused_select_reduction(
                 "_fused_columns": columns,
                 "_agg_kind": agg_kind,
                 "_is_chain": is_chain,
+                # Statically-inferred wire output dtype ("F32" for the float
+                # path, or an int tag like "I64" for a GPU-admissible int
+                # reduction). The dispatch pre-allocates the right-width output;
+                # the full int_fused_ok routing guard lands in Task 3.
+                "_fused_out_dtype": out_dtype_str,
                 # Null mode of the chain argument (None for bare). An
                 # "elementwise" chain over a null column can reduce on the GPU
                 # after dropping nulls (positions don't matter for a reduction);
@@ -471,10 +520,15 @@ def _route_fused_reduction(fused_aggs: list[dict], inner_plan: dict) -> bool:
 
 def _probe_fusion_analyzer(
     nt: Any, node_id: int, in_schema: dict[str, Any], output_name: str
-) -> tuple[Any, list[str]] | None:
+) -> tuple[Any, list[str], str] | None:
     """Run the M4 fusion analyzer on an HStack binding, log the decision,
-    and return ``(scope, input_column_names)`` when the analyzer accepts
-    the expression. Returns ``None`` on rejection.
+    and return ``(scope, input_descriptors, out_dtype_str)`` when the analyzer
+    accepts the expression. Returns ``None`` on rejection.
+
+    ``out_dtype_str`` is the statically-inferred wire output dtype (``"F32"``
+    for the legacy float path, or an integer tag like ``"I64"`` for a B1
+    monomorphic-int chain). The walker stamps it on the binding so the
+    dispatch pre-allocates the right-width output array.
 
     The returned scope is stashed on the binding's wire-plan dict as a
     side-channel for Phase 5 dispatch.
@@ -487,16 +541,17 @@ def _probe_fusion_analyzer(
     if result is None:
         _fusion_log.debug("analyzer rejected expr for column %r (unsupported op)", output_name)
         return None
-    scope, columns = result
+    scope, columns, out_dtype_str = result
     decision = scope.route_decision(10_000_000)
     _fusion_log.info(
-        "FusedExprGraph candidate column=%r n_inputs=%d n_ops=%d decision=%s",
+        "FusedExprGraph candidate column=%r n_inputs=%d n_ops=%d out_dtype=%s decision=%s",
         output_name,
         scope.n_inputs(),
         scope.n_ops(),
+        out_dtype_str,
         decision,
     )
-    return scope, columns
+    return scope, columns, out_dtype_str
 
 
 def _walk_hstack(nt: Any, node: Any) -> WalkResult:
@@ -557,10 +612,44 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
         # _dispatch path intercepts all-fused HStacks before any Rust
         # expression eval happens.
         output_name = str(getattr(e, "output_name", "") or "")
+
         fused = _probe_fusion_analyzer(nt, node_id, in_schema, output_name)
 
+        # The M3 HStack dispatch path produces Float32 output buffers, and the
+        # fused F32 path likewise. If this binding's correct output dtype is
+        # anything else the GPU result would be wrong-typed/downcast — UNLESS
+        # the fused analyzer statically inferred a *monomorphic-int* output
+        # dtype that matches the real output dtype (B1). In that case the typed
+        # FFI path produces the exact integer dtype and we let it through.
+        # Everything else (Float64, mixed-int chains, Boolean comparison
+        # outputs, …) still falls back so Polars' dtype is preserved exactly.
+        # (An F64/int input the chain explicitly casts to F32 has an F32 output
+        # and still fuses on the F32 path.)
+        # Placed AFTER the fusion probe so the analyzer still runs (and logs its
+        # accept/reject) for non-F32 expressions.
+        try:
+            out_dtype = str(nt.get_dtype(node_id))
+        except Exception:
+            out_dtype = "Float32"  # undeterminable — let the normal paths decide
+
+        # The analyzer's inferred wire output tag (None when not fused).
+        fused_out_tag = fused[2] if fused is not None else None
+        # A monomorphic-int fused binding is allowed through iff the inferred
+        # integer tag corresponds to the real Polars output dtype.
+        int_fused_ok = (
+            fused is not None
+            and fused_out_tag in _INT_TAG_TO_POLARS
+            and out_dtype == _INT_TAG_TO_POLARS[fused_out_tag]
+        )
+        if out_dtype != "Float32" and not int_fused_ok:
+            return FallBack(
+                reason=f"HStack binding output dtype is {out_dtype}, not Float32 "
+                "and not a recognized monomorphic-int fused output; the GPU path "
+                "can't produce it — CPU preserves Polars' dtype"
+            )
+
         if fused is not None:
-            scope, descriptors = fused
+            scope, descriptors, fused_out_dtype = fused
             # Find the first real column descriptor for the placeholder; if the
             # expression is all literals (rare but possible), grab any column
             # name from the input schema.
@@ -573,6 +662,7 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
                 "expr": {"kind": "Column", "name": real_col},
                 "_fused_scope": scope,
                 "_fused_columns": descriptors,
+                "_fused_out_dtype": fused_out_dtype,
             }
             binding_cols = {name for kind, name in descriptors if kind == "col"}
             fused_records.append(
@@ -650,6 +740,19 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
                 reason=f"fused HStack input has nulls and null_mode={null_mode!r} "
                 "is not reproducible on the fused path; CPU preserves Polars null semantics"
             )
+
+    # The only executable HStack dispatch path is the all-fused fast path
+    # (`_dispatch_hstack_fused`). A non-fused binding (an M3 closed-set expr the
+    # F32 fusion analyzer rejected) — or a mix of fused and non-fused bindings —
+    # would be handed to `_native.execute_plan`, which has no HStack handler and
+    # raises `unknown plan kind "HStack"`. Fall back to CPU at plan time so the
+    # whole query runs on Polars and produces the correct result. (Mixed/partial
+    # fused dispatch was never supported; this converts a crash into a fallback.)
+    if not all("_fused_scope" in b for b in out_exprs):
+        return FallBack(
+            reason="HStack has non-fused binding(s); only all-fused HStacks are "
+            "executable on the GPU path — CPU produces the correct result"
+        )
 
     return Handled(
         plan={
@@ -1066,6 +1169,13 @@ def _walk_group_by(nt: Any, node: Any) -> WalkResult:
         mapped = _map_dtype(dtype)
         if mapped is None:
             return FallBack(reason=f"unsupported dtype {dtype!s} on key {key_name!r}")
+        # UInt64 is a valid scan/projection/reduction dtype (M6) but the
+        # groupby composite-key encoder has no 64-bit-unsigned KeyDtype, and
+        # the groupby kernel is conformance-only — not extended (Non-goals).
+        # A U64 *key* therefore falls back to CPU. (U64 still reaches the
+        # fused reduction path; only the groupby-key role is excluded.)
+        if mapped == "U64":
+            return FallBack(reason=f"GroupBy key {key_name!r} is UInt64; not supported")
         keys.append([str(key_name), mapped])
 
     aggs: list[dict[str, str]] = []
@@ -1409,6 +1519,9 @@ def _map_dtype(dt: Any) -> str | None:
 
     M2 set: Int64, Float64, Boolean, Int32, Float32.
     M3 adds: Int8, Int16, UInt8, UInt16, UInt32 (capability F).
+    M6 adds: UInt64 — completes the 8 integer widths so a UInt64 column is
+    recognized at the DataFrameScan gate and can reach the fused GPU path
+    (the reduction analyzer already admits UInt64 sum/min/max).
     M3 Phase 7 (Task 34) adds: String (pl.Utf8) — dictionary-encoded as
     a key column. py-1.40.1 reports ``str(pl.Utf8) == "String"``; older
     Polars reported ``"Utf8"`` — accept both for forward/back compat.
@@ -1435,6 +1548,8 @@ def _map_dtype(dt: Any) -> str | None:
         return "U16"
     if s == "UInt32":
         return "U32"
+    if s == "UInt64":
+        return "U64"
     if s in ("String", "Utf8"):
         return "Utf8"
     if s == "Date":

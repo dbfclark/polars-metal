@@ -30,6 +30,13 @@ impl PyFusionScope {
             "F64" => InputDtype::F64,
             "Bool" => InputDtype::Bool,
             "I32" => InputDtype::I32,
+            "I8" => InputDtype::I8,
+            "I16" => InputDtype::I16,
+            "I64" => InputDtype::I64,
+            "U8" => InputDtype::U8,
+            "U16" => InputDtype::U16,
+            "U32" => InputDtype::U32,
+            "U64" => InputDtype::U64,
             other if other.starts_with("ArrayF32(") => {
                 let n: usize = other
                     .trim_start_matches("ArrayF32(")
@@ -161,4 +168,21 @@ fn op_id_from_str(s: &str) -> Option<OpId> {
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFusionScope>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod add_input_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::PyFusionScope;
+
+    #[test]
+    fn accepts_all_int_dtype_strings() {
+        for s in ["I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64"] {
+            let mut scope = PyFusionScope::new();
+            scope
+                .add_input("c", s)
+                .expect("int dtype string should parse");
+        }
+    }
 }

@@ -20,6 +20,11 @@ pub enum MetalDtype {
     U8,
     U16,
     U32,
+    // M6: completes the 8 integer widths. UInt64 columns reach the fused
+    // GPU reduction path (sum/min/max admitted by the analyzer); without this
+    // variant a plain UInt64 projection's Scan would fail to deserialize at
+    // `MetalDtype::from_wire` once the walker emits the "U64" tag.
+    U64,
     // M3 Phase 7: dictionary-encoded Utf8 keys.
     Utf8,
 }
@@ -82,6 +87,7 @@ impl MetalDtype {
             "U8" => Some(MetalDtype::U8),
             "U16" => Some(MetalDtype::U16),
             "U32" => Some(MetalDtype::U32),
+            "U64" => Some(MetalDtype::U64),
             "Utf8" | "String" => Some(MetalDtype::Utf8),
             // pl.Date is stored as Int32 days-since-1970 — same physical
             // layout as I32. We alias here rather than add a Date variant

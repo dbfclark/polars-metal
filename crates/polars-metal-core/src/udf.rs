@@ -43,7 +43,7 @@ use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 // ----------------------------------------------------------------------------
 // IR → kernel-layer mirrors (Phase 3 / Task 15)
@@ -187,6 +187,12 @@ fn decide_groupby_dispatch(
 /// Process-wide fused-library cache. Constructed lazily on first dispatch
 /// when the system default Metal device is acquirable.
 static FUSED_CACHE: OnceLock<FusedLibraryCache> = OnceLock::new();
+
+/// Process-global reusable staging buffer for `execute_dt` inputs (B3b).
+/// One buffer, grown to the largest input seen; the `Mutex` serializes dt
+/// dispatches (Metal command submission serializes anyway). Designed so other
+/// kernel bindings can adopt the same pattern with their own pool later.
+static DT_STAGING: OnceLock<Mutex<polars_metal_buffer::StagingPool>> = OnceLock::new();
 
 fn get_or_init_fused_cache(device: &MetalDevice) -> &'static FusedLibraryCache {
     FUSED_CACHE.get_or_init(|| FusedLibraryCache::new(device.clone()))
@@ -571,7 +577,12 @@ fn compact_one_column(
         // filter compaction path — filter is CPU-routed for these and the
         // walker should never lift a filter over such a column. Surface as
         // PyNotImplementedError so a router bug is visible.
-        MetalDtype::I8 | MetalDtype::I16 | MetalDtype::U8 | MetalDtype::U16 | MetalDtype::U32 => {
+        MetalDtype::I8
+        | MetalDtype::I16
+        | MetalDtype::U8
+        | MetalDtype::U16
+        | MetalDtype::U32
+        | MetalDtype::U64 => {
             Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
                 "polars_metal: filter compaction for {column_name:?} ({dtype:?}) not supported; filter should route CPU"
             )))
@@ -1389,8 +1400,15 @@ pub fn parse_groupby_plan(plan: &Bound<PyDict>) -> Result<ParsedGroupByPlan, Gro
 }
 
 /// Map a [`MetalDtype`] (plan layer) to the kernel-layer [`KeyDtype`].
-fn metal_dtype_to_key_dtype(d: MetalDtype) -> KeyDtype {
-    match d {
+///
+/// Returns `Err` for dtypes that have no groupby-key encoding. The only such
+/// case today is `U64`: the composite-key encoder has no 64-bit-unsigned
+/// `KeyDtype`, and the groupby kernel is conformance-only (Non-goals — not
+/// extended). The Python walker already gates U64 keys to CPU fallback, so
+/// this arm is defensive: if a router bug ever lifts a U64-key groupby, we
+/// surface a clear error rather than mis-encoding or panicking.
+fn metal_dtype_to_key_dtype(d: MetalDtype) -> Result<KeyDtype, String> {
+    Ok(match d {
         MetalDtype::I64 => KeyDtype::I64,
         MetalDtype::F64 => KeyDtype::F64,
         MetalDtype::Bool => KeyDtype::Bool,
@@ -1402,7 +1420,14 @@ fn metal_dtype_to_key_dtype(d: MetalDtype) -> KeyDtype {
         MetalDtype::U16 => KeyDtype::U16,
         MetalDtype::U32 => KeyDtype::U32,
         MetalDtype::Utf8 => KeyDtype::Utf8,
-    }
+        MetalDtype::U64 => {
+            return Err(
+                "groupby key dtype UInt64 has no composite-key encoding (groupby is \
+                 conformance-only and not extended); should route CPU at the walker"
+                    .to_string(),
+            )
+        }
+    })
 }
 
 /// Build the `(AggKind, ValueColumn<'a>)` pair for a single agg request,
@@ -2121,16 +2146,18 @@ pub fn execute_groupby<'py>(
                 Some((codes_bytes, dict)) => (codes_bytes.as_slice(), Some(dict.clone())),
                 None => (*data, None),
             };
-            KeyColumn {
+            Ok(KeyColumn {
                 name: k.name.clone(),
-                dtype: metal_dtype_to_key_dtype(k.dtype),
+                dtype: metal_dtype_to_key_dtype(k.dtype).map_err(|e| {
+                    pyo3::exceptions::PyNotImplementedError::new_err(format!("polars_metal: {e}"))
+                })?,
                 data: data_slice,
                 valid,
                 n_rows,
                 dict,
-            }
+            })
         })
-        .collect();
+        .collect::<PyResult<Vec<KeyColumn<'_>>>>()?;
 
     // 4. Build the routing-input view: each agg's value-column byte/dtype
     //    triple, keyed by column name. The fused path consumes a HashMap of
@@ -2492,26 +2519,33 @@ fn dispatch_logical_py<'py>(
 // PyFusionScope as a side-channel on the binding and the UDF dispatch
 // (Task 23) invokes this entry point.
 
-/// Execute a fused MLX subgraph with zero-copy I/O.
+/// Execute a fused MLX subgraph with zero-copy, dtype-polymorphic I/O.
 ///
-/// `inputs` is a list of `(ptr, n_elements)` pairs, one per scope input, where
-/// `ptr` is the address of a live, C-contiguous float32 buffer (a numpy
-/// array's `__array_interface__` data pointer). `out` is `(ptr, capacity)` for
-/// a writable float32 array to receive the single subgraph output. Returns the
-/// number of elements written (1 for a literal-only / scalar output, else the
-/// column length).
+/// `inputs` is a list of `(ptr, n_elements, dtype_tag)` triples, one per scope
+/// input, where `ptr` is the address of a live, C-contiguous buffer (a numpy
+/// array's `__array_interface__` data pointer) holding `n_elements` of the
+/// `MlxDtype` named by `dtype_tag`. `out` is `(ptr, capacity_elements,
+/// dtype_tag)` for a writable array to receive the single subgraph output;
+/// `dtype_tag` is the analyzer's statically-inferred output dtype, so Python
+/// pre-allocates the right-width array. Returns the number of elements written
+/// (1 for a literal-only / scalar output, else the column length).
 ///
 /// The buffer protocol isn't available under the abi3 limited API, so we pass
 /// raw pointers from Python rather than `PyBuffer`. The caller MUST keep every
 /// input array and the output array alive for the duration of this (fully
 /// synchronous) call; `_udf._dispatch_hstack_fused` does so by holding the
 /// arrays in locals across the call.
+///
+/// After eval, the Rust side asserts the eval'd dtype equals the declared
+/// output tag (analyzer mis-inference guard) before any width-aware write — a
+/// hard error rather than silently corrupting the caller's bytes.
 #[pyfunction]
 pub fn execute_fused_expr(
     scope: &crate::fusion::py::PyFusionScope,
-    inputs: Vec<(usize, usize)>,
-    out: (usize, usize),
+    inputs: Vec<(usize, usize, u32)>,
+    out: (usize, usize, u32),
 ) -> PyResult<usize> {
+    use polars_metal_mlx_sys::array::MlxDtype;
     use std::sync::Arc;
     let device = MetalDevice::system_default().map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -2519,25 +2553,37 @@ pub fn execute_fused_expr(
         ))
     })?;
 
-    // Stage each input float32 buffer into a MetalBuffer. The ingest is
-    // zero-copy when the pointer is page-aligned (numpy-origin / large
-    // allocations), else a single copy — handled inside `from_borrowed_f32`.
-    // The caller keeps the source arrays alive for the whole call, so the
-    // borrowed memory outlives every MetalBuffer and the synchronous eval.
+    // Stage each input buffer into a MetalBuffer at its native width. The
+    // byte-level borrow is zero-copy when the pointer is page-aligned
+    // (numpy-origin / large allocations), else a single copy — handled inside
+    // `from_borrowed_bytes`. The caller keeps the source arrays alive for the
+    // whole call, so the borrowed memory outlives every MetalBuffer and the
+    // synchronous eval.
     let metal_buffers: Vec<Arc<polars_metal_buffer::MetalBuffer>> = inputs
         .iter()
-        .map(|&(ptr, n)| {
-            let fptr = ptr as *const f32;
-            // SAFETY: `fptr` addresses `n` live, contiguous f32 (caller
-            // contract) for the lifetime of this call; page-aligned pointers
-            // take bytesNoCopy, others copy. See `from_borrowed_f32`.
-            unsafe { polars_metal_buffer::MetalBuffer::from_borrowed_f32(&device, fptr, n) }
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "polars_metal: input buffer staging failed: {e}"
-                    ))
-                })
-                .map(Arc::new)
+        .map(|&(ptr, n, tag)| {
+            let dtype = MlxDtype::from_tag(tag).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "polars_metal: bad input dtype tag: {e:?}"
+                ))
+            })?;
+            // SAFETY: `ptr` addresses `n` live, contiguous elements of `dtype`
+            // (caller contract) for the lifetime of this call; the byte length
+            // is `n * element_size`. Page-aligned pointers take bytesNoCopy,
+            // others copy. See `from_borrowed_bytes`.
+            let buf = unsafe {
+                polars_metal_buffer::MetalBuffer::from_borrowed_bytes(
+                    &device,
+                    ptr as *const u8,
+                    n * dtype.element_size(),
+                )
+            }
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "polars_metal: input buffer staging failed: {e}"
+                ))
+            })?;
+            Ok(Arc::new(buf))
         })
         .collect::<PyResult<Vec<_>>>()?;
 
@@ -2549,21 +2595,24 @@ pub fn execute_fused_expr(
         pyo3::exceptions::PyValueError::new_err(format!("polars_metal: subgraph build: {e}"))
     })?;
 
-    // Output-zero-copy: eval writes directly into the caller's `out` array.
-    let (out_ptr, out_len) = out;
-    // SAFETY: `out_ptr` addresses `out_len` writable, contiguous f32 (caller
-    // contract), kept alive for the whole call. `eval_into` blocks on
-    // `mlx_array_eval` before copying, so no GPU writes are in-flight on
-    // readback. `mlx_array_copy_to_f32_slice` checks the output fits in `dst`.
-    let dst: &mut [f32] = unsafe { std::slice::from_raw_parts_mut(out_ptr as *mut f32, out_len) };
-    let counts = subgraph.eval_into(&mut [dst]).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: subgraph eval: {e}"))
+    // Output-zero-copy: eval writes directly into the caller's `out` array,
+    // interpreting it at the analyzer-declared dtype.
+    let (out_ptr, out_cap, out_tag) = out;
+    let out_dtype = MlxDtype::from_tag(out_tag).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "polars_metal: bad output dtype tag: {e:?}"
+        ))
     })?;
-    counts.into_iter().next().ok_or_else(|| {
-        pyo3::exceptions::PyRuntimeError::new_err(
-            "polars_metal: fused subgraph produced no outputs",
-        )
-    })
+    // SAFETY: `out_ptr` addresses `out_cap` writable, contiguous elements of
+    // `out_dtype` (caller contract), kept alive for the whole call.
+    // `eval_into_typed` blocks on `mlx_array_eval` before copying (no in-flight
+    // GPU writes on readback), validates the dtype matches, and bounds-checks
+    // against `out_cap`.
+    subgraph
+        .eval_into_typed(out_ptr, out_cap, out_dtype)
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: subgraph eval: {e}"))
+        })
 }
 
 // ── M5 Task 3: execute_rolling ───────────────────────────────────────────────
@@ -2716,6 +2765,235 @@ pub fn execute_rolling(
         let src_f32: &[f32] =
             unsafe { std::slice::from_raw_parts(out_bytes.as_ptr() as *const f32, out_n) };
         dst.copy_from_slice(src_f32);
+    }
+
+    Ok(())
+}
+
+// ── M6 A4: execute_dtw ───────────────────────────────────────────────────────
+
+/// PyO3 entry exposed as `polars_metal._native.execute_dtw`.
+///
+/// * `queries` — `(ptr, n_pairs*seq_len)`: pair-major F32 query matrix.
+/// * `reference` — `(ptr, seq_len)`: the broadcast reference sequence.
+/// * `out` — `(ptr, n_pairs)`: writable F32 output (overwritten in place).
+/// * `n_pairs`, `seq_len` — dimensions.
+/// * `window` — Sakoe-Chiba radius; negative => unconstrained full DTW.
+///
+/// Staging mirrors `execute_rolling`: `from_borrowed_f32` (zero-copy when
+/// page-aligned; copy-back for an unaligned output). The caller keeps all
+/// arrays alive for the synchronous call.
+#[pyfunction]
+#[pyo3(signature = (queries, reference, out, n_pairs, seq_len, window))]
+pub fn execute_dtw(
+    queries: (usize, usize),
+    reference: (usize, usize),
+    out: (usize, usize),
+    n_pairs: usize,
+    seq_len: usize,
+    window: i32,
+) -> PyResult<()> {
+    use polars_metal_buffer::is_ptr_page_aligned;
+    use polars_metal_kernels::dtw::dispatch_dtw_buf;
+
+    let device = MetalDevice::system_default().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "polars_metal: metal device unavailable: {e}"
+        ))
+    })?;
+
+    let (q_ptr, q_n) = queries;
+    let (r_ptr, r_n) = reference;
+    let (out_ptr, out_n) = out;
+
+    if r_n != seq_len || out_n != n_pairs || q_n != n_pairs.saturating_mul(seq_len) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "polars_metal: dtw dimension mismatch",
+        ));
+    }
+    if n_pairs == 0 || seq_len == 0 {
+        return Ok(());
+    }
+    let n_u32 = u32::try_from(n_pairs).map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err("polars_metal: dtw n_pairs exceeds u32::MAX")
+    })?;
+    let l_u32 = u32::try_from(seq_len).map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err("polars_metal: dtw seq_len exceeds u32::MAX")
+    })?;
+
+    // SAFETY: each ptr addresses its stated count of live, contiguous f32 for
+    // the whole call; page-aligned pointers use bytesNoCopy, others copy in.
+    let qb = unsafe {
+        polars_metal_buffer::MetalBuffer::from_borrowed_f32(&device, q_ptr as *const f32, q_n)
+    }
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: dtw query staging: {e}"))
+    })?;
+    let rb = unsafe {
+        polars_metal_buffer::MetalBuffer::from_borrowed_f32(&device, r_ptr as *const f32, r_n)
+    }
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: dtw ref staging: {e}"))
+    })?;
+    let out_aligned = is_ptr_page_aligned(out_ptr);
+    // SAFETY: out_ptr addresses out_n writable contiguous f32 for the call.
+    let ob = unsafe {
+        polars_metal_buffer::MetalBuffer::from_borrowed_f32(&device, out_ptr as *const f32, out_n)
+    }
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: dtw out staging: {e}"))
+    })?;
+
+    dispatch_dtw_buf(&device, &qb, &rb, &ob, n_u32, l_u32, window).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: dtw dispatch: {e}"))
+    })?;
+
+    if !out_aligned {
+        let out_bytes = ob.as_slice();
+        // SAFETY: out_ptr valid for out_n*4 bytes (caller contract); GPU idle.
+        let dst: &mut [f32] = unsafe { std::slice::from_raw_parts_mut(out_ptr as *mut f32, out_n) };
+        // SAFETY: Shared allocations are page-aligned (≥4-byte); out_n f32
+        // occupy exactly out_bytes.len() bytes; f32 has no invalid patterns.
+        let src: &[f32] =
+            unsafe { std::slice::from_raw_parts(out_bytes.as_ptr() as *const f32, out_n) };
+        dst.copy_from_slice(src);
+    }
+    Ok(())
+}
+
+// ── M6 B3: execute_dt ────────────────────────────────────────────────────────
+//
+// PyO3 entry point dispatching the gregorian civil-from-days kernel over a
+// caller-supplied Int32 days-since-1970 column. Mirrors `execute_rolling`:
+// raw (ptr, n) tuples, `from_borrowed_i32` staging (zero-copy when page-
+// aligned, copy-back fallback for an unaligned output).
+
+/// PyO3 entry point exposed as `polars_metal._native.execute_dt`.
+///
+/// # Arguments
+/// * `inp` — `(ptr, n)`: address + element count of a live, C-contiguous
+///   Int32 days-since-1970 array.
+/// * `out` — `(ptr, n)`: address + element count of a writable C-contiguous
+///   Int32 array of the same length. Overwritten in place.
+/// * `field` — `0` = year, `1` = month, `2` = day.
+#[pyfunction]
+#[pyo3(signature = (inp, out, field))]
+pub fn execute_dt(inp: (usize, usize), out: (usize, usize), field: u32) -> PyResult<()> {
+    use polars_metal_buffer::is_ptr_page_aligned;
+    use polars_metal_kernels::dt::{dispatch_dt_field_buf, DtField};
+
+    let device = MetalDevice::system_default().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "polars_metal: metal device unavailable: {e}"
+        ))
+    })?;
+
+    let (in_ptr, in_n) = inp;
+    let (out_ptr, out_n) = out;
+
+    if in_n != out_n {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "polars_metal: dt input/output length mismatch",
+        ));
+    }
+
+    if in_n == 0 {
+        return Ok(());
+    }
+
+    let n = u32::try_from(in_n).map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err("polars_metal: dt column exceeds u32::MAX rows")
+    })?;
+
+    let dt_field = match field {
+        0 => DtField::Year,
+        1 => DtField::Month,
+        2 => DtField::Day,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "polars_metal: unknown dt field {other}"
+            )))
+        }
+    };
+
+    // Output staging: two paths (see execute_rolling for the rationale).
+    let out_ptr_is_aligned = is_ptr_page_aligned(out_ptr);
+
+    // SAFETY: `out_ptr` addresses `out_n` writable, contiguous i32 values
+    // for the whole call. Page-aligned: bytesNoCopy shares host memory
+    // (writable). Unaligned: bytes are copied in; the MTLBuffer is later
+    // read back.
+    let outb = unsafe {
+        polars_metal_buffer::MetalBuffer::from_borrowed_i32(&device, out_ptr as *const i32, out_n)
+    }
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: dt output staging: {e}"))
+    })?;
+
+    // Input staging: two paths based on pointer alignment.
+    //   Aligned (Datetime at large N): numpy mmap buffer is page-aligned →
+    //   zero-copy `bytesNoCopy` path via `from_borrowed_i32`, saving ~1ms at
+    //   10M rows.
+    //   Unaligned (Date / small N): Arrow 64-byte-aligned only → stage
+    //   through the reusable pool (one memcpy into a reused Shared buffer,
+    //   B3b). The pool avoids the per-call newBufferWithBytes allocation that
+    //   dominated the old path (~5x faster at scale).
+    // dispatch is called inside each arm to avoid juggling guard lifetimes.
+    let in_aligned = is_ptr_page_aligned(in_ptr);
+    if in_aligned {
+        // SAFETY: `in_ptr` addresses `in_n` live, contiguous i32 values for
+        // the whole synchronous call; page-aligned → `bytesNoCopy` shares
+        // host memory (read-only here). `from_borrowed_i32` borrows without
+        // copying.
+        let inb = unsafe {
+            polars_metal_buffer::MetalBuffer::from_borrowed_i32(&device, in_ptr as *const i32, in_n)
+        }
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "polars_metal: dt input staging: {e}"
+            ))
+        })?;
+        dispatch_dt_field_buf(&device, &inb, &outb, n, dt_field).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: dt dispatch: {e}"))
+        })?;
+    } else {
+        // Recover from a poisoned lock rather than panic (the buffer is
+        // scratch; no invariant is corrupted by a prior panic mid-stage).
+        let pool = DT_STAGING.get_or_init(|| Mutex::new(polars_metal_buffer::StagingPool::new()));
+        let mut staging = pool.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: `in_ptr` addresses `in_n` live, contiguous i32 values for
+        // the whole synchronous call; reinterpreting as `in_n * 4` bytes is
+        // sound (`i32` has no invalid bit patterns) and the slice is only
+        // read (memcpy source) before this function returns. `in_n * 4`
+        // cannot overflow: the `u32::try_from(in_n)` check above bounds
+        // `in_n <= u32::MAX`, so `in_n * 4 <= 4 * (2^32 - 1) < usize::MAX`
+        // on 64-bit targets.
+        let in_bytes: &[u8] = unsafe { std::slice::from_raw_parts(in_ptr as *const u8, in_n * 4) };
+        let inb = staging.stage(&device, in_bytes).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "polars_metal: dt input staging: {e}"
+            ))
+        })?;
+        dispatch_dt_field_buf(&device, inb, &outb, n, dt_field).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: dt dispatch: {e}"))
+        })?;
+    }
+
+    // Copy-back path: if `out` was not page-aligned, `outb` holds a
+    // GPU-private copy of the kernel results. Read it back via `as_slice()`
+    // and cast to i32, mirroring execute_rolling's f32 read-back.
+    if !out_ptr_is_aligned {
+        let out_bytes = outb.as_slice();
+        // SAFETY: `out_ptr` is valid for `out_n * 4` bytes (caller contract).
+        // We just dispatched into `outb` and the GPU is idle; the result bytes
+        // are stable. `i32` has no invalid bit patterns.
+        let dst: &mut [i32] = unsafe { std::slice::from_raw_parts_mut(out_ptr as *mut i32, out_n) };
+        // SAFETY: Metal `StorageModeShared` allocations are page-aligned,
+        // satisfying i32's 4-byte alignment requirement; `out_n` i32 occupy
+        // exactly `out_bytes.len()` bytes.
+        let src_i32: &[i32] =
+            unsafe { std::slice::from_raw_parts(out_bytes.as_ptr() as *const i32, out_n) };
+        dst.copy_from_slice(src_i32);
     }
 
     Ok(())

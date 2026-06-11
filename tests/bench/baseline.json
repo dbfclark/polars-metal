@@ -205,16 +205,18 @@
         "ratio_lt": 0.45
       }
     },
-    "phase8_corr_matrix_200x200k": {
-      "cpu_ms": null,
-      "metal_ms": null,
-      "ratio_metal_over_cpu": null,
-      "n_rows": 200000,
-      "n_cols": 200,
+    "phase8_corr_matrix_n1m_p50": {
+      "cpu_ms": 177.83,
+      "metal_ms": 17.99,
+      "ratio_metal_over_cpu": 0.1012,
+      "n_rows": 1000000,
+      "n_cols": 50,
       "hardware": "M2 Ultra",
-      "_notes": "M4 placeholder: 200x200000 correlation matrix via MLX matmul. Target wall-clock < 22.0 ms; ratio gate set at landing.",
-      "_pending": true,
-      "_target_ms": 22.0
+      "_notes": "M6 corr: honest engine-path measurement after the (p,n) zero-copy ingest optimization. lf.metal.corr(force_gpu=True).collect(engine=MetalEngine()) vs df.corr(). N=1M rows x p=50 F32 columns. GPU wins ~9.9x (ratio 0.10). The earlier ~2x (T8) was bottlenecked on host-side numpy copies: df.to_numpy() (column-major) + ascontiguousarray transpose were ~66ms of an 84ms path. Replaced by per-column zero-copy to_numpy stacked into a (p,n) variable-major buffer (~3.7ms) feeding a (p,n)-orientation kernel (C=Zn.Znt); GPU time dropped to ~18ms. Speedup grows with p (~2.5x @p=10, ~7.6x @p=25, ~10x @p=50 at N=1M). Still below the spike raw-MLX ~20x (residual = host->Metal staging copy). Measured 2026-06-11, bench_corr.py. Gate: ratio < 0.2 (GPU must be >5x faster at N=1M p=50).",
+      "_pending": false,
+      "_gate": {
+        "ratio_lt": 0.2
+      }
     },
     "phase9_rolling_mean_w1000_10m": {
       "cpu_ms": 116.34,
@@ -248,6 +250,18 @@
       "_pending": true,
       "_target_ms": 50.0
     },
+    "phase10_cosine_topk_q100_n200k_d256": {
+      "cpu_ms": 277.15,
+      "metal_ms": 13.94,
+      "ratio_metal_over_cpu": 0.0503,
+      "n_rows": 200000,
+      "hardware": "M2 Ultra",
+      "_notes": "M6 vector search: .metal.cosine_topk engine path, Q=100 N=200k D=256 k=10, vs a FAIR numpy baseline (matmul + argpartition partial top-k, same algorithm as the GPU). Measured 13.9 ms metal vs 277 ms numpy = 19.9x \u2014 consistent with the survey's compute-bound class. (An argsort baseline does ~5x more work and would inflate this to ~93x, past the survey's 29x ceiling; we report the honest argpartition number.) Reproduce: tests/bench/m4_survey/bench_cosine_topk.py::test_bench_cosine_topk_engine_gate. Gate: metal must beat numpy (ratio < 1.0).",
+      "_pending": false,
+      "_gate": {
+        "ratio_lt": 1.0
+      }
+    },
     "phase11_fft_8m": {
       "cpu_ms": null,
       "metal_ms": null,
@@ -257,6 +271,47 @@
       "_notes": "M4 placeholder: FFT 8M-point 1D F32 via Expr.metal.fft(). Target wall-clock < 3.0 ms; ratio gate set at landing.",
       "_pending": true,
       "_target_ms": 3.0
+    },
+    "reduction_std_f32_100m": {
+      "cpu_ms": 71.35,
+      "metal_ms": 8.88,
+      "ratio_metal_over_cpu": 0.124,
+      "n_rows": 100000000,
+      "hardware": "M2 Ultra",
+      "_notes": "Bare std routes to GPU (compute-bound: Polars CPU is a two-pass Welford, far from bandwidth). B4 end-to-end, 2026-06-10, bench_reductions.py.",
+      "_gate": {
+        "ratio_lt": 0.5
+      }
+    },
+    "reduction_var_f32_100m": {
+      "cpu_ms": 74.1,
+      "metal_ms": 9.49,
+      "ratio_metal_over_cpu": 0.128,
+      "n_rows": 100000000,
+      "hardware": "M2 Ultra",
+      "_notes": "Bare var routes to GPU. B4 end-to-end, 2026-06-10, bench_reductions.py.",
+      "_gate": {
+        "ratio_lt": 0.5
+      }
+    },
+    "reduction_bare_sum_f32_100m": {
+      "cpu_ms": 2.26,
+      "metal_ms": 2.26,
+      "ratio_metal_over_cpu": 1.0,
+      "n_rows": 100000000,
+      "hardware": "M2 Ultra",
+      "_notes": "Bare sum routes to CPU by design \u2014 informational, NO gate. The B4 spike measured forced-GPU at ~2.7x SLOWER: a bare reduction is bandwidth-bound and the host->MLX ingest (>=7ms) exceeds Polars' multithreaded scan. routed==cpu because the engine correctly stays on CPU. See memory m6-b4-reduction-routing-spike."
+    },
+    "dtw_metal_n100k_l256": {
+      "cpu_ms": 38039.51,
+      "metal_ms": 2834.25,
+      "ratio_metal_over_cpu": 0.0745,
+      "n_rows": 100000,
+      "hardware": "M2 Ultra",
+      "_notes": "Banded DTW (full, window=None), Array(F32,256), N=100k vs dtaidistance distance_matrix_fast (parallel C). B4-style honest bar. Custom MSL kernel, one threadgroup/pair. Measured 2026-06-10 bench_dtw.py: 2834 ms metal vs 38040 ms dtaidistance = 13.4x. (Other shapes: N=10k/L=64 8.3x, N=100k/L=64 9.7x, N=10k/L=256 14.3x.) Gate ratio_lt=0.2 leaves ~2.7x headroom over the measured 0.0745.",
+      "_gate": {
+        "ratio_lt": 0.2
+      }
     }
   }
 }

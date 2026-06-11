@@ -3,7 +3,6 @@
 #include "mlx/allocator.h"
 #include "mlx/array.h"
 #include "mlx/device.h"
-#include "mlx/fft.h"
 #include "mlx/ops.h"
 #include "mlx/transforms.h"
 #include "mlx/utils.h"
@@ -119,6 +118,43 @@ bool mlx_array_is_f32(const std::shared_ptr<MlxArray>& arr) {
     return arr->dtype() == mlx::core::float32;
 }
 
+// INVARIANT: keep in sync with MlxDtype (array.rs, canonical) and its inverse mlx_array_dtype below.
+mlx::core::Dtype mlx_dtype_from_tag(uint32_t tag) {
+    switch (tag) {
+        case 0:  return mlx::core::float32;
+        case 1:
+            throw std::invalid_argument(
+                "mlx_dtype_from_tag: float64 is not supported on Metal");
+        case 2:  return mlx::core::int32;
+        case 3:  return mlx::core::bool_;
+        case 4:  return mlx::core::int8;
+        case 5:  return mlx::core::int16;
+        case 6:  return mlx::core::int64;
+        case 7:  return mlx::core::uint8;
+        case 8:  return mlx::core::uint16;
+        case 9:  return mlx::core::uint32;
+        case 10: return mlx::core::uint64;
+        default:
+            throw std::invalid_argument("mlx_dtype_from_tag: unknown dtype tag");
+    }
+}
+
+// INVARIANT: exact inverse of mlx_dtype_from_tag above; canonical tag list is MlxDtype (array.rs).
+uint32_t mlx_array_dtype(const std::shared_ptr<MlxArray>& arr) {
+    mlx::core::Dtype dt = arr->dtype();
+    if (dt == mlx::core::float32) return 0;
+    if (dt == mlx::core::int32)   return 2;
+    if (dt == mlx::core::bool_)   return 3;
+    if (dt == mlx::core::int8)    return 4;
+    if (dt == mlx::core::int16)   return 5;
+    if (dt == mlx::core::int64)   return 6;
+    if (dt == mlx::core::uint8)   return 7;
+    if (dt == mlx::core::uint16)  return 8;
+    if (dt == mlx::core::uint32)  return 9;
+    if (dt == mlx::core::uint64)  return 10;
+    throw std::invalid_argument("mlx_array_dtype: unmapped dtype");
+}
+
 void mlx_array_copy_to_f32(
     const std::shared_ptr<MlxArray>& arr, float* out, size_t n) {
     // Caller guarantees the array has been eval'd and `out` holds at least n
@@ -126,6 +162,31 @@ void mlx_array_copy_to_f32(
     const float* src = arr->data<float>();
     std::memcpy(out, src, n * sizeof(float));
 }
+
+void mlx_array_copy_to_i32(
+    const std::shared_ptr<MlxArray>& arr, int32_t* out, size_t n) {
+    // Caller guarantees the array has been eval'd, is I32 dtype, and `out`
+    // holds at least n int32 values.
+    const int32_t* src = arr->data<int32_t>();
+    std::memcpy(out, src, n * sizeof(int32_t));
+}
+
+// Per-width integer readback. Same raw-memcpy contract as copy_to_i32:
+// caller guarantees the array is eval'd, has the matching dtype, and `out`
+// holds at least n elements.
+#define MLX_WRAP_READBACK(fn_name, ctype, mlx_ctype)                       \
+void fn_name(const std::shared_ptr<MlxArray>& arr, ctype* out, size_t n) { \
+    const mlx_ctype* src = arr->data<mlx_ctype>();                         \
+    std::memcpy(out, src, n * sizeof(ctype));                              \
+}
+MLX_WRAP_READBACK(mlx_array_copy_to_i8,  int8_t,   int8_t)
+MLX_WRAP_READBACK(mlx_array_copy_to_i16, int16_t,  int16_t)
+MLX_WRAP_READBACK(mlx_array_copy_to_i64, int64_t,  int64_t)
+MLX_WRAP_READBACK(mlx_array_copy_to_u8,  uint8_t,  uint8_t)
+MLX_WRAP_READBACK(mlx_array_copy_to_u16, uint16_t, uint16_t)
+MLX_WRAP_READBACK(mlx_array_copy_to_u32, uint32_t, uint32_t)
+MLX_WRAP_READBACK(mlx_array_copy_to_u64, uint64_t, uint64_t)
+#undef MLX_WRAP_READBACK
 
 void mlx_array_eval_one(const std::shared_ptr<MlxArray>& arr) {
     // mlx::core::eval's variadic template checks is_arrays_v<T> which only
@@ -165,23 +226,8 @@ std::shared_ptr<MlxArray> mlx_array_view_mtl_buffer(
     // ensures it does nothing and leaves the MTLBuffer untouched.
     mlx::core::Deleter no_op_deleter = [](mlx::core::allocator::Buffer) {};
 
-    // Map the dtype tag to mlx::core::Dtype.
-    // MLX 0.22.0 has no float64; tag 1 throws rather than silently mapping
-    // to a wrong type.  Tags: 0=float32, 1=float64 (unsupported), 2=int32,
-    // 3=bool_.
-    mlx::core::Dtype dt = mlx::core::float32; // initialise to satisfy compiler
-    switch (dtype) {
-        case 0: dt = mlx::core::float32; break;
-        case 1:
-            throw std::invalid_argument(
-                "mlx_array_view_mtl_buffer: float64 is not supported by "
-                "MLX 0.22.0; use float32");
-        case 2: dt = mlx::core::int32;   break;
-        case 3: dt = mlx::core::bool_;   break;
-        default:
-            throw std::invalid_argument(
-                "mlx_array_view_mtl_buffer: unknown dtype tag");
-    }
+    // Map the dtype tag to mlx::core::Dtype (shared helper covers all widths).
+    mlx::core::Dtype dt = mlx_dtype_from_tag(dtype);
 
     // Construct via the buffer-accepting array constructor:
     //   explicit array(allocator::Buffer data, Shape shape, Dtype dtype,
@@ -423,7 +469,7 @@ std::shared_ptr<MlxArray> mlx_iota_f32(int64_t n) {
     return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
 }
 
-// ── M4 Phase 1 Task 10: cumulative scans + matmul + fft + real/imag ─────────
+// ── M4 Phase 1 Task 10: cumulative scans + matmul ───────────────────────────
 
 #define MLX_WRAP_SCAN(rust_name, mlx_op)                                                   \
     std::shared_ptr<MlxArray> rust_name(const std::shared_ptr<MlxArray>& a, int32_t axis) { \
@@ -440,18 +486,57 @@ MLX_WRAP_SCAN(mlx_op_cummin, cummin)
 
 MLX_WRAP_BINOP(mlx_op_matmul, matmul)
 
-std::shared_ptr<MlxArray> mlx_op_fft_1d(const std::shared_ptr<MlxArray>& a) {
-    auto base = std::make_shared<mlx::core::array>(mlx::core::fft::fft(*a));
+// ── M6 vector search: shape ops ──────────────────────────────────────────────
+
+std::shared_ptr<MlxArray> mlx_op_transpose(
+    const std::shared_ptr<MlxArray>& a,
+    rust::Slice<const int32_t> axes) {
+    std::vector<int> ax(axes.begin(), axes.end());
+    // transpose yields a strided view; the F32/I32 readback memcpy's the raw
+    // contiguous buffer in storage order, so force row-major contiguity here.
+    auto base = std::make_shared<mlx::core::array>(
+        mlx::core::contiguous(mlx::core::transpose(*a, ax)));
     return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
 }
 
-std::shared_ptr<MlxArray> mlx_op_ifft_1d(const std::shared_ptr<MlxArray>& a) {
-    auto base = std::make_shared<mlx::core::array>(mlx::core::fft::ifft(*a));
+std::shared_ptr<MlxArray> mlx_op_reshape(
+    const std::shared_ptr<MlxArray>& a,
+    rust::Slice<const int32_t> shape) {
+    std::vector<int> sh(shape.begin(), shape.end());
+    auto base = std::make_shared<mlx::core::array>(mlx::core::reshape(*a, sh));
     return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
 }
 
-MLX_WRAP_UNOP(mlx_op_real, real)
-MLX_WRAP_UNOP(mlx_op_imag, imag)
+std::shared_ptr<MlxArray> mlx_op_slice(
+    const std::shared_ptr<MlxArray>& a,
+    rust::Slice<const int32_t> start,
+    rust::Slice<const int32_t> stop,
+    rust::Slice<const int32_t> strides) {
+    std::vector<int> lo(start.begin(), start.end());
+    std::vector<int> hi(stop.begin(), stop.end());
+    std::vector<int> st(strides.begin(), strides.end());
+    // slice yields a strided view; force contiguity so the raw-memcpy readback
+    // sees row-major data.
+    auto base = std::make_shared<mlx::core::array>(
+        mlx::core::contiguous(mlx::core::slice(*a, lo, hi, st)));
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
+std::shared_ptr<MlxArray> mlx_op_take_along_axis(
+    const std::shared_ptr<MlxArray>& a,
+    const std::shared_ptr<MlxArray>& indices,
+    int32_t axis) {
+    auto base = std::make_shared<mlx::core::array>(
+        mlx::core::take_along_axis(*a, *indices, axis));
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
+std::shared_ptr<MlxArray> mlx_op_argpartition_axis(
+    const std::shared_ptr<MlxArray>& a, int32_t kth, int32_t axis) {
+    auto base = std::make_shared<mlx::core::array>(
+        mlx::core::argpartition(*a, kth, axis));
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
 
 #undef MLX_WRAP_BINOP
 #undef MLX_WRAP_UNOP

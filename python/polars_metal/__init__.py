@@ -7,10 +7,32 @@ import inspect
 from functools import partial, wraps
 from typing import Any
 
+import polars as pl
 import polars.lazyframe.frame as _plf
 
+from polars_metal import (
+    _corr_detect as _corr_detect_module,  # noqa: F401  (installs with_columns patch)
+)
+from polars_metal import (
+    _corr_namespace as _corr_namespace_module,  # noqa: F401  (registers lf.metal.corr)
+)
+from polars_metal import (
+    _dt_detect as _dt_detect_module,  # noqa: F401  (installs with_columns patch)
+)
+from polars_metal import (
+    _dtw_detect as _dtw_detect_module,  # noqa: F401  (installs with_columns patch)
+)
+from polars_metal import (
+    _fft_detect as _fft_detect_module,  # noqa: F401  (installs with_columns patch)
+)
 from polars_metal import _native
 from polars_metal import _rolling_detect as _rolling_detect_module  # noqa: F401
+from polars_metal import (
+    _vector_detect as _vector_detect_module,  # noqa: F401  (installs with_columns patch eagerly)
+)
+from polars_metal import (
+    _vector_namespace as _vector_namespace_module,  # noqa: F401  (registers .metal)
+)
 from polars_metal._callback import execute_with_metal
 from polars_metal._engine import MetalEngine
 
@@ -62,6 +84,70 @@ def _opt_flags_without_cse(user_opt: Any) -> Any:
             if value is not None:
                 kwargs[field] = value
     return QueryOptFlags(comm_subexpr_elim=False, **kwargs)
+
+
+# Transcendental tokens that signal a fusion-eligible compute chain in
+# `lf.explain()` output (e.g. `col("lat").sin()`). We only force CSE off for
+# such queries — see `_is_fusion_candidate`. Plain arithmetic / non-compute
+# queries keep Polars' default CSE so that fall-back queries are byte-identical
+# to pure CPU (forcing CSE off unconditionally exposed a Polars CSE-off
+# correctness bug on e.g. `value_counts`/struct-expansion plans).
+_FUSION_FUNC_TOKENS = (
+    # Transcendentals (haversine / Black-Scholes chains).
+    ".sin(",
+    ".cos(",
+    ".tan(",
+    ".sinh(",
+    ".cosh(",
+    ".tanh(",
+    ".arcsin(",
+    ".arccos(",
+    ".arctan(",
+    "arctan2",
+    ".arcsinh(",
+    ".arccosh(",
+    ".arctanh(",
+    ".exp(",
+    ".exp2(",
+    ".log(",
+    ".log1p(",
+    ".log10(",
+    ".log2(",
+    ".sqrt(",
+    ".cbrt(",
+    # Fused reductions / scans over a compute chain. A shared sub-expression
+    # feeding two of these (e.g. (x*2).sum() and (x*2).std()) is hoisted by CSE
+    # into a temp the fused HStack dispatch can't consume — so these also need
+    # CSE off. value_counts / struct-expansion plans contain none of these.
+    # (Broadening the set is safe: before this gate CSE was *always* forced off,
+    # so more tokens just preserves the old behavior for more queries; only
+    # token-free, non-fusion plans take the new CSE-on path.)
+    ".sum(",
+    ".mean(",
+    ".std(",
+    ".var(",
+    ".cum_sum(",
+    ".cum_prod(",
+    ".cum_max(",
+    ".cum_min(",
+)
+
+
+def _is_fusion_candidate(lf: Any) -> bool:
+    """True iff the LazyFrame's plan contains a transcendental compute op — the
+    strong signal that a fused MLX subgraph (haversine / Black-Scholes / etc.)
+    will run and would be fragmented by Polars CSE. Conservative: any failure or
+    no-match returns False, leaving CSE at Polars' (correct) default. Uses
+    ``explain()`` (cheap; does not serialize the DataFrame)."""
+    try:
+        import warnings as _w
+
+        with _w.catch_warnings():
+            _w.simplefilter("ignore")
+            txt = lf.explain()
+        return any(tok in txt for tok in _FUSION_FUNC_TOKENS)
+    except Exception:
+        return False
 
 
 def _verify_patch_site() -> None:
@@ -173,19 +259,45 @@ def _patch_gpu_engine_callback() -> None:
                     return existing_cb(nt, *args, **kw)
 
                 cb = chained
-            # Force CSE off for Metal-routed plans so a compute subtree stays
-            # a single fused MLX subgraph rather than fragmenting across one
-            # dispatch per hoisted temp column (see `_opt_flags_without_cse`).
-            # A deprecated direct `comm_subexpr_elim` kwarg, if present, is
-            # dropped — the `optimizations` object is the supported channel and
-            # we override CSE regardless of what the caller requested.
-            kwargs.pop("comm_subexpr_elim", None)
-            kwargs["optimizations"] = _opt_flags_without_cse(kwargs.pop("optimizations", None))
+            # Force CSE off for fusion-candidate plans so a compute subtree
+            # stays a single fused MLX subgraph rather than fragmenting across
+            # one dispatch per hoisted temp column (see `_opt_flags_without_cse`).
+            # Gated on `_is_fusion_candidate`: forcing CSE off unconditionally
+            # changed results for fall-back queries that hit a Polars CSE-off
+            # correctness bug (e.g. `value_counts` / struct expansion). Non-fusion
+            # queries keep Polars' default CSE so they stay byte-identical to CPU.
+            # A deprecated direct `comm_subexpr_elim` kwarg, if present, is dropped.
+            if _is_fusion_candidate(self):
+                kwargs.pop("comm_subexpr_elim", None)
+                kwargs["optimizations"] = _opt_flags_without_cse(kwargs.pop("optimizations", None))
             # M5 rolling: serialize-detected rolling_* run on a custom Metal kernel.
             # Skip under streaming (adapter is in-memory only) and when nothing matches.
             from polars_metal import _rolling_detect, _rolling_dispatch
 
             streaming = bool(kwargs.get("streaming") or kwargs.get("new_streaming"))
+            if streaming:
+                import warnings as _w
+
+                from polars_metal._corr_namespace import CORR_SENTINEL_TAG
+                from polars_metal._dtw_namespace import DTW_SENTINEL_TAG
+                from polars_metal._fft_namespace import FFT_SENTINEL_TAG
+                from polars_metal._vector_namespace import SENTINEL_TAG as VSEARCH_SENTINEL_TAG
+
+                with _w.catch_warnings():
+                    _w.simplefilter("ignore")
+                    _plan_txt = self.explain()
+                _SENTINEL_TAGS = (
+                    VSEARCH_SENTINEL_TAG,
+                    FFT_SENTINEL_TAG,
+                    DTW_SENTINEL_TAG,
+                    CORR_SENTINEL_TAG,
+                )
+                if any(t in _plan_txt for t in _SENTINEL_TAGS):
+                    raise pl.exceptions.ComputeError(
+                        "polars_metal: the .metal vector/fft/dtw/corr verbs do not support "
+                        "streaming=True (they have no CPU implementation). Collect without "
+                        "streaming, or use a CPU equivalent."
+                    )
             rolling_bindings = [] if streaming else _rolling_detect.find_rolling_bindings(self)
             if rolling_bindings:
 
@@ -193,6 +305,71 @@ def _patch_gpu_engine_callback() -> None:
                     return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
 
                 return _rolling_dispatch.apply_rolling(self, rolling_bindings, _collect_rest)
+
+            # M6 vector search: serialize-detected .metal.cosine_topk/.knn sentinels
+            # run on the GPU via the same M5 collect-and-stitch template. Placed after
+            # the rolling block; the two don't co-occur in one outermost layer in
+            # practice (and if they did, rolling consumes first — acceptable for MVP).
+            from polars_metal import _vector_detect, _vector_dispatch
+
+            vector_bindings = [] if streaming else _vector_detect.find_vector_bindings(self)
+            if vector_bindings:
+
+                def _collect_rest_vs(rest_lf: Any) -> Any:
+                    return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
+
+                return _vector_dispatch.apply_vector_search(self, vector_bindings, _collect_rest_vs)
+            # M6 A3 FFT: serialize-detected .metal.fft()/.ifft() sentinels run on the GPU via
+            # the same collect-and-stitch template. Independent with_columns patch/cache, so it
+            # coexists with rolling + vector search.
+            from polars_metal import _fft_detect, _fft_dispatch
+
+            fft_bindings = [] if streaming else _fft_detect.find_fft_bindings(self)
+            if fft_bindings:
+
+                def _collect_rest_fft(rest_lf: Any) -> Any:
+                    return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
+
+                return _fft_dispatch.apply_fft(self, fft_bindings, _collect_rest_fft)
+            # M6 A4 DTW: serialize-detected .metal.dtw sentinels run on the banded
+            # DTW Metal kernel via the same collect-and-stitch template. Independent
+            # with_columns patch/cache; coexists with rolling/vector/fft.
+            from polars_metal import _dtw_detect, _dtw_dispatch
+
+            dtw_bindings = [] if streaming else _dtw_detect.find_dtw_bindings(self)
+            if dtw_bindings:
+
+                def _collect_rest_dtw(rest_lf: Any) -> Any:
+                    return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
+
+                return _dtw_dispatch.apply_dtw(self, dtw_bindings, _collect_rest_dtw)
+            # M6 B3 dt: serialize-detected dt.year/month/day run on the gregorian
+            # Metal kernel via the same collect-and-stitch template. Independent
+            # with_columns patch/cache; coexists with rolling/vector/fft.
+            from polars_metal import _dt_detect, _dt_dispatch
+
+            dt_bindings = [] if streaming else _dt_detect.find_dt_bindings(self)
+            if dt_bindings:
+
+                def _collect_rest_dt(rest_lf: Any) -> Any:
+                    return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
+
+                return _dt_dispatch.apply_dt(self, dt_bindings, _collect_rest_dt)
+            # M6 corr: serialize-detected lf.metal.corr() runs the MLX corr
+            # subgraph and REPLACES the frame with the pxp matrix (frame-
+            # replacing, unlike the column-stitch verbs above). Own patch/cache.
+            from polars_metal import _corr_detect, _corr_dispatch
+
+            corr_bindings = [] if streaming else _corr_detect.find_corr_bindings(self)
+            if corr_bindings:
+
+                def _collect_rest_corr(rest_lf: Any) -> Any:
+                    return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
+
+                # apply_corr takes a SINGLE binding (not the list the sibling
+                # verbs pass): corr is frame-replacing, so at most one sentinel
+                # per lf is meaningful — pass the first directly.
+                return _corr_dispatch.apply_corr(self, corr_bindings[0], _collect_rest_corr)
             # post_opt_callback is an internal bypass that injects a callback
             # directly, skipping _gpu_engine_callback. We run the query on
             # the CPU engine; in M0 our callback falls through, so the result

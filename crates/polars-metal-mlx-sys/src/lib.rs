@@ -14,10 +14,10 @@ pub use error::FfiError;
 
 pub mod array;
 pub mod elementwise;
-pub mod fft;
 pub mod matmul;
 pub mod reduce;
 pub mod scan;
+pub mod shape;
 pub mod sort;
 
 // cxx's SharedPtr<T> implementation expands a panic! macro in the generated
@@ -72,6 +72,30 @@ mod ffi {
         // caller-provided buffer. Must be called after `mlx_array_eval_one`.
         // SAFETY: `out` must point to a buffer of at least `n` f32 values.
         unsafe fn mlx_array_copy_to_f32(arr: &SharedPtr<MlxArray>, out: *mut f32, n: usize);
+
+        // M6 vector search: I32 readback. Copy `n` i32 values from the
+        // materialized (eval'd) array into the caller buffer. Array must be I32.
+        // SAFETY: `out` must point to a buffer of at least `n` i32 values.
+        unsafe fn mlx_array_copy_to_i32(arr: &SharedPtr<MlxArray>, out: *mut i32, n: usize);
+
+        // M6 Track B (B1): integer dtype query + per-width readback.
+        //
+        // Return the MlxDtype tag of `arr`'s dtype (0=f32, 2=i32, 3=bool,
+        // 4=i8, 5=i16, 6=i64, 7=u8, 8=u16, 9=u32, 10=u64). Throws on an
+        // unmapped dtype (e.g. float64), which cxx surfaces as Err.
+        fn mlx_array_dtype(arr: &SharedPtr<MlxArray>) -> Result<u32>;
+
+        // Per-width integer readback. Each copies `n` values of the matching
+        // width into the caller buffer. Array must be eval'd and have the
+        // matching dtype (caller contract).
+        // SAFETY: `out` must point to a buffer of at least `n` elements.
+        unsafe fn mlx_array_copy_to_i8(arr: &SharedPtr<MlxArray>, out: *mut i8, n: usize);
+        unsafe fn mlx_array_copy_to_i16(arr: &SharedPtr<MlxArray>, out: *mut i16, n: usize);
+        unsafe fn mlx_array_copy_to_i64(arr: &SharedPtr<MlxArray>, out: *mut i64, n: usize);
+        unsafe fn mlx_array_copy_to_u8(arr: &SharedPtr<MlxArray>, out: *mut u8, n: usize);
+        unsafe fn mlx_array_copy_to_u16(arr: &SharedPtr<MlxArray>, out: *mut u16, n: usize);
+        unsafe fn mlx_array_copy_to_u32(arr: &SharedPtr<MlxArray>, out: *mut u32, n: usize);
+        unsafe fn mlx_array_copy_to_u64(arr: &SharedPtr<MlxArray>, out: *mut u64, n: usize);
 
         // Force evaluation (materialize) of a single array. Wraps
         // `mlx::core::eval(*arr)`. Returns Err on any MLX exception.
@@ -229,6 +253,15 @@ mod ffi {
         fn mlx_op_sort(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
         fn mlx_op_argpartition(a: &SharedPtr<MlxArray>, kth: i32) -> Result<SharedPtr<MlxArray>>;
 
+        // M6 vector search: axis-aware argpartition (per-row top-k). Unlike the
+        // flattening `mlx_op_argpartition` above, this preserves the input shape
+        // and partitions along `axis` (use -1 for the last axis).
+        fn mlx_op_argpartition_axis(
+            a: &SharedPtr<MlxArray>,
+            kth: i32,
+            axis: i32,
+        ) -> Result<SharedPtr<MlxArray>>;
+
         // M5 rolling Task 1: forward shift (zero-fill).
         //
         // Shifts array `a` forward by `shift` positions along axis 0, prepending
@@ -245,7 +278,7 @@ mod ffi {
         // MlxArray; Result<> kept for `?`-idiom consistency.
         fn mlx_iota_f32(n: i64) -> Result<SharedPtr<MlxArray>>;
 
-        // M4 Phase 1 Task 10: cumulative scans + matmul + fft.
+        // M4 Phase 1 Task 10: cumulative scans + matmul.
 
         fn mlx_op_cumsum(a: &SharedPtr<MlxArray>, axis: i32) -> Result<SharedPtr<MlxArray>>;
         fn mlx_op_cumprod(a: &SharedPtr<MlxArray>, axis: i32) -> Result<SharedPtr<MlxArray>>;
@@ -257,11 +290,20 @@ mod ffi {
             b: &SharedPtr<MlxArray>,
         ) -> Result<SharedPtr<MlxArray>>;
 
-        fn mlx_op_fft_1d(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
-        fn mlx_op_ifft_1d(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
-
-        fn mlx_op_real(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
-        fn mlx_op_imag(a: &SharedPtr<MlxArray>) -> Result<SharedPtr<MlxArray>>;
+        // M6 vector search: shape ops (transpose/reshape/slice/take_along_axis).
+        fn mlx_op_transpose(a: &SharedPtr<MlxArray>, axes: &[i32]) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_reshape(a: &SharedPtr<MlxArray>, shape: &[i32]) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_slice(
+            a: &SharedPtr<MlxArray>,
+            start: &[i32],
+            stop: &[i32],
+            strides: &[i32],
+        ) -> Result<SharedPtr<MlxArray>>;
+        fn mlx_op_take_along_axis(
+            a: &SharedPtr<MlxArray>,
+            indices: &SharedPtr<MlxArray>,
+            axis: i32,
+        ) -> Result<SharedPtr<MlxArray>>;
     }
 }
 

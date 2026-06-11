@@ -1,39 +1,47 @@
 // crates/polars-metal-mlx-sys/build.rs
 use std::path::PathBuf;
 
-const REQUIRED_MLX_VERSION: &str = "0.22.0";
+const REQUIRED_MLX_VERSION: &str = "0.25.1";
 
-fn check_mlx_version(cmake_lists: &std::path::Path) {
-    let contents = match std::fs::read_to_string(cmake_lists) {
+fn check_mlx_version(version_h: &std::path::Path) {
+    // MLX >=0.24 derives its version from `mlx/version.h` (#define MLX_VERSION_MAJOR/MINOR/PATCH)
+    // rather than a literal `set(MLX_VERSION X.Y.Z)` in CMakeLists, so parse the header.
+    let contents = match std::fs::read_to_string(version_h) {
         Ok(s) => s,
         Err(_) => {
-            println!(
-                "cargo:warning=could not read vendor/mlx/CMakeLists.txt to verify MLX version"
-            );
+            println!("cargo:warning=could not read vendor/mlx/mlx/version.h to verify MLX version");
             return;
         }
     };
-    // Look for `set(MLX_VERSION X.Y.Z)`
-    for line in contents.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("set(MLX_VERSION ") {
-            let found = rest.trim_end_matches(|c: char| c == ')' || c.is_whitespace());
+    let field = |name: &str| -> Option<u32> {
+        contents.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix(name)
+                .and_then(|rest| rest.trim().parse::<u32>().ok())
+        })
+    };
+    match (
+        field("#define MLX_VERSION_MAJOR "),
+        field("#define MLX_VERSION_MINOR "),
+        field("#define MLX_VERSION_PATCH "),
+    ) {
+        (Some(major), Some(minor), Some(patch)) => {
+            let found = format!("{major}.{minor}.{patch}");
             if found != REQUIRED_MLX_VERSION {
                 println!(
-                    "cargo:warning=vendor/mlx MLX_VERSION={found} but polars-metal-mlx-sys pins {REQUIRED_MLX_VERSION}; bump deliberately"
+                    "cargo:warning=vendor/mlx version={found} but polars-metal-mlx-sys pins {REQUIRED_MLX_VERSION}; bump deliberately"
                 );
             }
-            return;
         }
+        _ => println!("cargo:warning=could not parse MLX version from vendor/mlx/mlx/version.h"),
     }
-    println!("cargo:warning=could not parse MLX_VERSION from vendor/mlx/CMakeLists.txt");
 }
 
 fn main() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let cmake_lists = manifest_dir.join("../../vendor/mlx/CMakeLists.txt");
-    check_mlx_version(&cmake_lists);
-    println!("cargo:rerun-if-changed={}", cmake_lists.display());
+    let version_h = manifest_dir.join("../../vendor/mlx/mlx/version.h");
+    check_mlx_version(&version_h);
+    println!("cargo:rerun-if-changed={}", version_h.display());
 
     // vendor/mlx is at <repo-root>/vendor/mlx; this crate is at
     // <repo-root>/crates/polars-metal-mlx-sys, so go up two levels.

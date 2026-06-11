@@ -130,6 +130,28 @@ impl MetalDevice {
         Ok(MetalBuffer::from_metal_owned(inner))
     }
 
+    /// Allocate a new shared-storage `MTLBuffer` of the given length, WITHOUT
+    /// zeroing its contents.
+    ///
+    /// Mirrors [`new_buffer_zeroed`](Self::new_buffer_zeroed) but skips the
+    /// `write_bytes` zero-fill. Intended for staging buffers whose full used
+    /// prefix is overwritten by a `memcpy` before any read (e.g.
+    /// [`crate::StagingPool`]); bytes beyond the staged length are never read.
+    ///
+    /// Storage mode is `MTLResourceStorageModeShared` (unified memory, CPU- and
+    /// GPU-addressable, page-aligned base). Returns
+    /// `BufferError::AllocationFailed` when `bytes == 0` or Metal refuses.
+    pub fn new_buffer_uninit(&self, bytes: usize) -> Result<MetalBuffer, BufferError> {
+        if bytes == 0 {
+            return Err(BufferError::AllocationFailed { bytes: 0 });
+        }
+        let inner = self
+            .inner
+            .newBufferWithLength_options(bytes, MTLResourceOptions::MTLResourceStorageModeShared)
+            .ok_or(BufferError::AllocationFailed { bytes })?;
+        Ok(MetalBuffer::from_metal_owned(inner))
+    }
+
     /// Raw borrow of the underlying `MTLDevice` protocol object.
     ///
     /// Exposed to sibling crates (`polars-metal-kernels`,

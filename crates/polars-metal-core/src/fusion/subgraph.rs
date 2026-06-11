@@ -13,8 +13,10 @@
 
 use polars_metal_buffer::{MetalBuffer, MetalDevice};
 use polars_metal_mlx_sys::array::{
-    mlx_array_copy_to_f32_slice, mlx_array_eval, mlx_array_from_f32_slice, mlx_array_to_f32_vec,
-    mlx_array_view_metal_buffer, MlxArrayHandle, MlxDtype,
+    mlx_array_eval, mlx_array_from_f32_slice, mlx_array_to_f32_vec, mlx_array_to_i16_vec,
+    mlx_array_to_i32_vec, mlx_array_to_i64_vec, mlx_array_to_i8_vec, mlx_array_to_u16_vec,
+    mlx_array_to_u32_vec, mlx_array_to_u64_vec, mlx_array_to_u8_vec, mlx_array_view_metal_buffer,
+    MlxArrayHandle, MlxDtype,
 };
 use polars_metal_mlx_sys::elementwise::{
     mlx_abs, mlx_acos, mlx_add, mlx_asin, mlx_atan, mlx_atan2, mlx_cbrt, mlx_ceil, mlx_cos,
@@ -23,7 +25,6 @@ use polars_metal_mlx_sys::elementwise::{
     mlx_mod_, mlx_mul, mlx_ne, mlx_neg, mlx_pow, mlx_round, mlx_sin, mlx_sinh, mlx_sqrt,
     mlx_square, mlx_sub, mlx_tan, mlx_tanh, mlx_where,
 };
-use polars_metal_mlx_sys::fft::{mlx_fft, mlx_ifft};
 use polars_metal_mlx_sys::matmul::mlx_matmul;
 use polars_metal_mlx_sys::reduce::{
     mlx_argmax, mlx_argmin, mlx_max, mlx_mean, mlx_min, mlx_std, mlx_sum, mlx_var,
@@ -34,7 +35,7 @@ use polars_metal_mlx_sys::scan::{
 use polars_metal_mlx_sys::sort::mlx_sort;
 use thiserror::Error;
 
-use super::scope::{FusionScope, OpNode};
+use super::scope::{FusionScope, InputDtype, OpNode};
 use super::supported_ops::OpId;
 
 #[derive(Debug, Error)]
@@ -53,6 +54,29 @@ pub enum BuildError {
         expected: usize,
         actual: usize,
     },
+    #[error("unsupported input dtype for buffer path: {0}")]
+    UnsupportedInputDtype(String),
+}
+
+/// Map a fused-scope `InputDtype` to the `MlxDtype` used to wrap its buffer.
+/// Composite / unsupported dtypes (`ArrayF32`/`ListF32`/`F64`) are not flat
+/// 1-D numeric columns the buffer path ingests → `UnsupportedInputDtype`.
+fn input_dtype_to_mlx(dtype: InputDtype) -> Result<MlxDtype, BuildError> {
+    Ok(match dtype {
+        InputDtype::F32 => MlxDtype::F32,
+        InputDtype::I32 => MlxDtype::I32,
+        InputDtype::Bool => MlxDtype::Bool,
+        InputDtype::I8 => MlxDtype::I8,
+        InputDtype::I16 => MlxDtype::I16,
+        InputDtype::I64 => MlxDtype::I64,
+        InputDtype::U8 => MlxDtype::U8,
+        InputDtype::U16 => MlxDtype::U16,
+        InputDtype::U32 => MlxDtype::U32,
+        InputDtype::U64 => MlxDtype::U64,
+        InputDtype::F64 | InputDtype::ArrayF32(_) | InputDtype::ListF32 => {
+            return Err(BuildError::UnsupportedInputDtype(format!("{dtype:?}")))
+        }
+    })
 }
 
 /// Stand-in for `polars_metal_buffer::MetalBuffer` used by tests. The
@@ -140,27 +164,80 @@ impl MlxSubgraph {
         Ok(outs)
     }
 
-    /// Eval the subgraph and copy each output directly into the matching
-    /// caller-owned slice (output-zero-copy: no intermediate `Vec`). `dsts[i]`
-    /// receives output `i` and must hold at least its element count. Returns
-    /// the per-output element counts written.
+    /// Eval the single-output subgraph and write the output into the caller's
+    /// raw buffer at `out_ptr` (output-zero-copy), interpreting it as
+    /// `out_dtype`. Returns the element count written.
     ///
-    /// The number of destination slices must equal the number of outputs.
-    pub fn eval_into(&self, dsts: &mut [&mut [f32]]) -> Result<Vec<usize>, BuildError> {
-        if dsts.len() != self.outputs.len() {
+    /// The caller pre-allocates an output array of the statically-inferred width
+    /// (the analyzer reports it), and this writer copies the eval'd MLX array
+    /// into it width-aware. It hard-errors if the eval'd dtype != `out_dtype`
+    /// (an analyzer mis-inference guard — refuse before corrupting the caller's
+    /// bytes) or if the output doesn't fit `out_cap`.
+    ///
+    /// # Safety contract (caller)
+    /// `out_ptr` addresses `out_cap` writable, contiguous elements of
+    /// `out_dtype`, alive for the whole call.
+    pub fn eval_into_typed(
+        &self,
+        out_ptr: usize,
+        out_cap: usize,
+        out_dtype: MlxDtype,
+    ) -> Result<usize, BuildError> {
+        if self.outputs.len() != 1 {
             return Err(BuildError::InputCountMismatch {
-                expected: self.outputs.len(),
-                actual: dsts.len(),
+                expected: 1,
+                actual: self.outputs.len(),
             });
         }
         mlx_array_eval(&self.outputs).map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
-        let mut counts = Vec::with_capacity(self.outputs.len());
-        for (h, dst) in self.outputs.iter().zip(dsts.iter_mut()) {
-            let n = mlx_array_copy_to_f32_slice(h, dst)
-                .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
-            counts.push(n);
+        let h = &self.outputs[0];
+        let got = h
+            .dtype()
+            .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+        if got != out_dtype {
+            return Err(BuildError::MlxError(format!(
+                "output dtype mismatch: declared {out_dtype:?}, eval'd {got:?}"
+            )));
         }
-        Ok(counts)
+        let n: usize = h.shape().iter().product();
+        if n > out_cap {
+            return Err(BuildError::MlxError(format!(
+                "output too large: {n} > capacity {out_cap}"
+            )));
+        }
+        if n == 0 {
+            return Ok(0);
+        }
+        // Local macro to DRY the per-width arms. This is the SECOND
+        // exhaustive `match out_dtype` site (the first is
+        // `eval_to_metal_buffers`); both are exhaustive over `MlxDtype`, so a
+        // new dtype forces a compile error in BOTH — they can't silently drift.
+        macro_rules! write_back {
+            ($to_vec:path, $t:ty) => {{
+                let data = $to_vec(h).map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+                // SAFETY: `out_ptr` addresses `out_cap >= n` writable, contiguous
+                // elements of `out_dtype` (caller contract); we copy exactly `n`.
+                let dst = unsafe { std::slice::from_raw_parts_mut(out_ptr as *mut $t, n) };
+                dst.copy_from_slice(&data);
+            }};
+        }
+        match out_dtype {
+            MlxDtype::F32 => write_back!(mlx_array_to_f32_vec, f32),
+            MlxDtype::I32 => write_back!(mlx_array_to_i32_vec, i32),
+            MlxDtype::I8 => write_back!(mlx_array_to_i8_vec, i8),
+            MlxDtype::I16 => write_back!(mlx_array_to_i16_vec, i16),
+            MlxDtype::I64 => write_back!(mlx_array_to_i64_vec, i64),
+            MlxDtype::U8 => write_back!(mlx_array_to_u8_vec, u8),
+            MlxDtype::U16 => write_back!(mlx_array_to_u16_vec, u16),
+            MlxDtype::U32 => write_back!(mlx_array_to_u32_vec, u32),
+            MlxDtype::U64 => write_back!(mlx_array_to_u64_vec, u64),
+            MlxDtype::Bool | MlxDtype::F64 => {
+                return Err(BuildError::UnsupportedInputDtype(format!(
+                    "output {out_dtype:?}"
+                )))
+            }
+        }
+        Ok(n)
     }
 
     /// Production-path constructor: build the subgraph over zero-copy views
@@ -180,11 +257,14 @@ impl MlxSubgraph {
         }
         let mut handles: Vec<MlxArrayHandle> = inputs
             .iter()
-            .map(|buf| {
-                // Derive 1-D shape from buffer byte length (F32 = 4 bytes each).
-                let n_elements = (buf.len() / 4) as i64;
+            .zip(scope.inputs.iter())
+            .map(|(buf, input_ref)| {
+                // Derive 1-D shape from buffer byte length and the input's
+                // declared dtype (element width is dtype-dependent).
+                let mlx_dtype = input_dtype_to_mlx(input_ref.dtype)?;
+                let n_elements = (buf.len() / mlx_dtype.element_size()) as i64;
                 let shape = [n_elements];
-                mlx_array_view_metal_buffer(buf.clone(), &shape, MlxDtype::F32)
+                mlx_array_view_metal_buffer(buf.clone(), &shape, mlx_dtype)
                     .map_err(|e| BuildError::MlxError(format!("{e:?}")))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -212,8 +292,9 @@ impl MlxSubgraph {
     /// allocator API; extracting the underlying MTL::Buffer\* and wrapping
     /// it as a `MetalBuffer` without copying requires exposing the MLX
     /// allocator surface through the FFI bridge. For Phase 4 we take the
-    /// pragmatic path - read the output as Vec<f32> and stage a fresh
-    /// `MetalBuffer`. This adds one F32 copy at the output, which doesn't
+    /// pragmatic path - read the output as a typed Vec matching the eval'd
+    /// dtype (`f32` / `i*` / `u*`) and stage a fresh `MetalBuffer` of that
+    /// dtype. This adds one copy at the output, which doesn't
     /// affect the input zero-copy path (the dominant cost for large
     /// transcendental chains). Full output-zero-copy is a future
     /// optimization tracked alongside the MLX allocator-surface work.
@@ -224,10 +305,67 @@ impl MlxSubgraph {
         mlx_array_eval(&self.outputs).map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
         let mut outs = Vec::with_capacity(self.outputs.len());
         for h in &self.outputs {
-            let data =
-                mlx_array_to_f32_vec(h).map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
-            let buf = MetalBuffer::from_f32_slice(device, &data)
+            let dtype = h
+                .dtype()
                 .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+            let buf = match dtype {
+                MlxDtype::F32 => {
+                    let data = mlx_array_to_f32_vec(h)
+                        .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+                    MetalBuffer::from_f32_slice(device, &data)
+                }
+                MlxDtype::I32 => {
+                    let data = mlx_array_to_i32_vec(h)
+                        .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+                    MetalBuffer::from_i32_slice(device, &data)
+                }
+                MlxDtype::I8 => {
+                    let data = mlx_array_to_i8_vec(h)
+                        .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+                    MetalBuffer::from_i8_slice(device, &data)
+                }
+                MlxDtype::I16 => {
+                    let data = mlx_array_to_i16_vec(h)
+                        .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+                    MetalBuffer::from_i16_slice(device, &data)
+                }
+                MlxDtype::I64 => {
+                    let data = mlx_array_to_i64_vec(h)
+                        .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+                    MetalBuffer::from_i64_slice(device, &data)
+                }
+                MlxDtype::U8 => {
+                    let data = mlx_array_to_u8_vec(h)
+                        .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+                    MetalBuffer::from_u8_slice(device, &data)
+                }
+                MlxDtype::U16 => {
+                    let data = mlx_array_to_u16_vec(h)
+                        .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+                    MetalBuffer::from_u16_slice(device, &data)
+                }
+                MlxDtype::U32 => {
+                    let data = mlx_array_to_u32_vec(h)
+                        .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+                    MetalBuffer::from_u32_slice(device, &data)
+                }
+                MlxDtype::U64 => {
+                    let data = mlx_array_to_u64_vec(h)
+                        .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
+                    MetalBuffer::from_u64_slice(device, &data)
+                }
+                // B1 ships integer + F32 output only. Bool output would need
+                // repacking to Arrow's bit-packed validity-style layout, and
+                // F64 is unsupported by the MLX-on-Metal view path; both are
+                // out of B1 scope and surface as an error (caller falls back to
+                // CPU). Revisit if a later milestone needs Bool/F64 output.
+                MlxDtype::Bool | MlxDtype::F64 => {
+                    return Err(BuildError::UnsupportedInputDtype(format!(
+                        "output {dtype:?}"
+                    )))
+                }
+            }
+            .map_err(|e| BuildError::MlxError(format!("{e:?}")))?;
             outs.push(buf);
         }
         Ok(outs)
@@ -391,10 +529,13 @@ fn build_op(node: &OpNode, handles: &[MlxArrayHandle]) -> Result<MlxArrayHandle,
         // Matmul - inputs must be 2-D; Phase 10 (List/Array dot) sets that up.
         MatMul => ffi(mlx_matmul(args[0], args[1])),
 
-        // FFT (Phase 11 surface; needs the metal.fft() namespace before it's
-        // reachable from the analyzer, but the dispatch is wired now).
-        Fft => ffi(mlx_fft(args[0])),
-        Ifft => ffi(mlx_ifft(args[0])),
+        // FFT. UNREACHABLE from this fused-walker path: `fft` is not a NodeTraverser-viewable
+        // expression, so the analyzer never builds this arm, and folding a complex FFT result
+        // back into an F32 Series here would be wrong anyway. The LIVE FFT path is the `.metal`
+        // namespace backed by the hand-rolled MSL kernel (`shaders/fft.metal` /
+        // `polars_metal_kernels::fft`), which handles all sizes on-GPU. The fused subgraph does
+        // not support FFT, hence `UnsupportedOp`. Do not rely on / extend these arms.
+        Fft | Ifft => Err(BuildError::UnsupportedOp(node.op)),
 
         // Shift (M5 rolling): forward shift with zero-fill; requires a scalar
         // param carrying the shift amount.

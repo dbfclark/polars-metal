@@ -710,20 +710,35 @@ proptest! {
             .expect("dispatch_sum_f32");
         let expected = ref_sum_f32(&values, &valid_bools, &r2g, n_groups);
         // The GPU f32 sum uses a CAS-loop in parallel (one thread per row), so the
-        // accumulation order is non-deterministic. We verify:
-        //   - empty groups give exactly 0.0.
-        //   - non-empty groups agree within 1e-5 relative error (f32 precision).
+        // accumulation order is non-deterministic. Both the GPU result and the sequential
+        // reference are valid f32 summations of the same multiset, so each lies within the
+        // standard backward-error bound γ_{n-1}·Σ|xᵢ| of the true sum; their difference is
+        // therefore bounded by ~2(n-1)·ε·Σ|xᵢ|. We assert that ABSOLUTE bound rather than a
+        // relative-to-result one: under catastrophic cancellation (large summands that nearly
+        // cancel) the relative-to-result error is unbounded — it scales with the condition
+        // number Σ|xᵢ|/|Σxᵢ| — even though every individual addition is correct to f32 ULP.
+        // A real kernel bug (dropped/double-counted/misrouted value) injects error of order
+        // |x| ≈ Σ|x|, which is ~4 orders of magnitude above this tolerance, so it stays caught.
         for g in 0..n_groups {
-            let any_valid = valid_bools.iter().enumerate().any(|(i, &v)| v && r2g[i] == g as u32);
-            if !any_valid {
+            let mut abssum = 0f32;
+            let mut count = 0u32;
+            for i in 0..n {
+                if valid_bools[i] && r2g[i] == g as u32 {
+                    abssum += values[i].abs();
+                    count += 1;
+                }
+            }
+            if count == 0 {
+                // Truly empty group → identity 0.0, bit-exact.
                 prop_assert_eq!(out[g].to_bits(), 0u32, "empty group g={} must be 0.0", g);
-            } else if expected[g] == 0.0 {
-                prop_assert_eq!(out[g].to_bits(), 0u32, "g={}: expected zero", g);
             } else {
-                let rel = (out[g] - expected[g]).abs() / expected[g].abs().max(1e-30);
-                // 1e-4 relative: f32 has ~7 decimal digits; parallel reordering
-                // can cause ~few ULP (1e-5 to 1e-4) for 256 values.
-                prop_assert!(rel < 1e-4, "g={}: out={} expected={} rel_err={}", g, out[g], expected[g], rel);
+                let tol = 8.0 * count as f32 * f32::EPSILON * abssum + f32::MIN_POSITIVE;
+                let abs_err = (out[g] - expected[g]).abs();
+                prop_assert!(
+                    abs_err <= tol,
+                    "g={}: out={} expected={} abs_err={} tol={} (n={}, sum|x|={})",
+                    g, out[g], expected[g], abs_err, tol, count, abssum
+                );
             }
         }
     }

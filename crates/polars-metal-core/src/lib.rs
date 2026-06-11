@@ -7,12 +7,15 @@
 #![allow(clippy::useless_conversion)]
 
 mod arena;
+mod corr;
 mod error;
+mod fft;
 pub mod fusion;
 pub mod plan;
 pub mod router;
 mod router_udf;
 mod udf;
+mod vector_search;
 
 pub use arena::{BumpArena, ScratchArena, StubArena};
 pub use error::EngineError;
@@ -70,6 +73,11 @@ fn polars_metal_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()>
     m.add_function(wrap_pyfunction!(udf::warmup_common_fused_signatures, m)?)?;
     m.add_function(wrap_pyfunction!(udf::execute_fused_expr, m)?)?;
     m.add_function(wrap_pyfunction!(udf::execute_rolling, m)?)?;
+    m.add_function(wrap_pyfunction!(udf::execute_dt, m)?)?;
+    m.add_function(wrap_pyfunction!(udf::execute_dtw, m)?)?;
+    m.add_function(wrap_pyfunction!(vector_search::execute_vector_search, m)?)?;
+    m.add_function(wrap_pyfunction!(fft::execute_fft, m)?)?;
+    m.add_function(wrap_pyfunction!(corr::execute_corr, m)?)?;
     fusion::py::register(m)?;
     Ok(())
 }

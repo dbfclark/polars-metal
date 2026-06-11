@@ -393,7 +393,11 @@ pub fn emit_msl(sig: &AggSignature, specs: &[AggSpec]) -> String {
 /// through M2's CPU-finalize path.
 pub fn signature_supported_by_fused(sig: &AggSignature) -> bool {
     sig.column_dtypes().iter().all(|d| match d {
-        MetalDtype::F64 | MetalDtype::I64 => false,
+        // 64-bit value columns accumulate through M2's CPU-finalize path; the
+        // 32-bit fused reduce kinds would overflow/truncate them. U64 reductions
+        // proper land via the Python select-reduction path, not this groupby
+        // signature — report unsupported so a stray U64 column falls back.
+        MetalDtype::F64 | MetalDtype::I64 | MetalDtype::U64 => false,
         // Utf8 is never an agg value column (it's a key dtype only), but the
         // mirror enum carries it. Report unsupported so a bug that lifts a
         // Utf8 column into the fused path falls back rather than panics.
@@ -419,11 +423,11 @@ fn msl_value_load_type(dt: MetalDtype) -> &'static str {
         MetalDtype::I32 | MetalDtype::I16 | MetalDtype::I8 | MetalDtype::I64 => "int",
         MetalDtype::U32 | MetalDtype::U16 | MetalDtype::U8 => "uint",
         MetalDtype::Bool => "uchar",
-        // Utf8 is never a value-column dtype reaching the MSL emitter; the
-        // fused-supported predicate above filters it out. Map to a no-op
+        // Neither U64 nor Utf8 reaches the MSL emitter for a value column: the
+        // fused-supported predicate above filters both out. Map to a no-op
         // placeholder so the panic path is unreachable in practice but the
         // match remains exhaustive.
-        MetalDtype::Utf8 => "uint",
+        MetalDtype::U64 | MetalDtype::Utf8 => "uint",
     }
 }
 

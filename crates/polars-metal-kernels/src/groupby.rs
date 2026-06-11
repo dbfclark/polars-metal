@@ -3017,10 +3017,11 @@ fn primary_kind_for(op: KAggOp, input_dt: KMetalDtype) -> PrimaryKind {
             KMetalDtype::U32 | KMetalDtype::U16 | KMetalDtype::U8 | KMetalDtype::Bool => {
                 PrimaryKind::U32
             }
-            // Utf8 is never an agg value-column dtype; the dispatch router
-            // filters this out. Treat as U32 (its underlying code dtype) for
-            // exhaustiveness; reaching this arm would mean a router bug.
-            KMetalDtype::Utf8 => PrimaryKind::U32,
+            // Neither U64 (handled on the Python select-reduction path) nor
+            // Utf8 is an agg value-column dtype here; the dispatch router
+            // filters both out. Treat as U32 for exhaustiveness; reaching this
+            // arm would mean a router bug.
+            KMetalDtype::U64 | KMetalDtype::Utf8 => PrimaryKind::U32,
         },
     }
 }

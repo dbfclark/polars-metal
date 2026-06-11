@@ -545,3 +545,65 @@ adapter that the current architecture does not have. Polars streaming mode
 falls back to CPU. No plan to build a streaming-specific rolling path.
 *Owner:* out of scope indefinitely unless the engine acquires a streaming
 execution model.
+
+---
+
+## `lf.metal.corr()` dtype divergence: F32 vs Polars F64 (M6, 2026-06-11)
+
+**Known divergence (documented, not a bug).** `lf.metal.corr()` returns a
+`Float32` p×p correlation matrix. Polars `df.corr()` returns `Float64`.
+
+- Values are F32-precision (~1e-5 relative error). The GPU path computes
+  `C = Zn·Znᵀ` (per-variable-normalized rows of a (p,n) buffer) entirely in
+  MLX F32 (MLX has no F64); the output dtype is F32 regardless of whether
+  routing chose GPU or CPU fallback (the CPU fallback path — small p / nulls /
+  non-numeric inputs — calls `df.corr()` and casts the result to F32 before
+  returning).
+- Output dtype is therefore **path-independent**: callers always get F32.
+- Routing: GPU when `p >= CORR_P_MIN=8` or `force_gpu=True`; else CPU
+  `df.corr()` cast F32. Nulls / non-numeric inputs / `N < 2` are handled on
+  CPU in all cases.
+
+**Honest engine-path perf:** **~9.9× at N=1M, p=50** (grows with p: ~2.5× @p=10,
+~7.6× @p=25). The first cut measured only ~2×, bottlenecked entirely on host-side
+numpy copies: `df.to_numpy()` yields a column-major array, then `ascontiguousarray`
+transposes it to sample-major (n,p) — ~66ms of an 84ms path, while the GPU work was
+only ~11ms. Fix: Polars columns are already contiguous, so per-column `to_numpy()` is
+**zero-copy**; `np.stack` of them builds a **(p,n) variable-major** buffer in ~3.7ms,
+fed to a (p,n)-orientation kernel (the cheap-to-build layout is the one the kernel
+consumes). GPU time fell to ~18ms. Residual gap to the spike's raw-MLX ~20× is the
+host→Metal staging copy (irreducible: Polars 64-byte vs Metal 16KB page alignment).
+The "profile the ingest, don't assume the kernel is the cost" lesson echoes B3's
+StagingPool finding.
+
+**Same divergence class as "Mean F32 returns F32 not F64"** — the existing
+conformance baseline for group-by mean/median/quantile over integer columns
+(fixed in M6 conformance-fixes by casting those agg outputs to F64; corr is
+intentionally kept F32 because F32 is the only available precision).
+
+*Owner:* documented. No fix planned — F32 is the correct precision for GPU
+corr; callers needing F64 should use `df.corr()` directly.
+
+---
+
+## FFT planar (SoA) rewrite + the GPU-reshuffle non-finding (M6 memory pass, 2026-06-11)
+
+**Finding (measured, not assumed).** The GPU FFT used interleaved-complex (`float2`) layout,
+forcing a host planar→interleaved "pack" + interleaved→planar "unpack" around every FFT (the
+engine has separate re/im planar data). An attempt to move that reshuffle onto the GPU
+(pack/unpack MSL kernels) **REGRESSED**: each separate dispatch costs ~13-24ms (full
+command-buffer submit + `wait_until_complete` barrier) vs ~5-10ms for the cache-friendly CPU
+memcpy. **A bandwidth-shaped O(N) reshuffle loses on the GPU once it pays per-dispatch sync**
+(cf. the B4 bare-reduction finding).
+
+**Resolution.** Eliminated the reshuffle entirely by rewriting the FFT kernels to **planar
+(SoA)** — separate `re`/`im` global buffers — so no interleave exists. The internal threadgroup
+butterfly math stays `float2` unchanged; only the global device-buffer load/store splits to
+planar. `fft_core` now stages planar re (+ a zeroed im plane for real input) directly through
+`fft_gpu_planar_core`, with no host interleave/split. Honest win: **~20% off the engine FFT at
+2^24** (the reshuffle + two host-Vec round-trips of size 2N are gone). The interleaved core is
+retained internally for Bluestein (rare non-smooth/prime n, which bridges through it) and as the
+differential-test oracle. Verified planar-vs-interleaved to 2^25 + inverse + complex, L2<1e-3.
+
+**Generalizable rule:** a reshuffle (interleave, transpose, scatter) can't be made zero-copy by
+relocating it to the GPU — eliminate it by changing the kernel's data layout.

@@ -206,11 +206,12 @@ def _analyzer_eval(
     result = analyze_ir_with_columns(nt, expr_meta.node, schema)
     if result is None:
         return None
-    scope, descriptors = result
+    scope, descriptors, _out_dtype_str = result
 
     n_rows = len(next(iter(inputs.values())))
     # Hold the source arrays in this list across the call (the executor borrows
-    # their memory). Pass (ptr, n_elements) pairs — the abi3-safe input form.
+    # their memory). Pass (ptr, n_elements, dtype_tag) triples — the abi3-safe
+    # input form. This strategy generates F32 exprs only; tag 0 = MlxDtype::F32.
     input_arrays: list[np.ndarray] = []
     for kind, payload in descriptors:
         if kind == "col":
@@ -221,11 +222,11 @@ def _analyzer_eval(
             raise AssertionError(f"unknown descriptor kind {kind!r}")
 
     out_arr = np.empty(n_rows, dtype=np.float32)
-    in_ptrs = [(int(a.__array_interface__["data"][0]), int(a.size)) for a in input_arrays]
+    in_ptrs = [(int(a.__array_interface__["data"][0]), int(a.size), 0) for a in input_arrays]
     written = native.execute_fused_expr(
         scope=scope,
         inputs=in_ptrs,
-        out=(int(out_arr.__array_interface__["data"][0]), int(out_arr.size)),
+        out=(int(out_arr.__array_interface__["data"][0]), int(out_arr.size), 0),
     )
     if written == 1 and n_rows != 1:
         out_arr.fill(out_arr[0])

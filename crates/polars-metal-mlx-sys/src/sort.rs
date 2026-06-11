@@ -42,3 +42,23 @@ pub fn mlx_argpartition(a: &MlxArrayHandle, kth: i32) -> Result<MlxArrayHandle, 
         _input_refs: a._input_refs.clone(),
     })
 }
+
+/// Argpartition along `axis` (use `-1` for the last axis). Returns integer indices,
+/// same shape as `a`, with the `0..=kth` positions along `axis` holding the kth-smallest.
+///
+/// Unlike [`mlx_argpartition`], this preserves the input shape (per-row top-k)
+/// rather than flattening to 1-D.
+///
+/// # Errors
+/// Returns `FfiError::Runtime` if `kth`/`axis` is out of range or MLX rejects.
+pub fn mlx_argpartition_axis(
+    a: &MlxArrayHandle,
+    kth: i32,
+    axis: i32,
+) -> Result<MlxArrayHandle, FfiError> {
+    let ptr = ffi::mlx_op_argpartition_axis(&a.ptr, kth, axis).map_err(FfiError::from)?;
+    Ok(MlxArrayHandle {
+        ptr,
+        _input_refs: a._input_refs.clone(),
+    })
+}
