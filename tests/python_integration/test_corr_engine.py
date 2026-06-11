@@ -78,3 +78,32 @@ def test_corr_p_min_constant_is_eight():
     from polars_metal._corr_dispatch import CORR_P_MIN
 
     assert CORR_P_MIN == 8
+
+
+def test_corr_nulls_route_to_cpu_and_match():
+    # Null-bearing input → CPU fallback (exact Polars null semantics), F32 out.
+    df = _frame(n=2000, p=10, seed=5).with_columns(
+        pl.when(pl.int_range(pl.len()) % 7 == 0).then(None).otherwise(pl.col("c0")).alias("c0")
+    )
+    out = df.lazy().metal.corr().collect(engine=pm.MetalEngine())
+    expected = df.corr().cast(pl.Float32)
+    assert all(dt == pl.Float32 for dt in out.dtypes)
+    # Compare with NaN-equal semantics (constant/degenerate cells may be NaN).
+    np.testing.assert_allclose(out.to_numpy(), expected.to_numpy(), atol=1e-4, equal_nan=True)
+
+
+def test_corr_integer_and_f64_inputs_cast():
+    # Int + F64 numeric columns are accepted (cast to F32). p>=8 → GPU path.
+    rng = np.random.default_rng(6)
+    df = pl.DataFrame(
+        {f"c{i}": rng.integers(-100, 100, size=4000) for i in range(10)}
+    )  # Int64 columns
+    out = df.lazy().metal.corr().collect(engine=pm.MetalEngine())
+    expected = df.corr().cast(pl.Float32)
+    np.testing.assert_allclose(out.to_numpy(), expected.to_numpy(), atol=1e-3)
+
+
+def test_corr_non_numeric_raises():
+    df = _frame(n=100, p=9).with_columns(pl.lit("x").alias("c0"))
+    with pytest.raises(ValueError):
+        df.lazy().metal.corr().collect(engine=pm.MetalEngine())
