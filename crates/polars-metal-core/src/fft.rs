@@ -22,6 +22,19 @@ pub fn fft_core(
     let len = n as usize;
     // Build the interleaved-complex `[re,im,...]` host buffer (length 2n) the
     // kernel expects.
+    //
+    // M5b-2 finding (honest-baseline discipline): moving this CPU interleave/split
+    // onto the GPU (via `fft_gpu_planar`) was MEASURED to REGRESS, not win. The
+    // CPU scatter/gather is a cache-friendly O(N) memcpy (~4-5ms @2^23,
+    // ~8-10ms @2^24); the on-device pack and unpack each pay a full
+    // command-buffer submit + `wait_until_complete` barrier + buffer alloc
+    // (~13ms / ~21ms each) — 2-3x SLOWER than the CPU work they replace, while the
+    // host input-stage and planar readback transfers are unchanged. Same lesson
+    // as the B4 bare-reduction spike: a trivial bandwidth-shaped O(N) shuffle
+    // loses on the GPU once it pays per-dispatch sync. So `fft_core` stays on the
+    // host interleave/split path; `fft_gpu_planar` (kernels crate) is kept as the
+    // correct building block IF a future fully-fused single-command-buffer
+    // pack->fft->unpack pipeline (no intermediate barriers) is ever built.
     let mut interleaved = vec![0.0f32; 2 * len];
     match input {
         FftInput::Real(re) => {

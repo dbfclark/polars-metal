@@ -629,10 +629,119 @@ fn make_n_buf(device: &MetalDevice, n: usize) -> Result<MetalBuffer, FftError> {
     Ok(device.new_buffer_from_bytes(&(n as u32).to_le_bytes())?)
 }
 
+/// Buffer-level core: GPU-pack a real input buffer (`re_buf`, `n` f32) into the
+/// interleaved-complex `out_buf` (`2n` f32: `out[2i]=re[i]`, `out[2i+1]=0`).
+/// Dispatches `fft_pack_real_to_interleaved` with `n` threads, commit+wait. The
+/// host-slice [`dispatch_pack_real`] is a thin wrapper over this.
+pub fn pack_real_buf(
+    device: &MetalDevice,
+    re_buf: &MetalBuffer,
+    out_buf: &MetalBuffer,
+    n: usize,
+) -> Result<(), FftError> {
+    let n_buf = make_n_buf(device, n)?;
+    let lib = shared_library(device)?;
+    let pso = lib.pipeline("fft_pack_real_to_interleaved")?;
+    let mut queue = CommandQueue::new(device)?;
+    // One thread per sample; dispatch_1d handles threadgroup sizing at runtime.
+    queue.dispatch_1d(&pso, &[re_buf, out_buf, &n_buf], n)?;
+    queue.wait_until_complete()?;
+    Ok(())
+}
+
+/// Buffer-level core: GPU-pack separate real/imag input buffers (each `n` f32)
+/// into the interleaved-complex `out_buf` (`2n` f32: `out[2i]=re[i]`,
+/// `out[2i+1]=im[i]`). Dispatches `fft_pack_complex_to_interleaved`. The
+/// host-slice [`dispatch_pack_complex`] is a thin wrapper over this.
+pub fn pack_complex_buf(
+    device: &MetalDevice,
+    re_buf: &MetalBuffer,
+    im_buf: &MetalBuffer,
+    out_buf: &MetalBuffer,
+    n: usize,
+) -> Result<(), FftError> {
+    let n_buf = make_n_buf(device, n)?;
+    let lib = shared_library(device)?;
+    let pso = lib.pipeline("fft_pack_complex_to_interleaved")?;
+    let mut queue = CommandQueue::new(device)?;
+    // One thread per sample; dispatch_1d handles threadgroup sizing at runtime.
+    queue.dispatch_1d(&pso, &[re_buf, im_buf, out_buf, &n_buf], n)?;
+    queue.wait_until_complete()?;
+    Ok(())
+}
+
+/// Buffer-level core: GPU-unpack the interleaved-complex `in_buf` (`2n` f32)
+/// into separate planar buffers `re_out_buf` / `im_out_buf` (each `n` f32:
+/// `re_out[i]=in[2i]`, `im_out[i]=in[2i+1]`). Dispatches
+/// `fft_unpack_interleaved_to_planar`. The host-slice [`dispatch_unpack`] is a
+/// thin wrapper over this.
+pub fn unpack_buf(
+    device: &MetalDevice,
+    in_buf: &MetalBuffer,
+    re_out_buf: &MetalBuffer,
+    im_out_buf: &MetalBuffer,
+    n: usize,
+) -> Result<(), FftError> {
+    let n_buf = make_n_buf(device, n)?;
+    let lib = shared_library(device)?;
+    let pso = lib.pipeline("fft_unpack_interleaved_to_planar")?;
+    let mut queue = CommandQueue::new(device)?;
+    // One thread per sample; dispatch_1d handles threadgroup sizing at runtime.
+    queue.dispatch_1d(&pso, &[in_buf, re_out_buf, im_out_buf, &n_buf], n)?;
+    queue.wait_until_complete()?;
+    Ok(())
+}
+
+/// On-device 1-D FFT: GPU-pack the real (or real+imag) input into interleaved
+/// complex, run [`fft_gpu_buf`], GPU-unpack into planar `(re, im)`. Only the
+/// input stage and the two planar readbacks cross the host boundary — no CPU
+/// interleave/split, no intermediate interleaved host `Vec`. Returns
+/// `(re_out, im_out)`, each length `n`.
+///
+/// M5b-2 finding: this does NOT beat the host interleave/split path at the
+/// engine level. Pack and unpack each pay a full command-buffer submit +
+/// `wait_until_complete` barrier + buffer alloc (~13ms / ~21ms at 2^23 / 2^24),
+/// which is 2-3x SLOWER than the cache-friendly CPU scatter/gather they replace
+/// (~4-5ms / ~8-10ms), while the host input-stage + planar readback transfers
+/// are unchanged. `fft_core` therefore stays on the host path; this fn is
+/// retained as the correct building block IF a future fully-fused
+/// single-command-buffer pack->fft->unpack pipeline (no intermediate barriers)
+/// is built. See the `fft_core` comment in
+/// `crates/polars-metal-core/src/fft.rs`.
+pub fn fft_gpu_planar(
+    device: &MetalDevice,
+    re: &[f32],
+    im: Option<&[f32]>,
+    n: i64,
+    inverse: bool,
+) -> Result<(Vec<f32>, Vec<f32>), FftError> {
+    if n <= 0 {
+        return Err(FftError::Unsupported(n));
+    }
+    let nn = n as usize;
+    let inter_buf = device.new_buffer_zeroed(2 * nn * std::mem::size_of::<f32>())?;
+    match im {
+        None => {
+            let re_buf = MetalBuffer::from_f32_slice(device, re)?;
+            pack_real_buf(device, &re_buf, &inter_buf, nn)?;
+        }
+        Some(imag) => {
+            let re_buf = MetalBuffer::from_f32_slice(device, re)?;
+            let im_buf = MetalBuffer::from_f32_slice(device, imag)?;
+            pack_complex_buf(device, &re_buf, &im_buf, &inter_buf, nn)?;
+        }
+    }
+    let out_buf = device.new_buffer_zeroed(2 * nn * std::mem::size_of::<f32>())?;
+    fft_gpu_buf(device, &inter_buf, &out_buf, n, inverse)?;
+    let re_out_buf = device.new_buffer_zeroed(nn * std::mem::size_of::<f32>())?;
+    let im_out_buf = device.new_buffer_zeroed(nn * std::mem::size_of::<f32>())?;
+    unpack_buf(device, &out_buf, &re_out_buf, &im_out_buf, nn)?;
+    Ok((re_out_buf.to_f32_vec(), im_out_buf.to_f32_vec()))
+}
+
 /// Pack a real host signal into an interleaved-complex host `Vec` (length `2n`)
 /// on the GPU. Each element `i` of the output satisfies `out[2i] = re[i]` and
-/// `out[2i+1] = 0`. Mirrors the CPU scatter in `fft_core` so M5b can keep the
-/// whole FFT pipeline on-device.
+/// `out[2i+1] = 0`. Thin host-slice wrapper over [`pack_real_buf`].
 pub fn dispatch_pack_real(
     device: &MetalDevice,
     re: &[f32],
@@ -640,21 +749,14 @@ pub fn dispatch_pack_real(
 ) -> Result<Vec<f32>, FftError> {
     let in_buf = MetalBuffer::from_f32_slice(device, re)?;
     let out_buf = device.new_buffer_zeroed(2 * n * std::mem::size_of::<f32>())?;
-    let n_buf = make_n_buf(device, n)?;
-
-    let lib = shared_library(device)?;
-    let pso = lib.pipeline("fft_pack_real_to_interleaved")?;
-    let mut queue = CommandQueue::new(device)?;
-    // One thread per sample; dispatch_1d handles threadgroup sizing at runtime.
-    queue.dispatch_1d(&pso, &[&in_buf, &out_buf, &n_buf], n)?;
-    queue.wait_until_complete()?;
+    pack_real_buf(device, &in_buf, &out_buf, n)?;
     Ok(out_buf.to_f32_vec())
 }
 
 /// Pack separate real and imaginary host planes into an interleaved-complex host
 /// `Vec` (length `2n`) on the GPU. Each element `i` of the output satisfies
-/// `out[2i] = re[i]` and `out[2i+1] = im[i]`. Mirrors the CPU scatter in
-/// `fft_core`'s complex branch so M5b can keep the whole FFT pipeline on-device.
+/// `out[2i] = re[i]` and `out[2i+1] = im[i]`. Thin host-slice wrapper over
+/// [`pack_complex_buf`].
 pub fn dispatch_pack_complex(
     device: &MetalDevice,
     re: &[f32],
@@ -664,21 +766,14 @@ pub fn dispatch_pack_complex(
     let re_buf = MetalBuffer::from_f32_slice(device, re)?;
     let im_buf = MetalBuffer::from_f32_slice(device, im)?;
     let out_buf = device.new_buffer_zeroed(2 * n * std::mem::size_of::<f32>())?;
-    let n_buf = make_n_buf(device, n)?;
-
-    let lib = shared_library(device)?;
-    let pso = lib.pipeline("fft_pack_complex_to_interleaved")?;
-    let mut queue = CommandQueue::new(device)?;
-    // One thread per sample; dispatch_1d handles threadgroup sizing at runtime.
-    queue.dispatch_1d(&pso, &[&re_buf, &im_buf, &out_buf, &n_buf], n)?;
-    queue.wait_until_complete()?;
+    pack_complex_buf(device, &re_buf, &im_buf, &out_buf, n)?;
     Ok(out_buf.to_f32_vec())
 }
 
 /// Unpack an interleaved-complex host slice (length `2n`) into `(re_out,
 /// im_out)` host `Vec`s on the GPU. Each element `i` satisfies
-/// `re_out[i] = inter[2i]` and `im_out[i] = inter[2i+1]`. Mirrors the CPU
-/// gather in `fft_core` so M5b can keep the whole FFT pipeline on-device.
+/// `re_out[i] = inter[2i]` and `im_out[i] = inter[2i+1]`. Thin host-slice
+/// wrapper over [`unpack_buf`].
 pub fn dispatch_unpack(
     device: &MetalDevice,
     inter: &[f32],
@@ -687,14 +782,7 @@ pub fn dispatch_unpack(
     let in_buf = MetalBuffer::from_f32_slice(device, inter)?;
     let re_out_buf = device.new_buffer_zeroed(n * std::mem::size_of::<f32>())?;
     let im_out_buf = device.new_buffer_zeroed(n * std::mem::size_of::<f32>())?;
-    let n_buf = make_n_buf(device, n)?;
-
-    let lib = shared_library(device)?;
-    let pso = lib.pipeline("fft_unpack_interleaved_to_planar")?;
-    let mut queue = CommandQueue::new(device)?;
-    // One thread per sample; dispatch_1d handles threadgroup sizing at runtime.
-    queue.dispatch_1d(&pso, &[&in_buf, &re_out_buf, &im_out_buf, &n_buf], n)?;
-    queue.wait_until_complete()?;
+    unpack_buf(device, &in_buf, &re_out_buf, &im_out_buf, n)?;
     Ok((re_out_buf.to_f32_vec(), im_out_buf.to_f32_vec()))
 }
 

@@ -5,7 +5,8 @@
 
 use polars_metal_buffer::MetalDevice;
 use polars_metal_kernels::fft::{
-    dft_reference, dispatch_pack_complex, dispatch_pack_real, dispatch_unpack, fft_gpu, l2_rel_err,
+    dft_reference, dispatch_pack_complex, dispatch_pack_real, dispatch_unpack, fft_gpu,
+    fft_gpu_planar, l2_rel_err,
 };
 
 fn interleaved_signal(n: usize, seed: u64) -> Vec<f32> {
@@ -321,6 +322,62 @@ fn bluestein_prime_matches_dft_and_roundtrips() {
         "n={n} roundtrip L2 {}",
         l2_rel_err(&back, &sig)
     );
+}
+
+// ---------------------------------------------------------------------------
+// M5b-2: on-device planar pipeline (pack -> fft_gpu_buf -> unpack)
+// ---------------------------------------------------------------------------
+
+/// `fft_gpu_planar` (GPU pack -> fft_gpu_buf -> GPU unpack) must produce the
+/// SAME result as the host path (CPU interleave + `fft_gpu` + CPU split), for
+/// real input across several sizes including large pow2.
+#[test]
+fn fft_gpu_planar_matches_host_path() {
+    let device = MetalDevice::system_default().expect("device");
+    for &n in &[16i64, 1024, 4096, 65536] {
+        let re: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.1).sin()).collect();
+        // host reference: interleave, fft_gpu, split
+        let mut inter = vec![0.0f32; 2 * n as usize];
+        for i in 0..n as usize {
+            inter[2 * i] = re[i];
+        }
+        let host = fft_gpu(&device, &inter, n, false).expect("fft_gpu host");
+        let (ro, io) = fft_gpu_planar(&device, &re, None, n, false).expect("fft_gpu_planar");
+        for i in 0..n as usize {
+            assert!((ro[i] - host[2 * i]).abs() < 1e-3, "re[{i}] n={n}");
+            assert!((io[i] - host[2 * i + 1]).abs() < 1e-3, "im[{i}] n={n}");
+        }
+    }
+}
+
+/// `fft_gpu_planar` complex input + inverse must match the host path.
+#[test]
+fn fft_gpu_planar_complex_and_inverse_match_host_path() {
+    let device = MetalDevice::system_default().expect("device");
+    for &n in &[16i64, 1024, 4096, 65536] {
+        let re: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.1).sin()).collect();
+        let im: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.07).cos()).collect();
+        for &inverse in &[false, true] {
+            let mut inter = vec![0.0f32; 2 * n as usize];
+            for i in 0..n as usize {
+                inter[2 * i] = re[i];
+                inter[2 * i + 1] = im[i];
+            }
+            let host = fft_gpu(&device, &inter, n, inverse).expect("fft_gpu host");
+            let (ro, io) =
+                fft_gpu_planar(&device, &re, Some(&im), n, inverse).expect("fft_gpu_planar");
+            for i in 0..n as usize {
+                assert!(
+                    (ro[i] - host[2 * i]).abs() < 1e-3,
+                    "re[{i}] n={n} inv={inverse}"
+                );
+                assert!(
+                    (io[i] - host[2 * i + 1]).abs() < 1e-3,
+                    "im[{i}] n={n} inv={inverse}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
