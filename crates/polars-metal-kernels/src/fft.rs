@@ -317,14 +317,17 @@ fn fft_recursive_fourstep(
     debug_assert_eq!((n & (n - 1)), 0, "fft_recursive_fourstep requires pow2 n");
     let ntot = n as usize;
 
-    // Stage the (optionally conjugated) input into the data buffer.
-    let mut staged = input.to_vec();
-    if inverse {
+    // Stage into the data buffer. Forward: no clone — from_f32_slice copies into
+    // Metal memory anyway. Inverse: clone to conjugate (input is borrowed).
+    let mut data_buf = if inverse {
+        let mut staged = input.to_vec();
         for c in staged.chunks_exact_mut(2) {
             c[1] = -c[1];
         }
-    }
-    let mut data_buf = MetalBuffer::from_f32_slice(device, &staged)?;
+        MetalBuffer::from_f32_slice(device, &staged)?
+    } else {
+        MetalBuffer::from_f32_slice(device, input)?
+    };
     let mut scratch_buf = device.new_buffer_zeroed(2 * ntot * std::mem::size_of::<f32>())?;
 
     let lib = shared_library(device)?;
