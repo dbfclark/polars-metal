@@ -17,7 +17,7 @@ def test_capture_assigns_unique_handles_and_stores_corpus():
     h1 = vns._capture_corpus(corpus, "emb", k=5, metric="cosine")
     h2 = vns._capture_corpus(corpus, "emb", k=5, metric="cosine")
     assert h1 != h2
-    spec = vns._peek_capture(h1)  # non-destructive peek for the test
+    spec = vns.get_capture(h1)  # non-removing read
     assert spec.corpus_col == "emb"
     assert spec.k == 5 and spec.metric == "cosine"
 
@@ -272,4 +272,29 @@ def test_vector_null_query_row_raises():
     with pytest.raises(ValueError, match="null"):
         qdf.lazy().with_columns(pl.col("emb").metal.cosine_topk(corpus, k=1).alias("hits")).collect(
             engine=MetalEngine()
+        )
+
+
+def test_vector_repeated_collect_same_lf():
+    """Collecting the SAME lf twice must not raise and both results must match."""
+    from polars_metal import MetalEngine
+
+    rng = np.random.default_rng(7)
+    D = 8
+    Q = 4
+    N = 20
+    qv = rng.standard_normal((Q, D)).astype(np.float32) + 0.1
+    cv = rng.standard_normal((N, D)).astype(np.float32) + 0.1
+    corpus = pl.DataFrame({"emb": list(cv)}, schema={"emb": pl.Array(pl.Float32, D)}).lazy()
+    qframe = pl.DataFrame({"emb": list(qv)}, schema={"emb": pl.Array(pl.Float32, D)})
+    lf = qframe.lazy().with_columns(pl.col("emb").metal.cosine_topk(corpus, k=3).alias("hits"))
+    out1 = lf.collect(engine=MetalEngine())
+    out2 = lf.collect(engine=MetalEngine())  # must NOT raise; must match
+    assert out1.shape == out2.shape
+    for qi in range(Q):
+        assert list(out1["hits"][qi]["indices"]) == list(out2["hits"][qi]["indices"])
+        np.testing.assert_allclose(
+            list(out1["hits"][qi]["scores"]),
+            list(out2["hits"][qi]["scores"]),
+            atol=1e-5,
         )

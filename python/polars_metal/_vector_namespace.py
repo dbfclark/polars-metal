@@ -10,7 +10,8 @@ These return a *sentinel* expression that:
   - is recognized + dispatched to the GPU by collect(engine="metal").
 
 The corpus (a LazyFrame / DataFrame / numpy array) is held by-reference in a module-global
-dict keyed by the handle-id, with pop-on-consume eviction at dispatch (mirrors M5 rolling).
+dict keyed by the handle-id; the dispatcher reads it non-removingly and ties eviction to the
+collected lf's lifetime via weakref.finalize (so a repeated collect of the same lf reuses it).
 """
 
 from __future__ import annotations
@@ -35,10 +36,11 @@ class CorpusSpec:
     query_col: str
 
 
-# Handle-id → corpus spec, held BY-REFERENCE. Entries are evicted by pop_capture()
-# at dispatch (pop-on-consume, mirroring M5). NOTE: a captured expr that is built but
-# never collected under engine="metal" leaks its entry (and the corpus it references)
-# until process exit — inherent to the by-reference design; acceptable for the MVP.
+# Handle-id → corpus spec, held BY-REFERENCE. Read non-removingly at dispatch
+# (get_capture) and evicted when the collected lf is GC'd (weakref.finalize →
+# evict_capture). NOTE: a captured expr that is built but never collected under
+# engine="metal" leaks its entry (and the corpus it references) until process exit —
+# inherent to the by-reference design; acceptable for the MVP.
 _CORPUS_CACHE: dict[int, CorpusSpec] = {}
 
 # Magic prefix embedded in the sentinel's Int64-literal field alias so the
@@ -52,12 +54,20 @@ def _capture_corpus(corpus: Any, corpus_col: str, k: int, metric: str, query_col
     return handle
 
 
-def _peek_capture(handle: int) -> CorpusSpec:
-    return _CORPUS_CACHE[handle]
+def get_capture(handle: int) -> CorpusSpec | None:
+    """Non-removing read (repeated collect of the same lf reuses the corpus spec;
+    the dispatcher ties eviction to the lf lifetime via weakref.finalize)."""
+    return _CORPUS_CACHE.get(handle)
 
 
 def pop_capture(handle: int) -> CorpusSpec | None:
     return _CORPUS_CACHE.pop(handle, None)
+
+
+def evict_capture(handle: int) -> None:
+    """Remove the spec for *handle* from the cache. Registered as a weakref
+    finalizer on the dispatched LazyFrame so the entry is freed on lf GC."""
+    _CORPUS_CACHE.pop(handle, None)
 
 
 def _raise_cpu(_s: pl.Series) -> pl.Series:

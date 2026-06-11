@@ -10,12 +10,14 @@ Collect-and-stitch over whole, materialized columns (chunk-safe), mirroring _rol
 
 from __future__ import annotations
 
+import weakref
+
 import numpy as np
 import polars as pl
 
 from polars_metal import _native
 from polars_metal._vector_detect import VectorBinding
-from polars_metal._vector_namespace import pop_capture
+from polars_metal._vector_namespace import evict_capture, get_capture
 
 _OP_CODE = {"cosine": 0, "knn": 1}
 _TILE_ROWS_DEFAULT = 1 << 30  # effectively no tiling unless the corpus is enormous
@@ -75,7 +77,7 @@ def _build_struct(
 
 
 def _run_binding(qframe: pl.DataFrame, b: VectorBinding) -> pl.Series:
-    spec = pop_capture(b.handle)
+    spec = get_capture(b.handle)
     if spec is None:
         raise RuntimeError("polars_metal: vector-search corpus handle missing (already consumed?)")
     qmat, q_rows, qd = _array_col_to_matrix(qframe.get_column(b.query_col).rechunk())
@@ -120,6 +122,11 @@ def apply_vector_search(
     """
     out_names = [b.out_name for b in bindings]
     order = lf.collect_schema().names()
+    # Tie spec eviction to the lf lifetime (repeated collects of the same lf
+    # reuse the spec; it is freed when the lf is GC'd). Registering twice is
+    # harmless — both do an idempotent dict.pop.
+    for b in bindings:
+        weakref.finalize(lf, evict_capture, b.handle)
     rest_lf = lf.drop(out_names)
     df = collect_fn(rest_lf)
     cols: dict[str, pl.Series] = {c: df.get_column(c) for c in df.columns}

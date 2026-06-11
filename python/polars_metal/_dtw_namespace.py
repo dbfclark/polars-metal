@@ -40,6 +40,19 @@ def pop_capture(handle: int) -> DtwSpec | None:
     return _DTW_CACHE.pop(handle, None)
 
 
+def get_capture(handle: int) -> DtwSpec | None:
+    """Non-removing read. The dispatcher ties eviction to the lf lifetime via
+    weakref.finalize so repeated collects of the same lf reuse the spec, and
+    it is freed when the lf is GC'd."""
+    return _DTW_CACHE.get(handle)
+
+
+def evict_capture(handle: int) -> None:
+    """Remove the spec for *handle* from the cache. Registered as a weakref
+    finalizer on the dispatched LazyFrame so the entry is freed on lf GC."""
+    _DTW_CACHE.pop(handle, None)
+
+
 def _raise_cpu(_s: pl.Series) -> pl.Series:
     raise RuntimeError(
         "polars_metal: .metal.dtw requires collect(engine='metal'); "

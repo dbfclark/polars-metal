@@ -10,12 +10,14 @@ Collect-and-stitch over whole materialized columns (mirrors _vector_dispatch):
 
 from __future__ import annotations
 
+import weakref
+
 import numpy as np
 import polars as pl
 
 from polars_metal import _native
 from polars_metal._dtw_detect import DtwBinding
-from polars_metal._dtw_namespace import DtwSpec, pop_capture
+from polars_metal._dtw_namespace import DtwSpec, evict_capture, get_capture
 
 MAX_L = 1024  # keep in sync with crates/polars-metal-kernels/src/dtw.rs
 
@@ -60,7 +62,7 @@ def _seq_matrix(s: pl.Series) -> tuple[np.ndarray, int, int]:
 
 
 def _run_binding(frame: pl.DataFrame, b: DtwBinding) -> pl.Series:
-    spec: DtwSpec | None = pop_capture(b.handle)
+    spec: DtwSpec | None = get_capture(b.handle)
     if spec is None:
         raise RuntimeError("polars_metal: dtw spec handle missing (already consumed?)")
     s = frame.get_column(b.query_col).rechunk()
@@ -120,6 +122,11 @@ def _run_binding(frame: pl.DataFrame, b: DtwBinding) -> pl.Series:
 def apply_dtw(lf: pl.LazyFrame, bindings: list[DtwBinding], collect_fn) -> pl.DataFrame:
     out_names = [b.out_name for b in bindings]
     order = lf.collect_schema().names()
+    # Tie spec eviction to the lf lifetime (repeated collects of the same lf
+    # reuse the spec; it is freed when the lf is GC'd). Registering twice is
+    # harmless — both do an idempotent dict.pop.
+    for b in bindings:
+        weakref.finalize(lf, evict_capture, b.handle)
     rest_lf = lf.drop(out_names)
     df = collect_fn(rest_lf)
     cols: dict[str, pl.Series] = {c: df.get_column(c) for c in df.columns}

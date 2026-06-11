@@ -119,3 +119,32 @@ def test_corr_streaming_raises_clear_error():
     df = _frame(n=1000, p=10)
     with pytest.raises(pl.exceptions.ComputeError, match="streaming"):
         df.lazy().metal.corr().collect(engine=pm.MetalEngine(), streaming=True)
+
+
+def test_corr_repeated_collect_same_lf():
+    """Collecting the SAME lf twice must not raise and both results must match."""
+    df = _frame(n=3000, p=12, seed=11)
+    lf = df.lazy().metal.corr()
+    out1 = lf.collect(engine=pm.MetalEngine())
+    out2 = lf.collect(engine=pm.MetalEngine())  # must NOT raise; must match
+    np.testing.assert_allclose(out1.to_numpy(), out2.to_numpy(), atol=1e-5, equal_nan=True)
+
+
+def test_corr_spec_evicted_on_lf_gc():
+    """After lf is GC'd the spec must be evicted from _CORR_CACHE."""
+    import gc
+
+    from polars_metal._corr_detect import find_corr_bindings
+    from polars_metal._corr_namespace import _CORR_CACHE
+
+    df = _frame(n=2000, p=10, seed=12)
+    lf = df.lazy().metal.corr()
+    bindings = find_corr_bindings(lf)
+    assert len(bindings) == 1
+    handle = bindings[0].handle
+    # Trigger collect so the weakref.finalize is registered
+    lf.collect(engine=pm.MetalEngine())
+    assert handle in _CORR_CACHE  # still alive — lf still referenced
+    del lf
+    gc.collect()
+    assert handle not in _CORR_CACHE  # evicted after lf is GC'd

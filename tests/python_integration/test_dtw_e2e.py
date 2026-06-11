@@ -117,3 +117,20 @@ def test_ragged_list_cpu_fallback_computes():
     )
     exp = np.array([_dtw.distance(np.array(s), r) for s in seqs])
     np.testing.assert_allclose(got, exp, atol=1e-3, rtol=1e-3)
+
+
+def test_dtw_repeated_collect_same_lf():
+    """Collecting the SAME lf twice must not raise and both results must match."""
+    eng = polars_metal.MetalEngine()
+    rng = np.random.default_rng(42)
+    L = 16
+    r = rng.standard_normal(L).astype(np.float32)
+    Q = rng.standard_normal((10, L)).astype(np.float32)
+    lf = _frame(Q).lazy().with_columns(pl.col("seq").metal.dtw(r).alias("d"))
+    out1 = lf.collect(engine=eng)
+    out2 = lf.collect(engine=eng)  # must NOT raise; must match
+    np.testing.assert_allclose(
+        out1.get_column("d").to_numpy(),
+        out2.get_column("d").to_numpy(),
+        atol=1e-5,
+    )
