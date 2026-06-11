@@ -331,6 +331,21 @@ def _patch_gpu_engine_callback() -> None:
                     return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
 
                 return _dt_dispatch.apply_dt(self, dt_bindings, _collect_rest_dt)
+            # M6 corr: serialize-detected lf.metal.corr() runs the MLX corr
+            # subgraph and REPLACES the frame with the pxp matrix (frame-
+            # replacing, unlike the column-stitch verbs above). Own patch/cache.
+            from polars_metal import _corr_detect, _corr_dispatch
+
+            corr_bindings = [] if streaming else _corr_detect.find_corr_bindings(self)
+            if corr_bindings:
+
+                def _collect_rest_corr(rest_lf: Any) -> Any:
+                    return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
+
+                # apply_corr takes a SINGLE binding (not the list the sibling
+                # verbs pass): corr is frame-replacing, so at most one sentinel
+                # per lf is meaningful — pass the first directly.
+                return _corr_dispatch.apply_corr(self, corr_bindings[0], _collect_rest_corr)
             # post_opt_callback is an internal bypass that injects a callback
             # directly, skipping _gpu_engine_callback. We run the query on
             # the CPU engine; in M0 our callback falls through, so the result

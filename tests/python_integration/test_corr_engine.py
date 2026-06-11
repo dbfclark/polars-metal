@@ -2,7 +2,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-import polars_metal  # noqa: F401  (registers namespace + patches collect)
+import polars_metal as pm  # registers namespace + patches collect
 
 
 def _frame(n=2000, p=10, seed=0):
@@ -44,3 +44,13 @@ def test_apply_corr_matches_numpy_gpu_path():
     assert out.columns == [f"c{i}" for i in range(12)]
     expected = np.corrcoef(df.to_numpy().T).astype(np.float32)
     np.testing.assert_allclose(out.to_numpy(), expected, atol=1e-4)
+
+
+def test_metal_corr_end_to_end():
+    df = _frame(n=5000, p=16, seed=2)
+    out = df.lazy().metal.corr().collect(engine=pm.MetalEngine())
+    assert out.shape == (16, 16)
+    assert all(dt == pl.Float32 for dt in out.dtypes)
+    expected = df.corr().cast(pl.Float32)
+    np.testing.assert_allclose(out.to_numpy(), expected.to_numpy(), atol=1e-4)
+    assert out.columns == expected.columns
