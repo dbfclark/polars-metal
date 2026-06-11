@@ -7,6 +7,7 @@ import inspect
 from functools import partial, wraps
 from typing import Any
 
+import polars as pl
 import polars.lazyframe.frame as _plf
 
 from polars_metal import (
@@ -274,6 +275,29 @@ def _patch_gpu_engine_callback() -> None:
             from polars_metal import _rolling_detect, _rolling_dispatch
 
             streaming = bool(kwargs.get("streaming") or kwargs.get("new_streaming"))
+            if streaming:
+                import warnings as _w
+
+                from polars_metal._corr_namespace import CORR_SENTINEL_TAG
+                from polars_metal._dtw_namespace import DTW_SENTINEL_TAG
+                from polars_metal._fft_namespace import FFT_SENTINEL_TAG
+                from polars_metal._vector_namespace import SENTINEL_TAG as VSEARCH_SENTINEL_TAG
+
+                with _w.catch_warnings():
+                    _w.simplefilter("ignore")
+                    _plan_txt = self.explain()
+                _SENTINEL_TAGS = (
+                    VSEARCH_SENTINEL_TAG,
+                    FFT_SENTINEL_TAG,
+                    DTW_SENTINEL_TAG,
+                    CORR_SENTINEL_TAG,
+                )
+                if any(t in _plan_txt for t in _SENTINEL_TAGS):
+                    raise pl.exceptions.ComputeError(
+                        "polars_metal: the .metal vector/fft/dtw/corr verbs do not support "
+                        "streaming=True (they have no CPU implementation). Collect without "
+                        "streaming, or use a CPU equivalent."
+                    )
             rolling_bindings = [] if streaming else _rolling_detect.find_rolling_bindings(self)
             if rolling_bindings:
 

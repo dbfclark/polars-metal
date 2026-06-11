@@ -113,3 +113,9 @@ def test_corr_single_row_raises_clear_error():
     df = pl.DataFrame({f"c{i}": [1.0] for i in range(10)})  # N=1
     with pytest.raises(pl.exceptions.ComputeError, match="at least 2 rows"):
         df.lazy().metal.corr().collect(engine=pm.MetalEngine())
+
+
+def test_corr_streaming_raises_clear_error():
+    df = _frame(n=1000, p=10)
+    with pytest.raises(pl.exceptions.ComputeError, match="streaming"):
+        df.lazy().metal.corr().collect(engine=pm.MetalEngine(), streaming=True)
