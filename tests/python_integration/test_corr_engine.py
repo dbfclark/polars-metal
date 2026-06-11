@@ -16,3 +16,13 @@ def test_corr_sentinel_raises_on_plain_cpu():
     lf = _frame().lazy().metal.corr()
     with pytest.raises(RuntimeError):
         lf.collect()
+
+
+def test_corr_detect_finds_binding():
+    from polars_metal import _corr_detect
+
+    lf = _frame(p=4).lazy().metal.corr()
+    bindings = _corr_detect.find_corr_bindings(lf)
+    assert len(bindings) == 1
+    assert bindings[0].out_name  # the sentinel column name
+    assert isinstance(bindings[0].handle, int)
