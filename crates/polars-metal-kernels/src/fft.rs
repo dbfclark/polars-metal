@@ -221,7 +221,16 @@ pub fn fft_gpu_planar_core(
         return Err(FftError::Unsupported(n));
     }
     if n > FFT_BASE_MAX {
-        // Larger pow2 routes to the planar four-step path (M5c-2); not yet here.
+        // Larger pow2 routes to the planar recursive four-step path (M5c-2),
+        // mirroring fft_gpu_buf's large-pow2 branch. The 2^30 cap guards the
+        // u32 kernel scalars (batch*len == n) and the i32 twiddle index i*j.
+        if (n & (n - 1)) == 0 {
+            if n > (1 << 30) {
+                return Err(FftError::Unsupported(n));
+            }
+            return fft_recursive_fourstep_planar(device, re_in, im_in, re_out, im_out, n, inverse);
+        }
+        // Non-smooth large n → planar Bluestein (M5c-3); not yet here.
         return Err(FftError::Unsupported(n));
     }
     if (n & (n - 1)) != 0 && factorize(n).is_none() {
@@ -666,6 +675,198 @@ fn fft_pass(
     let count_buf = device.new_buffer_from_bytes(&((batch * len) as u32).to_le_bytes())?;
     let copy_pso = lib.pipeline("fft_copy")?;
     queue.dispatch_1d(&copy_pso, &[scratch, data, &count_buf], batch * len)?;
+    queue.wait_until_complete()?;
+
+    Ok(())
+}
+
+/// PLANAR (SoA) twin of [`fft_recursive_fourstep_buf`] for power-of-two
+/// `n > FFT_BASE_MAX`. Separate re/im input planes (`re_in`/`im_in`, each `n`
+/// f32) → separate re/im output planes (`re_out`/`im_out`, each `n` f32) — no
+/// interleaving. Mirrors the interleaved driver exactly, with every buffer
+/// doubled (data → data_re/data_im, scratch → scratch_re/scratch_im).
+///
+/// Input staging into the out planes (which double as the in-place `data`
+/// planes for [`fft_pass_planar`]):
+/// - Forward: byte-copy `re_in` → `re_out` and `im_in` → `im_out`.
+/// - Inverse: `ifft(x) = conj(fft(conj(x)))/N`. PLANAR conjugation is just
+///   negating the WHOLE im plane (no stride, unlike interleaved's every-other
+///   element): copy `re_in` → `re_out` as-is, and stage the negated `im_in`
+///   into `im_out`. After the forward recursion, conjugate + scale by `1/N` in
+///   place — `re_out *= 1/N`, `im_out = -im_out/N` — on the backing stores.
+///
+/// Scratch planes are length `n` (`n` f32 each), NOT `2n` — that's the planar
+/// saving vs the interleaved `2n` scratch.
+fn fft_recursive_fourstep_planar(
+    device: &MetalDevice,
+    re_in: &MetalBuffer,
+    im_in: &MetalBuffer,
+    re_out: &MetalBuffer,
+    im_out: &MetalBuffer,
+    n: i64,
+    inverse: bool,
+) -> Result<(), FftError> {
+    debug_assert_eq!(
+        (n & (n - 1)),
+        0,
+        "fft_recursive_fourstep_planar requires pow2 n"
+    );
+    let ntot = n as usize;
+
+    // Seed the out planes (which double as the in-place data planes). Forward:
+    // byte-copy both planes as-is. Inverse: copy re as-is, stage negated im.
+    if inverse {
+        copy_buf_into(re_out, re_in);
+        let mut staged_im = im_in.to_f32_vec();
+        for v in staged_im.iter_mut() {
+            *v = -*v;
+        }
+        write_f32_into(im_out, &staged_im);
+    } else {
+        copy_buf_into(re_out, re_in);
+        copy_buf_into(im_out, im_in);
+    }
+
+    let mut data_re = re_out.shallow_clone();
+    let mut data_im = im_out.shallow_clone();
+    let mut scratch_re = device.new_buffer_zeroed(ntot * std::mem::size_of::<f32>())?;
+    let mut scratch_im = device.new_buffer_zeroed(ntot * std::mem::size_of::<f32>())?;
+
+    let lib = shared_library(device)?;
+    let mut queue = CommandQueue::new(device)?;
+
+    fft_pass_planar(
+        lib,
+        &mut queue,
+        device,
+        &mut data_re,
+        &mut data_im,
+        &mut scratch_re,
+        &mut scratch_im,
+        ntot,
+        1,
+        0,
+    )?;
+
+    if inverse {
+        // ifft = conj(fft(conj(x)))/N: conjugate + scale by 1/N in place on the
+        // out planes' backing stores. The pass has completed (fft_pass_planar's
+        // last stage waits), so no GPU work is in-flight against the out planes.
+        let scale = 1.0f32 / n as f32;
+        let mut ro = re_out.to_f32_vec();
+        for v in ro.iter_mut() {
+            *v *= scale;
+        }
+        write_f32_into(re_out, &ro);
+        let mut io = im_out.to_f32_vec();
+        for v in io.iter_mut() {
+            *v = -*v * scale;
+        }
+        write_f32_into(im_out, &io);
+    }
+    Ok(())
+}
+
+/// PLANAR twin of [`fft_pass`]: forward-only recursive batched four-step over
+/// `batch` contiguous signals, each length `len` (pow2), packed back-to-back in
+/// the `data_re`/`data_im` planes (signal `s` occupies `[s*len .. (s+1)*len]` in
+/// each plane). Result is written in place into the data planes.
+///
+/// Mirrors [`fft_pass`] dispatch-for-dispatch, threading BOTH data planes and
+/// BOTH scratch planes through the recursion (the planar kernels split each
+/// interleaved float2 buffer into its re/im planes). Same per-pass
+/// `wait_until_complete` (passes are data-dependent) and same
+/// `FFT_MAX_RECURSION_DEPTH` guard.
+#[allow(clippy::too_many_arguments)]
+fn fft_pass_planar(
+    lib: &crate::shader_lib::ShaderLibrary,
+    queue: &mut CommandQueue,
+    device: &MetalDevice,
+    data_re: &mut MetalBuffer,
+    data_im: &mut MetalBuffer,
+    scratch_re: &mut MetalBuffer,
+    scratch_im: &mut MetalBuffer,
+    len: usize,
+    batch: usize,
+    depth: u32,
+) -> Result<(), FftError> {
+    if depth > FFT_MAX_RECURSION_DEPTH {
+        return Err(FftError::Unsupported(len as i64));
+    }
+
+    if len as i64 <= FFT_BASE_MAX {
+        // Base case: one threadgroup per signal, contiguous length-len Stockham.
+        let len_buf = device.new_buffer_from_bytes(&(len as u32).to_le_bytes())?;
+        let pso = lib.pipeline("fft_stockham_pow2_batched_planar")?;
+        queue.dispatch_1d_with_tg(&pso, &[data_re, data_im, &len_buf], batch * len, len)?;
+        queue.wait_until_complete()?;
+        return Ok(());
+    }
+
+    // Four-step: l1 = FFT_BASE_MAX (= 2^10), l2 = len / l1 (pow2, >= 2).
+    let l1 = FFT_BASE_MAX as usize;
+    let l2 = len / l1;
+    debug_assert_eq!(l1 * l2, len, "l1*l2 must equal len");
+    debug_assert!(l2 >= 2, "l2 must be >= 2 (len > FFT_BASE_MAX)");
+
+    let l1_buf = device.new_buffer_from_bytes(&(l1 as u32).to_le_bytes())?;
+    let l2_buf = device.new_buffer_from_bytes(&(l2 as u32).to_le_bytes())?;
+    let len_buf = device.new_buffer_from_bytes(&(len as u32).to_le_bytes())?;
+    let batch_buf = device.new_buffer_from_bytes(&(batch as u32).to_le_bytes())?;
+
+    // Pass 1: column FFTs — batch*l2 threadgroups, width l1 (<= FFT_BASE_MAX).
+    let cols_pso = lib.pipeline("fft_fourstep_cols_planar")?;
+    queue.dispatch_1d_with_tg(
+        &cols_pso,
+        &[data_re, data_im, &l1_buf, &l2_buf, &batch_buf],
+        batch * l2 * l1,
+        l1,
+    )?;
+    queue.wait_until_complete()?;
+
+    // Pass 2: cross-twiddle over all batch*len elements (modulus = len).
+    let tw_pso = lib.pipeline("fft_twiddle_mul_planar")?;
+    queue.dispatch_1d(
+        &tw_pso,
+        &[data_re, data_im, &l2_buf, &len_buf, &batch_buf],
+        batch * len,
+    )?;
+    queue.wait_until_complete()?;
+
+    // Pass 3: row FFTs — RECURSE. The l1 contiguous rows of length l2 across all
+    // batch signals are batch*l1 contiguous length-l2 signals at data[0].
+    fft_pass_planar(
+        lib,
+        queue,
+        device,
+        data_re,
+        data_im,
+        scratch_re,
+        scratch_im,
+        l2,
+        batch * l1,
+        depth + 1,
+    )?;
+
+    // Pass 4: per-signal transpose l1 x l2 -> l2 x l1 into scratch planes, then
+    // copy scratch -> data. Transpose is NOT in-place, hence the separate planes.
+    let tr_pso = lib.pipeline("fft_transpose_planar")?;
+    queue.dispatch_1d(
+        &tr_pso,
+        &[
+            data_re, data_im, scratch_re, scratch_im, &l1_buf, &l2_buf, &batch_buf,
+        ],
+        batch * len,
+    )?;
+    queue.wait_until_complete()?;
+
+    let count_buf = device.new_buffer_from_bytes(&((batch * len) as u32).to_le_bytes())?;
+    let copy_pso = lib.pipeline("fft_copy_planar")?;
+    queue.dispatch_1d(
+        &copy_pso,
+        &[scratch_re, scratch_im, data_re, data_im, &count_buf],
+        batch * len,
+    )?;
     queue.wait_until_complete()?;
 
     Ok(())

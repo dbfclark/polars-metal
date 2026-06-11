@@ -9,6 +9,43 @@ use polars_metal_kernels::fft::{
     fft_gpu_planar, fft_gpu_planar_core, l2_rel_err,
 };
 
+/// The PLANAR four-step path (`n > FFT_BASE_MAX`, pow2) must match the proven
+/// interleaved `fft_gpu`, including the recursive (2^21+) band that was once
+/// broken in MLX. COMPLEX input, forward + inverse. Compared via the crate's
+/// L2 relative error (per-element abs is noisy at large N).
+#[test]
+fn fft_planar_core_matches_interleaved_fourstep() {
+    let device = MetalDevice::system_default().expect("device");
+    for &n in &[2048i64, 4096, 1 << 13, 1 << 16, 1 << 20, 1 << 21, 1 << 22] {
+        for &inverse in &[false, true] {
+            let nn = n as usize;
+            let re: Vec<f32> = (0..nn).map(|i| ((i as f32) * 0.0013).sin()).collect();
+            let im: Vec<f32> = (0..nn).map(|i| ((i as f32) * 0.0007).cos() * 0.3).collect();
+            let mut inter = vec![0.0f32; 2 * nn];
+            for i in 0..nn {
+                inter[2 * i] = re[i];
+                inter[2 * i + 1] = im[i];
+            }
+            let ref_out = fft_gpu(&device, &inter, n, inverse).expect("fft_gpu");
+            let re_in = MetalBuffer::from_f32_slice(&device, &re).expect("re_in");
+            let im_in = MetalBuffer::from_f32_slice(&device, &im).expect("im_in");
+            let re_out = device.new_buffer_zeroed(nn * 4).expect("re_out");
+            let im_out = device.new_buffer_zeroed(nn * 4).expect("im_out");
+            fft_gpu_planar_core(&device, &re_in, &im_in, &re_out, &im_out, n, inverse)
+                .expect("planar core");
+            let ro = re_out.to_f32_vec();
+            let io = im_out.to_f32_vec();
+            let mut got = vec![0.0f32; 2 * nn];
+            for i in 0..nn {
+                got[2 * i] = ro[i];
+                got[2 * i + 1] = io[i];
+            }
+            let err = l2_rel_err(&got, &ref_out);
+            assert!(err < 1e-3, "n={n} inv={inverse} L2={err}");
+        }
+    }
+}
+
 fn interleaved_signal(n: usize, seed: u64) -> Vec<f32> {
     // deterministic pseudo-random complex signal, interleaved re,im
     let mut v = vec![0f32; 2 * n];

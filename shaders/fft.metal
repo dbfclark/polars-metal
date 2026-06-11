@@ -171,6 +171,143 @@ kernel void fft_copy(
     }
 }
 
+// ============ PLANAR (SoA) four-step kernels (M5c-2) ============
+// One-for-one planar twins of the interleaved four-step kernels above. The
+// index math (base, stride, transpose location, twiddle modulus) is IDENTICAL
+// to the interleaved versions — the ONLY change is the global (device) buffer
+// I/O: separate re/im planes instead of one interleaved float2 buffer. The
+// internal threadgroup `float2` working buffers and the (shared, UNCHANGED)
+// `stockham_pow2_tg` helper are byte-for-byte the same. The Rust four-step
+// driver (`fft_pass_planar` in fft.rs) threads both re/im data planes and both
+// re/im scratch planes through the recursion; a differential test verifies the
+// planar core matches the interleaved `fft_gpu` to L2 < 1e-3.
+
+// PLANAR batched base case. Mirrors fft_stockham_pow2_batched: one threadgroup
+// per signal s = tgid, contiguous length-`len` forward Stockham. The cooperative
+// load reads data_re[base+i]/data_im[base+i] into a float2; the store splits the
+// result back. Buffers: data_re=0, data_im=1, len=2.
+kernel void fft_stockham_pow2_batched_planar(
+    device float*   data_re [[buffer(0)]],
+    device float*   data_im [[buffer(1)]],
+    constant uint&  len     [[buffer(2)]],
+    uint tgid              [[threadgroup_position_in_grid]],
+    uint tid              [[thread_position_in_threadgroup]],
+    uint tg_size          [[threads_per_threadgroup]]) {
+    threadgroup float2 a[FFT_BASE_MAX];
+    threadgroup float2 b[FFT_BASE_MAX];
+    uint base = tgid * len;  // signal s = tgid
+    for (uint i = tid; i < len; i += tg_size) {
+        a[i] = float2(data_re[base + i], data_im[base + i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    stockham_pow2_tg(a, b, len, tid, tg_size);
+    for (uint i = tid; i < len; i += tg_size) {
+        data_re[base + i] = a[i].x;
+        data_im[base + i] = a[i].y;
+    }
+}
+
+// PLANAR column FFTs. Mirrors fft_fourstep_cols: one threadgroup per (signal s,
+// column c), tgid = s*l2 + c; loads the l1 elements at base s*len + c, stride l2,
+// runs a forward length-l1 Stockham, writes back strided. The strided load reads
+// data_re[base+i*l2]/data_im[base+i*l2] into a float2; the store splits back.
+// Buffers: data_re=0, data_im=1, l1=2, l2=3, batch=4.
+kernel void fft_fourstep_cols_planar(
+    device float*   data_re [[buffer(0)]],
+    device float*   data_im [[buffer(1)]],
+    constant uint&  l1      [[buffer(2)]],
+    constant uint&  l2      [[buffer(3)]],
+    constant uint&  batch   [[buffer(4)]],
+    uint tgid             [[threadgroup_position_in_grid]],
+    uint tid             [[thread_position_in_threadgroup]],
+    uint tg_size         [[threads_per_threadgroup]]) {
+    (void)batch;  // unused: signal index is tgid/l2; arg kept for uniform binding layout
+    threadgroup float2 a[FFT_BASE_MAX];
+    threadgroup float2 b[FFT_BASE_MAX];
+    uint s   = tgid / l2;       // signal index
+    uint col = tgid % l2;       // column index in [0, l2)
+    uint base = s * (l1 * l2) + col;
+    for (uint i = tid; i < l1; i += tg_size) {
+        a[i] = float2(data_re[base + i * l2], data_im[base + i * l2]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    stockham_pow2_tg(a, b, l1, tid, tg_size);
+    for (uint i = tid; i < l1; i += tg_size) {
+        data_re[base + i * l2] = a[i].x;
+        data_im[base + i * l2] = a[i].y;
+    }
+}
+
+// PLANAR cross-twiddle. Mirrors fft_twiddle_mul: in-place read-modify-write,
+// data[idx] *= W_len^{i*j} (forward sign, modulus = len of the CURRENT
+// sub-signal). Reads the planar pair into a float2, multiplies, splits back.
+// Buffers: data_re=0, data_im=1, l2=2, len=3, batch=4.
+kernel void fft_twiddle_mul_planar(
+    device float*   data_re [[buffer(0)]],
+    device float*   data_im [[buffer(1)]],
+    constant uint&  l2      [[buffer(2)]],
+    constant uint&  len     [[buffer(3)]],
+    constant uint&  batch   [[buffer(4)]],
+    uint gid              [[thread_position_in_grid]],
+    uint grid_size        [[threads_per_grid]]) {
+    uint total = batch * len;
+    for (uint idx = gid; idx < total; idx += grid_size) {
+        uint loc = idx % len;
+        uint i = loc / l2;
+        uint j = loc % l2;
+        float2 v = float2(data_re[idx], data_im[idx]);
+        v = cmul(v, twiddle(int(i * j), int(len), false));
+        data_re[idx] = v.x;
+        data_im[idx] = v.y;
+    }
+}
+
+// PLANAR transpose. Mirrors fft_transpose: per signal s, l1 x l2 -> l2 x l1,
+//   out[s*len + j*l1 + i] = in[s*len + i*l2 + j]
+// applied to BOTH planes. One thread per source element, grid-strided over
+// batch*len. NOT in-place (out planes must differ from in planes). Buffers:
+// in_re=0, in_im=1, out_re=2, out_im=3, l1=4, l2=5, batch=6.
+kernel void fft_transpose_planar(
+    device const float* in_re  [[buffer(0)]],
+    device const float* in_im  [[buffer(1)]],
+    device float*       out_re [[buffer(2)]],
+    device float*       out_im [[buffer(3)]],
+    constant uint&      l1     [[buffer(4)]],
+    constant uint&      l2     [[buffer(5)]],
+    constant uint&      batch  [[buffer(6)]],
+    uint gid                   [[thread_position_in_grid]],
+    uint grid_size             [[threads_per_grid]]) {
+    uint len = l1 * l2;
+    uint total = batch * len;
+    for (uint idx = gid; idx < total; idx += grid_size) {
+        uint s   = idx / len;
+        uint loc = idx % len;
+        uint i = loc / l2;   // source row
+        uint j = loc % l2;   // source col
+        uint dst = s * len + j * l1 + i;
+        out_re[dst] = in_re[idx];
+        out_im[dst] = in_im[idx];
+    }
+}
+
+// PLANAR copy. Mirrors fft_copy: straight copy of `count` elements (in -> out),
+// grid-strided, applied to BOTH planes. Used to fold the transpose scratch
+// planes back into the data planes. Buffers: in_re=0, in_im=1, out_re=2,
+// out_im=3, count=4.
+kernel void fft_copy_planar(
+    device const float* in_re  [[buffer(0)]],
+    device const float* in_im  [[buffer(1)]],
+    device float*       out_re [[buffer(2)]],
+    device float*       out_im [[buffer(3)]],
+    constant uint&      count  [[buffer(4)]],
+    uint gid                   [[thread_position_in_grid]],
+    uint grid_size             [[threads_per_grid]]) {
+    for (uint idx = gid; idx < count; idx += grid_size) {
+        out_re[idx] = in_re[idx];
+        out_im[idx] = in_im[idx];
+    }
+}
+
 // One threadgroup transforms one length-n pow2 signal (n <= FFT_BASE_MAX),
 // iterative Stockham radix-2. Input/output interleaved float2 in global mem.
 // `n` and `inv` (0/1) are scalar buffers. tg memory holds 2 working buffers.
