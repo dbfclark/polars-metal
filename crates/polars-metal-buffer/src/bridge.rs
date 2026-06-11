@@ -280,6 +280,25 @@ impl MetalBuffer {
         &self.inner
     }
 
+    /// Make a second `MetalBuffer` handle onto the SAME underlying allocation
+    /// (refcount bump on the `Retained<MTLBuffer>`, no byte copy). Both handles
+    /// alias the identical backing store; mutations through one are visible
+    /// through the other. The keep-alives (`_owner`, `_view_parent`) are cloned
+    /// so the new handle is independently valid for the allocation's lifetime.
+    ///
+    /// Used where an API hands out a `&MetalBuffer` but a callee needs an owned
+    /// `&mut MetalBuffer` to drive in-place compute on it (e.g. the FFT
+    /// four-step recursion, which transforms its data buffer in place). Because
+    /// both handles point at one allocation, the callee's in-place result lands
+    /// in the caller's buffer with no blit.
+    pub fn shallow_clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            _owner: self._owner.clone(),
+            _view_parent: self._view_parent.clone(),
+        }
+    }
+
     /// Construct a view onto a sub-range of an existing `MetalBuffer`'s
     /// contents.
     ///

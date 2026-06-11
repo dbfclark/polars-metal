@@ -20,15 +20,14 @@ pub enum FftError {
 /// Cap on the base radix-2 Stockham kernel — matches `FFT_BASE_MAX` in
 /// `shaders/fft.metal`. 1024 complex points × 8 B × 2 ping-pong threadgroup
 /// buffers = 16 KB, safely under Apple Silicon's 32 KB threadgroup-memory
-/// limit. Sizes above this route through the four-step / Bluestein paths
-/// (later tasks); for now they return [`FftError::Unsupported`].
+/// limit. Sizes above this route through the four-step / Bluestein paths.
 pub const FFT_BASE_MAX: i64 = 1024;
 
 /// Decompose `n` into an ordered list of radices, each in `{2,3,4,5,6,7,8}`,
 /// whose product is `n`. Returns `None` if any prime factor `> 7` remains
 /// (such sizes route to Bluestein in a later task) or for `n <= 0`.
 ///
-/// True powers of two are handled by the dedicated radix-2 path in `fft_gpu`
+/// True powers of two are handled by the dedicated radix-2 path in `fft_gpu_buf`
 /// *before* `factorize` is called; `factorize` is used only for composite
 /// (non-pow2) `n`. Greedy largest-first over `{8,7,6,5,4,3,2}` is a perf
 /// preference for the radix factors it emits — any valid factorization
@@ -60,10 +59,11 @@ pub fn factorize(n: i64) -> Option<Vec<u32>> {
 /// (`[re,im,...]`, length `2*n`). Returns the transform interleaved, length
 /// `2*n`. `inverse` applies 1/N scaling.
 ///
-/// Phase 0 (this task): a single threadgroup cooperatively transforms one
-/// length-`n` pow2 signal via iterative Stockham radix-2 in threadgroup
-/// memory. Only `n` that is a power of two with `n <= FFT_BASE_MAX` is
-/// supported; everything else returns [`FftError::Unsupported`].
+/// Thin host-slice wrapper over [`fft_gpu_buf`]: stage `input` into a Metal
+/// buffer, run the buffer-level core (which routes among radix-2/mixed-radix,
+/// the four-step path, and Bluestein by size), and read the result back. All
+/// supported sizes (pow2, smooth composite, and non-smooth/prime via Bluestein)
+/// go through here; routing + the size caps live in [`fft_gpu_buf`].
 pub fn fft_gpu(
     device: &MetalDevice,
     input: &[f32],
@@ -74,11 +74,49 @@ pub fn fft_gpu(
     if n <= 0 {
         return Err(FftError::Unsupported(n));
     }
+    // Thin host-slice wrapper over the buffer-in/buffer-out core: stage `input`
+    // into `in_buf`, allocate `out_buf`, transform, read back. All routing and
+    // validation lives in `fft_gpu_buf` so the GPU-resident pipeline (M5b-2) can
+    // reuse it without round-tripping through host slices.
+    let in_buf = MetalBuffer::from_f32_slice(device, input)?;
+    let out_buf = device.new_buffer_zeroed((2 * n as usize) * std::mem::size_of::<f32>())?;
+    fft_gpu_buf(device, &in_buf, &out_buf, n, inverse)?;
+    Ok(out_buf.to_f32_vec())
+}
+
+/// Buffer-in / buffer-out FFT core. `in_buf` holds the interleaved-complex input
+/// (`2n` f32) and the transform result lands in `out_buf` (`2n` f32). All FFT
+/// paths route through here; [`fft_gpu`] is a thin host-slice wrapper that stages
+/// `in_buf` and reads back `out_buf`.
+///
+/// Routing (identical to the former `fft_gpu`):
+/// - `n <= FFT_BASE_MAX`, pow2 or smooth: single-threadgroup radix-2 / mixed-radix
+///   Stockham dispatched directly into `out_buf`.
+/// - `n > FFT_BASE_MAX`, pow2: recursive batched four-step via
+///   [`fft_recursive_fourstep_buf`] (genuinely buffer-level, on-device).
+/// - non-smooth `n` (prime factor > 7): Bluestein. Bluestein's numerics stay
+///   host-internal (small-N, host-conjugation-heavy, ~zero on-device benefit);
+///   this routes through a host bridge — read `in_buf` → host, call the existing
+///   [`bluestein_dispatch`], memcpy its result Vec into `out_buf`. Only the API
+///   is buffer-level for this path.
+///
+/// `inverse` applies 1/N scaling. The 2^30 caps (kernel scalars / twiddle index
+/// are 32-bit) are enforced here, where the routing lives.
+pub fn fft_gpu_buf(
+    device: &MetalDevice,
+    in_buf: &MetalBuffer,
+    out_buf: &MetalBuffer,
+    n: i64,
+    inverse: bool,
+) -> Result<(), FftError> {
+    if n <= 0 {
+        return Err(FftError::Unsupported(n));
+    }
     if n > FFT_BASE_MAX {
         // Larger sizes route to the recursive batched four-step path when pow2;
-        // otherwise unsupported until later tasks. The recursion handles both
-        // the single-level band (2^11..2^20) and the previously-broken
-        // 2^21..2^25 band (where MLX returns garbage, ml-explore/mlx#1800).
+        // otherwise Bluestein. The recursion handles both the single-level band
+        // (2^11..2^20) and the previously-broken 2^21..2^25 band (where MLX
+        // returns garbage, ml-explore/mlx#1800).
         if (n & (n - 1)) == 0 {
             // All kernel scalars (len, batch, count) and the in-kernel twiddle
             // index i*j (< len <= n) are 32-bit. Cap n at 2^30 so neither the
@@ -88,22 +126,20 @@ pub fn fft_gpu(
             if n > (1 << 30) {
                 return Err(FftError::Unsupported(n));
             }
-            return fft_recursive_fourstep(device, input, n, inverse);
+            return fft_recursive_fourstep_buf(device, in_buf, out_buf, n, inverse);
         }
         // Composite smooth n <= FFT_BASE_MAX is handled below; composite smooth
         // n > FFT_BASE_MAX and primes both fall through to Bluestein. Smooth
         // sizes > 1024 would also work via Bluestein here; the four-step path
         // already claimed pow2, and the mixed-radix kernel is single-threadgroup
         // (n <= 1024), so anything non-pow2 above 1024 routes to Bluestein.
-        return bluestein_dispatch(device, input, n, inverse);
+        return bluestein_bridge(device, in_buf, out_buf, n, inverse);
     }
     if (n & (n - 1)) != 0 && factorize(n).is_none() {
         // Small non-smooth n (prime factor > 7, e.g. 101 .. 1024) → Bluestein.
-        return bluestein_dispatch(device, input, n, inverse);
+        return bluestein_bridge(device, in_buf, out_buf, n, inverse);
     }
 
-    let in_buf = MetalBuffer::from_f32_slice(device, input)?;
-    let out_buf = device.new_buffer_zeroed((2 * n as usize) * std::mem::size_of::<f32>())?;
     let n_buf = device.new_buffer_from_bytes(&(n as u32).to_le_bytes())?;
     let inv_buf = device.new_buffer_from_bytes(&u32::from(inverse).to_le_bytes())?;
 
@@ -120,7 +156,7 @@ pub fn fft_gpu(
     if (n & (n - 1)) == 0 {
         // Power-of-two: keep the proven radix-2 Stockham path.
         let pso = lib.pipeline("fft_stockham_pow2_f32")?;
-        queue.dispatch_1d_with_tg(&pso, &[&in_buf, &out_buf, &n_buf, &inv_buf], tg, tg)?;
+        queue.dispatch_1d_with_tg(&pso, &[in_buf, out_buf, &n_buf, &inv_buf], tg, tg)?;
     } else if let Some(radices) = factorize(n) {
         // Composite smooth n: mixed-radix (3..8) Stockham. Pass the per-stage
         // radix list as a u32 buffer plus its length scalar.
@@ -134,8 +170,8 @@ pub fn fft_gpu(
         queue.dispatch_1d_with_tg(
             &pso,
             &[
-                &in_buf,
-                &out_buf,
+                in_buf,
+                out_buf,
                 &n_buf,
                 &inv_buf,
                 &radices_buf,
@@ -151,7 +187,51 @@ pub fn fft_gpu(
     }
 
     queue.wait_until_complete()?;
-    Ok(out_buf.to_f32_vec())
+    Ok(())
+}
+
+/// Bluestein host bridge for [`fft_gpu_buf`]: read `in_buf` → host, run the
+/// existing host-internal [`bluestein_dispatch`], memcpy its result into
+/// `out_buf`. Bluestein is the non-headline (prime / non-smooth N) path — its
+/// chirp build, pointwise product, and post-multiply are all small-N host work,
+/// so keeping it host-internal here costs nothing the on-device pipeline cares
+/// about (M5b-2's GPU-resident win is for the large-pow2 four-step regime).
+fn bluestein_bridge(
+    device: &MetalDevice,
+    in_buf: &MetalBuffer,
+    out_buf: &MetalBuffer,
+    n: i64,
+    inverse: bool,
+) -> Result<(), FftError> {
+    let host_input = in_buf.to_f32_vec();
+    let result = bluestein_dispatch(device, &host_input, n, inverse)?;
+    write_f32_into(out_buf, &result);
+    Ok(())
+}
+
+/// Copy an interleaved-complex host `Vec` into a Shared-storage `MetalBuffer`
+/// (bytewise memcpy through its CPU-coherent backing store). Used by the
+/// host-internal Bluestein bridge to land a host result into a caller-provided
+/// `out_buf`. `result` must be exactly `out_buf.len()` bytes of f32 (`2n`
+/// floats).
+fn write_f32_into(out_buf: &MetalBuffer, result: &[f32]) {
+    let dst = out_buf.as_slice();
+    let nbytes = std::mem::size_of_val(result);
+    debug_assert_eq!(dst.len(), nbytes);
+    // SAFETY: out_buf is StorageModeShared and CPU-writable; `dst.as_ptr()`
+    // points at its backing store, valid for `dst.len()` bytes. No GPU command
+    // buffer is in-flight against out_buf at this call site (the Bluestein
+    // bridge never dispatches into out_buf — it produces the result host-side
+    // and only then copies it in), so `&MetalBuffer` (not `&mut`) is sound for
+    // the write. `result` has the same byte length (debug-asserted). The
+    // bytewise copy is alignment-agnostic (mirrors `to_f32_vec`).
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            result.as_ptr().cast::<u8>(),
+            dst.as_ptr() as *mut u8,
+            nbytes,
+        );
+    }
 }
 
 /// Smallest power of two `>= x` (with `next_pow2(0) == 1`). Used to size the
@@ -298,36 +378,52 @@ fn bluestein(device: &MetalDevice, input: &[f32], n: usize) -> Result<Vec<f32>, 
 /// exists only to make accidental non-termination a clean error, not a hang.
 const FFT_MAX_RECURSION_DEPTH: u32 = 6;
 
-/// Recursive batched Bailey four-step FFT for power-of-two `n > FFT_BASE_MAX`.
+/// Buffer-in / buffer-out recursive batched Bailey four-step FFT for power-of-two
+/// `n > FFT_BASE_MAX`. This UNIFIES the old single-level (2^11..2^20) four-step
+/// with the recursive (2^21..2^25) path: the former is one recursion level, the
+/// latter two or more.
 ///
-/// Stages the (optionally conjugated) input into a data buffer, allocates a
-/// same-size scratch for the non-in-place per-signal transpose, runs
-/// [`fft_pass`] (forward-only) over the single length-`n` signal, then reads
-/// back. Inverse is handled at this boundary: `ifft(x) = conj(fft(conj(x)))/N`
-/// — conjugate the input host-side, run the forward recursion, then conjugate
-/// and scale by `1/N` on readback. This UNIFIES the old single-level
-/// (2^11..2^20) four-step with the recursive (2^21..2^25) path: the former is
-/// one recursion level, the latter two or more.
-fn fft_recursive_fourstep(
+/// Runs the four-step recursion GENUINELY on-device: `out_buf` doubles as the
+/// in-place `data` buffer for [`fft_pass`] (forward-only, over the single
+/// length-`n` signal), so the transform result lands in `out_buf` with no final
+/// blit. Only a same-size `scratch` is allocated (for the non-in-place
+/// per-signal transpose).
+///
+/// Input staging into `out_buf`:
+/// - Forward: copy `in_buf` → `out_buf` (host bytewise memcpy through the Shared
+///   backing store; `fft_pass` then runs in place).
+/// - Inverse: `ifft(x) = conj(fft(conj(x)))/N`. Conjugate the input host-side
+///   (read `in_buf` → host, negate imag) and stage into `out_buf`; after the
+///   forward recursion, conjugate + scale by `1/N` in place on `out_buf`'s
+///   backing store. The inverse path reads `in_buf` to host ONLY to conjugate —
+///   the rarer path, and this preserves the exact prior behavior.
+fn fft_recursive_fourstep_buf(
     device: &MetalDevice,
-    input: &[f32],
+    in_buf: &MetalBuffer,
+    out_buf: &MetalBuffer,
     n: i64,
     inverse: bool,
-) -> Result<Vec<f32>, FftError> {
-    debug_assert_eq!((n & (n - 1)), 0, "fft_recursive_fourstep requires pow2 n");
+) -> Result<(), FftError> {
+    debug_assert_eq!(
+        (n & (n - 1)),
+        0,
+        "fft_recursive_fourstep_buf requires pow2 n"
+    );
     let ntot = n as usize;
 
-    // Stage into the data buffer. Forward: no clone — from_f32_slice copies into
-    // Metal memory anyway. Inverse: clone to conjugate (input is borrowed).
-    let mut data_buf = if inverse {
-        let mut staged = input.to_vec();
+    // Seed out_buf (the in-place data buffer). Forward: byte-copy in_buf as-is.
+    // Inverse: read in_buf → host, conjugate, write into out_buf.
+    if inverse {
+        let mut staged = in_buf.to_f32_vec();
         for c in staged.chunks_exact_mut(2) {
             c[1] = -c[1];
         }
-        MetalBuffer::from_f32_slice(device, &staged)?
+        write_f32_into(out_buf, &staged);
     } else {
-        MetalBuffer::from_f32_slice(device, input)?
-    };
+        copy_buf_into(out_buf, in_buf);
+    }
+
+    let mut data_buf = out_buf.shallow_clone();
     let mut scratch_buf = device.new_buffer_zeroed(2 * ntot * std::mem::size_of::<f32>())?;
 
     let lib = shared_library(device)?;
@@ -344,16 +440,43 @@ fn fft_recursive_fourstep(
         0,
     )?;
 
-    let mut out = data_buf.to_f32_vec();
     if inverse {
-        // ifft = conj(fft(conj(x)))/N: conjugate + scale by 1/N on readback.
+        // ifft = conj(fft(conj(x)))/N: conjugate + scale by 1/N in place on
+        // out_buf's backing store. The pass has completed (fft_pass's last stage
+        // waits), so no GPU work is in-flight against out_buf.
+        let mut out = out_buf.to_f32_vec();
         let scale = 1.0f32 / n as f32;
         for c in out.chunks_exact_mut(2) {
             c[0] *= scale;
             c[1] = -c[1] * scale;
         }
+        write_f32_into(out_buf, &out);
     }
-    Ok(out)
+    Ok(())
+}
+
+/// Bytewise copy `src` (a Shared-storage `MetalBuffer`) into `dst` (same size,
+/// Shared storage). Both must be `2n` f32. CPU-side memcpy through the coherent
+/// backing stores — used to seed the four-step `out_buf` from `in_buf` on the
+/// forward path without a host round-trip Vec.
+fn copy_buf_into(dst: &MetalBuffer, src: &MetalBuffer) {
+    let d = dst.as_slice();
+    let s = src.as_slice();
+    debug_assert_eq!(d.len(), s.len());
+    // copy_nonoverlapping is UB if dst/src alias the same MTLBuffer (possible now
+    // that shallow_clone hands out aliased handles); catch it in debug builds.
+    debug_assert_ne!(
+        d.as_ptr(),
+        s.as_ptr(),
+        "copy_buf_into: dst and src alias the same MTLBuffer"
+    );
+    // SAFETY: both are StorageModeShared; `d`/`s` point at their backing stores,
+    // valid for `len` bytes. dst is a freshly-allocated out_buf with no GPU work
+    // in-flight; src is the caller's input buffer (also not mid-dispatch at this
+    // seeding point). Disjoint allocations, so copy_nonoverlapping is sound.
+    unsafe {
+        std::ptr::copy_nonoverlapping(s.as_ptr(), d.as_ptr() as *mut u8, d.len());
+    }
 }
 
 /// Forward-only recursive batched four-step over `batch` contiguous signals,
