@@ -2916,26 +2916,6 @@ pub fn execute_dt(inp: (usize, usize), out: (usize, usize), field: u32) -> PyRes
         }
     };
 
-    // Input staging via the reusable page-aligned pool: one memcpy into a
-    // reused Shared buffer (B3b). Reuse avoids the per-call allocation that
-    // dominated the old `newBufferWithBytes` path (~5x faster at scale). The
-    // pooled buffer's capacity may exceed `in_n * 4`; the kernel reads only
-    // `input[0..n)`, so passing the true `n` below is correct.
-    let pool = DT_STAGING.get_or_init(|| Mutex::new(polars_metal_buffer::StagingPool::new()));
-    // Recover from a poisoned lock rather than panic (the buffer is scratch;
-    // no invariant is corrupted by a prior panic mid-stage).
-    let mut staging = pool.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    // SAFETY: `in_ptr` addresses `in_n` live, contiguous i32 values for the
-    // whole synchronous call; reinterpreting as `in_n * 4` bytes is sound
-    // (`i32` has no invalid bit patterns) and the slice is only read (memcpy
-    // source) before this function returns. `in_n * 4` cannot overflow: the
-    // `u32::try_from(in_n)` check above bounds `in_n <= u32::MAX`, so
-    // `in_n * 4 <= 4 * (2^32 - 1) < usize::MAX` on 64-bit targets.
-    let in_bytes: &[u8] = unsafe { std::slice::from_raw_parts(in_ptr as *const u8, in_n * 4) };
-    let inb = staging.stage(&device, in_bytes).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: dt input staging: {e}"))
-    })?;
-
     // Output staging: two paths (see execute_rolling for the rationale).
     let out_ptr_is_aligned = is_ptr_page_aligned(out_ptr);
 
@@ -2950,9 +2930,54 @@ pub fn execute_dt(inp: (usize, usize), out: (usize, usize), field: u32) -> PyRes
         pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: dt output staging: {e}"))
     })?;
 
-    dispatch_dt_field_buf(&device, inb, &outb, n, dt_field).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: dt dispatch: {e}"))
-    })?;
+    // Input staging: two paths based on pointer alignment.
+    //   Aligned (Datetime at large N): numpy mmap buffer is page-aligned →
+    //   zero-copy `bytesNoCopy` path via `from_borrowed_i32`, saving ~1ms at
+    //   10M rows.
+    //   Unaligned (Date / small N): Arrow 64-byte-aligned only → stage
+    //   through the reusable pool (one memcpy into a reused Shared buffer,
+    //   B3b). The pool avoids the per-call newBufferWithBytes allocation that
+    //   dominated the old path (~5x faster at scale).
+    // dispatch is called inside each arm to avoid juggling guard lifetimes.
+    let in_aligned = is_ptr_page_aligned(in_ptr);
+    if in_aligned {
+        // SAFETY: `in_ptr` addresses `in_n` live, contiguous i32 values for
+        // the whole synchronous call; page-aligned → `bytesNoCopy` shares
+        // host memory (read-only here). `from_borrowed_i32` borrows without
+        // copying.
+        let inb = unsafe {
+            polars_metal_buffer::MetalBuffer::from_borrowed_i32(&device, in_ptr as *const i32, in_n)
+        }
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "polars_metal: dt input staging: {e}"
+            ))
+        })?;
+        dispatch_dt_field_buf(&device, &inb, &outb, n, dt_field).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: dt dispatch: {e}"))
+        })?;
+    } else {
+        // Recover from a poisoned lock rather than panic (the buffer is
+        // scratch; no invariant is corrupted by a prior panic mid-stage).
+        let pool = DT_STAGING.get_or_init(|| Mutex::new(polars_metal_buffer::StagingPool::new()));
+        let mut staging = pool.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: `in_ptr` addresses `in_n` live, contiguous i32 values for
+        // the whole synchronous call; reinterpreting as `in_n * 4` bytes is
+        // sound (`i32` has no invalid bit patterns) and the slice is only
+        // read (memcpy source) before this function returns. `in_n * 4`
+        // cannot overflow: the `u32::try_from(in_n)` check above bounds
+        // `in_n <= u32::MAX`, so `in_n * 4 <= 4 * (2^32 - 1) < usize::MAX`
+        // on 64-bit targets.
+        let in_bytes: &[u8] = unsafe { std::slice::from_raw_parts(in_ptr as *const u8, in_n * 4) };
+        let inb = staging.stage(&device, in_bytes).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "polars_metal: dt input staging: {e}"
+            ))
+        })?;
+        dispatch_dt_field_buf(&device, inb, &outb, n, dt_field).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: dt dispatch: {e}"))
+        })?;
+    }
 
     // Copy-back path: if `out` was not page-aligned, `outb` holds a
     // GPU-private copy of the kernel results. Read it back via `as_slice()`
