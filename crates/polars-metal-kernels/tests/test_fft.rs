@@ -436,6 +436,43 @@ fn radix2_inverse_and_roundtrip() {
 }
 
 #[test]
+fn fft_planar_core_matches_interleaved_bluestein() {
+    let device = MetalDevice::system_default().expect("device");
+    // non-smooth n (prime factor > 7): primes + composites with a large prime factor
+    for &n in &[11i64, 13, 22, 26, 101, 251, 1009, 1021] {
+        for &inverse in &[false, true] {
+            let nn = n as usize;
+            let re: Vec<f32> = (0..nn).map(|i| ((i as f32) * 0.11).sin()).collect();
+            let im: Vec<f32> = (0..nn).map(|i| ((i as f32) * 0.05).cos() * 0.4).collect();
+            let mut inter = vec![0.0f32; 2 * nn];
+            for i in 0..nn {
+                inter[2 * i] = re[i];
+                inter[2 * i + 1] = im[i];
+            }
+            let ref_out = fft_gpu(&device, &inter, n, inverse).expect("fft_gpu");
+            let re_in = MetalBuffer::from_f32_slice(&device, &re).expect("re_in");
+            let im_in = MetalBuffer::from_f32_slice(&device, &im).expect("im_in");
+            let re_out = device.new_buffer_zeroed(nn * 4).expect("re_out");
+            let im_out = device.new_buffer_zeroed(nn * 4).expect("im_out");
+            fft_gpu_planar_core(&device, &re_in, &im_in, &re_out, &im_out, n, inverse)
+                .expect("planar core");
+            let ro = re_out.to_f32_vec();
+            let io = im_out.to_f32_vec();
+            for i in 0..nn {
+                assert!(
+                    (ro[i] - ref_out[2 * i]).abs() < 1e-3,
+                    "re n={n} inv={inverse} i={i}"
+                );
+                assert!(
+                    (io[i] - ref_out[2 * i + 1]).abs() < 1e-3,
+                    "im n={n} inv={inverse} i={i}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn fft_planar_core_matches_interleaved_small() {
     // The PLANAR (SoA) single-threadgroup path must match the proven interleaved
     // `fft_gpu`. COMPLEX input (both re and im nonzero) exercises the full planar

@@ -230,12 +230,12 @@ pub fn fft_gpu_planar_core(
             }
             return fft_recursive_fourstep_planar(device, re_in, im_in, re_out, im_out, n, inverse);
         }
-        // Non-smooth large n → planar Bluestein (M5c-3); not yet here.
-        return Err(FftError::Unsupported(n));
+        // Non-smooth large n → planar Bluestein bridge.
+        return bluestein_bridge_planar(device, re_in, im_in, re_out, im_out, n, inverse);
     }
     if (n & (n - 1)) != 0 && factorize(n).is_none() {
-        // Small non-smooth n (prime factor > 7) → planar Bluestein (M5c-3).
-        return Err(FftError::Unsupported(n));
+        // Small non-smooth n (prime factor > 7) → planar Bluestein bridge.
+        return bluestein_bridge_planar(device, re_in, im_in, re_out, im_out, n, inverse);
     }
 
     let n_buf = device.new_buffer_from_bytes(&(n as u32).to_le_bytes())?;
@@ -289,6 +289,39 @@ pub fn fft_gpu_planar_core(
     }
 
     queue.wait_until_complete()?;
+    Ok(())
+}
+
+/// Planar Bluestein bridge: interleave the planar (re,im) inputs to host, run the
+/// existing interleaved Bluestein, split the result back to the planar outputs.
+/// Bluestein is small-N and rare, so the host interleave/split here is negligible
+/// (the planar rewrite targets the four-step large-N path, not this one).
+fn bluestein_bridge_planar(
+    device: &MetalDevice,
+    re_in: &MetalBuffer,
+    im_in: &MetalBuffer,
+    re_out: &MetalBuffer,
+    im_out: &MetalBuffer,
+    n: i64,
+    inverse: bool,
+) -> Result<(), FftError> {
+    let re = re_in.to_f32_vec();
+    let im = im_in.to_f32_vec();
+    let nn = n as usize;
+    let mut inter = vec![0.0f32; 2 * nn];
+    for i in 0..nn {
+        inter[2 * i] = re[i];
+        inter[2 * i + 1] = im[i];
+    }
+    let result = bluestein_dispatch(device, &inter, n, inverse)?;
+    let mut ro = vec![0.0f32; nn];
+    let mut io = vec![0.0f32; nn];
+    for i in 0..nn {
+        ro[i] = result[2 * i];
+        io[i] = result[2 * i + 1];
+    }
+    write_f32_into(re_out, &ro);
+    write_f32_into(im_out, &io);
     Ok(())
 }
 
