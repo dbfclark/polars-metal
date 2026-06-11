@@ -10,6 +10,9 @@ from typing import Any
 import polars.lazyframe.frame as _plf
 
 from polars_metal import (
+    _corr_namespace as _corr_namespace_module,  # noqa: F401  (registers lf.metal.corr)
+)
+from polars_metal import (
     _dt_detect as _dt_detect_module,  # noqa: F401  (installs with_columns patch)
 )
 from polars_metal import (
