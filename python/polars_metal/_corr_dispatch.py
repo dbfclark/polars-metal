@@ -66,7 +66,12 @@ def _run_corr(df: pl.DataFrame, spec: CorrSpec) -> pl.DataFrame:
         if s.null_count() > 0:
             has_null = True
     p = len(columns)
-    if has_null or df.height < 2:
+    if df.height < 2:
+        raise pl.exceptions.ComputeError(
+            "polars_metal: .metal.corr() needs at least 2 rows to compute a "
+            f"correlation (got {df.height})."
+        )
+    if has_null:
         return _cpu_corr_f32(df, columns)
     if p < CORR_P_MIN and not spec.force_gpu:
         return _cpu_corr_f32(df, columns)
