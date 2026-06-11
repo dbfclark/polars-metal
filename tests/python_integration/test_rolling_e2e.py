@@ -56,6 +56,22 @@ def test_repeated_collect_same_lf_correct():
     assert_frame_equal(second, cpu, check_exact=False, rel_tol=1e-4, abs_tol=1e-4)
 
 
+def test_rolling_repeated_collect_same_lf_fast_and_correct():
+    # After M7a get-not-pop fix: 2nd collect of the SAME lf should still use
+    # the fast path (cache not evicted by 1st collect) and produce correct results.
+    df = pl.DataFrame({"x": [float(i) for i in range(5000)]})
+    lf = df.lazy().with_columns(
+        pl.col("x").cast(pl.Float32).rolling_mean(window_size=100).alias("rm")
+    )
+    eng = polars_metal.MetalEngine()
+    out1 = lf.collect(engine=eng)
+    out2 = lf.collect(engine=eng)  # 2nd collect of SAME lf -- must match, no error
+    assert_frame_equal(out1, out2, check_exact=False, rel_tol=1e-4, abs_tol=1e-4)
+    # And matches CPU
+    exp = lf.collect()
+    assert_frame_equal(out1, exp, check_exact=False, rel_tol=1e-4, abs_tol=1e-4)
+
+
 def test_non_rolling_collect_after_rolling_unaffected():
     # A non-with_columns frame collected after a rolling one must not pick up
     # stale exprs from a previous (now-evicted) cache entry.

@@ -17,7 +17,7 @@ from polars_metal import _detect_common as dc
 from polars_metal._detect_common import _alias_name, _literal_int, _struct_fields
 from polars_metal._dtw_namespace import DTW_SENTINEL_TAG
 
-_dtw_lf_exprs_cache: dict[int, list[pl.Expr]] = {}
+_dtw_lf_exprs_cache: dict = {}  # id(lf) -> (weakref.ref, exprs); managed by _detect_common
 _PATCH_ATTR = "_polars_metal_dtw_original_with_columns"
 
 dc.install_with_columns_capture(_PATCH_ATTR, _dtw_lf_exprs_cache)
@@ -53,7 +53,7 @@ def _binding_from_expr_json(expr_json: dict, out_name: str) -> DtwBinding | None
 def find_dtw_bindings(lf: pl.LazyFrame) -> list[DtwBinding]:
     """Return DtwBinding for each sentinel alias in the outermost with_columns layer."""
     try:
-        cached = _dtw_lf_exprs_cache.pop(id(lf), None)
+        cached = dc.lookup(_dtw_lf_exprs_cache, lf)
         if cached is not None:
             out: list[DtwBinding] = []
             for expr in cached:

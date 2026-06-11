@@ -1,12 +1,14 @@
 """M6: shared serialize-detect machinery for the .metal struct-sentinel verbs.
 
 One copy of the JSON-walk helpers (were duplicated across vector/fft/dtw/corr
-detect modules) and the with_columns-capture monkeypatch installer. A later task
-upgrades the cache here (weakref get-not-pop) so repeated collect() stays fast;
-keeping it in one place is what makes that a one-line change.
+detect modules) and the with_columns-capture monkeypatch installer.  M7a adds
+weakref get-not-pop so repeated collect() of the same LazyFrame stays on the
+fast path instead of falling through to O(N) lf.serialize().
 """
 
 from __future__ import annotations
+
+import weakref
 
 import polars as pl
 import polars.lazyframe.frame as _plf
@@ -62,10 +64,37 @@ def _literal_int(node) -> int | None:
     return None
 
 
+def _make_evictor(cache: dict, key: int):
+    """Return a weakref finalizer that removes `key` from `cache` when the
+    referent is garbage-collected.  Keeps cache growth bounded and prevents
+    a reused id() from returning stale exprs."""
+
+    def _evict(_ref) -> None:
+        cache.pop(key, None)
+
+    return _evict
+
+
+def lookup(cache: dict, lf) -> list | None:
+    """Return captured exprs for `lf` WITHOUT removing them (so a repeated collect
+    stays on the fast path).  Identity-validates via the stored weakref to reject
+    the rare id-reuse case (returns None -> caller takes the slow serialize fallback)."""
+    entry = cache.get(id(lf))
+    if entry is None:
+        return None
+    ref, exprs = entry
+    if ref() is not lf:
+        return None
+    return exprs
+
+
 def install_with_columns_capture(attr: str, cache: dict) -> None:
     """Idempotently install a with_columns wrapper recording each call's exprs
-    into `cache` keyed by id(result). Chains with other installs (wraps whichever
-    with_columns is current). No-op if `attr` already installed."""
+    into `cache` keyed by id(result) as `(weakref.ref(result), exprs)`.  Get-not-pop
+    via lookup() + weakref eviction means a repeated collect() of the same lf stays
+    on the fast path, growth stays bounded, and a reused id can't return stale exprs.
+    Chains with other installs (wraps whichever with_columns is current).
+    No-op if `attr` already installed."""
     if hasattr(_plf.LazyFrame, attr):
         return
     orig = _plf.LazyFrame.with_columns
@@ -77,7 +106,8 @@ def install_with_columns_capture(attr: str, cache: dict) -> None:
             flat = [e for e in exprs if isinstance(e, pl.Expr)]
             flat += [e.alias(n) for n, e in named.items() if isinstance(e, pl.Expr)]
             if flat:
-                cache[id(result)] = flat
+                key = id(result)
+                cache[key] = (weakref.ref(result, _make_evictor(cache, key)), flat)
         except Exception:
             pass
         return result

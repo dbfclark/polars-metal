@@ -28,8 +28,8 @@ from polars_metal import _detect_common as dc
 from polars_metal._detect_common import _alias_name, _literal_int, _struct_fields
 from polars_metal._vector_namespace import SENTINEL_TAG
 
-# id(result LazyFrame) → captured Expr objects (fast path). Evicted on consume (pop).
-_lf_exprs_cache: dict[int, list[pl.Expr]] = {}
+# id(result LazyFrame) -> captured Expr objects (fast path). Get-not-pop; evicted on GC via weakref (see _detect_common.lookup).
+_lf_exprs_cache: dict = {}  # id(lf) -> (weakref.ref, exprs); managed by _detect_common
 _PATCH_ATTR = "_polars_metal_vs_original_with_columns"
 
 dc.install_with_columns_capture(_PATCH_ATTR, _lf_exprs_cache)
@@ -68,7 +68,7 @@ def _binding_from_expr_json(expr_json: dict, out_name: str) -> VectorBinding | N
 def find_vector_bindings(lf: pl.LazyFrame) -> list[VectorBinding]:
     """Return VectorBinding for each sentinel alias in the outermost with_columns layer."""
     try:
-        cached = _lf_exprs_cache.pop(id(lf), None)
+        cached = dc.lookup(_lf_exprs_cache, lf)
         if cached is not None:
             out: list[VectorBinding] = []
             for expr in cached:

@@ -17,7 +17,7 @@ from polars_metal import _detect_common as dc
 from polars_metal._corr_namespace import CORR_SENTINEL_TAG
 from polars_metal._detect_common import _alias_name, _literal_int, _struct_fields
 
-_corr_lf_exprs_cache: dict[int, list[pl.Expr]] = {}
+_corr_lf_exprs_cache: dict = {}  # id(lf) -> (weakref.ref, exprs); managed by _detect_common
 _PATCH_ATTR = "_polars_metal_corr_original_with_columns"
 
 dc.install_with_columns_capture(_PATCH_ATTR, _corr_lf_exprs_cache)
@@ -48,7 +48,7 @@ def _binding_from_expr_json(expr_json: dict, out_name: str) -> CorrBinding | Non
 def find_corr_bindings(lf: pl.LazyFrame) -> list[CorrBinding]:
     """Return CorrBinding for each sentinel alias in the outermost with_columns layer."""
     try:
-        cached = _corr_lf_exprs_cache.pop(id(lf), None)
+        cached = dc.lookup(_corr_lf_exprs_cache, lf)
         if cached is not None:
             out: list[CorrBinding] = []
             for expr in cached:
