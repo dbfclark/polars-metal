@@ -84,14 +84,24 @@ def _run_binding(frame: pl.DataFrame, b: DtwBinding) -> pl.Series:
     # ROW null mask, not cell-level NaN: a non-null row that contains a legitimate
     # NaN cell must NOT be silently zeroed (the kernel's fmin drops NaN, so it
     # would return a wrong finite value rather than the oracle's NaN) — raise.
-    safe = mat.copy()
-    safe[null_mask] = 0.0
-    if np.isnan(safe).any():
-        raise ValueError(
-            "polars_metal: .metal.dtw: a non-null sequence contains NaN, which the "
-            "GPU kernel cannot match against the oracle (nulls are supported; NaN cells are not)."
-        )
-    qflat = np.ascontiguousarray(safe, dtype=np.float32).reshape(-1)
+    if null_mask.any():
+        safe = mat.copy()
+        safe[null_mask] = 0.0
+        # A non-null row containing a genuine NaN cell would be silently mis-scored
+        # by the kernel's fmin (drops NaN), so reject it (nulls ok, NaN cells not).
+        if np.isnan(safe).any():
+            raise ValueError(
+                "polars_metal: .metal.dtw: a non-null sequence contains NaN, which the "
+                "GPU kernel cannot match against the oracle (nulls are supported; NaN cells are not)."
+            )
+        qflat = np.ascontiguousarray(safe, dtype=np.float32).reshape(-1)
+    else:
+        if np.isnan(mat).any():
+            raise ValueError(
+                "polars_metal: .metal.dtw: a non-null sequence contains NaN, which the "
+                "GPU kernel cannot match against the oracle (nulls are supported; NaN cells are not)."
+            )
+        qflat = np.ascontiguousarray(mat, dtype=np.float32).reshape(-1)
     out = np.empty(n, dtype=np.float32)
     _native.execute_dtw(
         (qflat.ctypes.data, qflat.size),
