@@ -47,8 +47,7 @@ def _run_corr(df: pl.DataFrame, spec: CorrSpec) -> pl.DataFrame:
         s = df.get_column(c)
         if not s.dtype.is_numeric():
             raise ValueError(
-                f"polars_metal: .metal.corr() requires numeric columns; "
-                f"column {c!r} is {s.dtype}."
+                f"polars_metal: .metal.corr() requires numeric columns; column {c!r} is {s.dtype}."
             )
         if s.null_count() > 0:
             has_null = True

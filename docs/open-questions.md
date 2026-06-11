@@ -545,3 +545,34 @@ adapter that the current architecture does not have. Polars streaming mode
 falls back to CPU. No plan to build a streaming-specific rolling path.
 *Owner:* out of scope indefinitely unless the engine acquires a streaming
 execution model.
+
+---
+
+## `lf.metal.corr()` dtype divergence: F32 vs Polars F64 (M6, 2026-06-11)
+
+**Known divergence (documented, not a bug).** `lf.metal.corr()` returns a
+`Float32` p×p correlation matrix. Polars `df.corr()` returns `Float64`.
+
+- Values are F32-precision (~1e-5 relative error). The GPU path computes
+  `C = Znᵀ·Zn` entirely in MLX F32 (MLX has no F64); the output dtype is
+  F32 regardless of whether routing chose GPU or CPU fallback (the CPU
+  fallback path — small p / nulls / non-numeric inputs — calls `df.corr()`
+  and casts the result to F32 before returning).
+- Output dtype is therefore **path-independent**: callers always get F32.
+- Routing: GPU when `p >= CORR_P_MIN=8` or `force_gpu=True`; else CPU
+  `df.corr()` cast F32. Nulls / non-numeric inputs / `N < 2` are handled on
+  CPU in all cases.
+
+**Honest engine-path perf:** ~2× at N=1M, p=50. Grows with p (compute/ingest
+∝ p; ~1.0–1.5× at p=10–25). The spike measured ~20× but timed resident
+raw-MLX arrays, not the engine path (serialize-detect + ingest + readback
+dominate at small p). Same pattern as B4 (bare reductions) and B3
+(dt.year/month/day).
+
+**Same divergence class as "Mean F32 returns F32 not F64"** — the existing
+conformance baseline for group-by mean/median/quantile over integer columns
+(fixed in M6 conformance-fixes by casting those agg outputs to F64; corr is
+intentionally kept F32 because F32 is the only available precision).
+
+*Owner:* documented. No fix planned — F32 is the correct precision for GPU
+corr; callers needing F64 should use `df.corr()` directly.

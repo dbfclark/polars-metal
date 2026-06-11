@@ -14,9 +14,9 @@ could do better but this is the conservative floor.
 
 import time
 
+import mlx.core as mx
 import numpy as np
 import polars as pl
-import mlx.core as mx
 
 
 def med(fn, it):
@@ -55,11 +55,13 @@ def main():
             df.corr()
             gpu_corr(Xmx, n)
             it = 7 if n <= 100_000 else 4
-            cpu = med(lambda: df.corr(), it)
-            gpu = med(lambda: gpu_corr(Xmx, n), it)
+            cpu = med(lambda df=df: df.corr(), it)
+            gpu = med(lambda Xmx=Xmx, n=n: gpu_corr(Xmx, n), it)
             sp = cpu / gpu
-            print(f"{n:>9,} {p:>5} {cpu*1e3:>9.3f} {gpu*1e3:>9.3f} {sp:>7.2f}x  "
-                  f"{'GPU' if sp > 1 else 'cpu':>4}")
+            print(
+                f"{n:>9,} {p:>5} {cpu * 1e3:>9.3f} {gpu * 1e3:>9.3f} {sp:>7.2f}x  "
+                f"{'GPU' if sp > 1 else 'cpu':>4}"
+            )
 
 
 if __name__ == "__main__":
