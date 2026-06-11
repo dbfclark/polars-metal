@@ -54,3 +54,27 @@ def test_metal_corr_end_to_end():
     expected = df.corr().cast(pl.Float32)
     np.testing.assert_allclose(out.to_numpy(), expected.to_numpy(), atol=1e-4)
     assert out.columns == expected.columns
+
+
+def test_corr_small_p_cpu_fallback_correct():
+    # p=3 < CORR_P_MIN → CPU fallback path; result still correct + F32.
+    df = _frame(n=3000, p=3, seed=3)
+    out = df.lazy().metal.corr().collect(engine=pm.MetalEngine())
+    assert out.shape == (3, 3)
+    assert all(dt == pl.Float32 for dt in out.dtypes)
+    expected = df.corr().cast(pl.Float32)
+    np.testing.assert_allclose(out.to_numpy(), expected.to_numpy(), atol=1e-4)
+
+
+def test_corr_force_gpu_small_p_matches():
+    # force_gpu=True drives p=3 through the GPU path; must still match oracle.
+    df = _frame(n=3000, p=3, seed=4)
+    out = df.lazy().metal.corr(force_gpu=True).collect(engine=pm.MetalEngine())
+    expected = df.corr().cast(pl.Float32)
+    np.testing.assert_allclose(out.to_numpy(), expected.to_numpy(), atol=1e-4)
+
+
+def test_corr_p_min_constant_is_eight():
+    from polars_metal._corr_dispatch import CORR_P_MIN
+
+    assert CORR_P_MIN == 8
