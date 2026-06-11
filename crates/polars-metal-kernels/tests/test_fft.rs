@@ -4,7 +4,9 @@
 #![allow(clippy::expect_used)]
 
 use polars_metal_buffer::MetalDevice;
-use polars_metal_kernels::fft::{dft_reference, fft_gpu, l2_rel_err};
+use polars_metal_kernels::fft::{
+    dft_reference, dispatch_pack_complex, dispatch_pack_real, dispatch_unpack, fft_gpu, l2_rel_err,
+};
 
 fn interleaved_signal(n: usize, seed: u64) -> Vec<f32> {
     // deterministic pseudo-random complex signal, interleaved re,im
@@ -208,6 +210,83 @@ fn recursive_fourstep_inverse_broken_band() {
         let rerr = l2_rel_err(&back, &sig);
         assert!(rerr < 1e-3, "2^{pow} roundtrip L2 {rerr}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// M5a: GPU pack/unpack kernel tests
+// ---------------------------------------------------------------------------
+
+/// Round-trip: dispatch_pack_real -> dispatch_unpack reproduces the original
+/// real signal and all-zero imaginary plane.
+#[test]
+fn fft_pack_unpack_roundtrip() {
+    let device = MetalDevice::system_default().expect("device");
+    let n = 1000usize;
+    let re: Vec<f32> = (0..n).map(|i| (i as f32) * 0.5 - 13.0).collect();
+
+    // Pack real -> interleaved (length 2n, imaginary = 0).
+    let inter = dispatch_pack_real(&device, &re, n).expect("dispatch_pack_real");
+    assert_eq!(inter.len(), 2 * n, "interleaved length must be 2n");
+
+    // Sanity-check a few packed values before the unpack.
+    assert_eq!(inter[0], re[0]);
+    assert_eq!(inter[1], 0.0f32);
+    assert_eq!(inter[2], re[1]);
+    assert_eq!(inter[3], 0.0f32);
+
+    // Unpack back to planar.
+    let (ro, io) = dispatch_unpack(&device, &inter, n).expect("dispatch_unpack");
+    assert_eq!(ro.len(), n);
+    assert_eq!(io.len(), n);
+    assert_eq!(ro, re, "real plane must match the original signal");
+    assert!(
+        io.iter().all(|&x| x == 0.0f32),
+        "imaginary plane must be all-zero after pack_real -> unpack"
+    );
+}
+
+/// Round-trip: dispatch_pack_complex -> dispatch_unpack preserves both planes.
+#[test]
+fn fft_pack_complex_unpack_roundtrip() {
+    let device = MetalDevice::system_default().expect("device");
+    let n = 512usize;
+    let re: Vec<f32> = (0..n).map(|i| (i as f32) * 0.25).collect();
+    let im: Vec<f32> = (0..n).map(|i| -((i as f32) * 0.1 - 25.6)).collect();
+
+    let inter = dispatch_pack_complex(&device, &re, &im, n).expect("dispatch_pack_complex");
+    assert_eq!(inter.len(), 2 * n);
+
+    let (ro, io) = dispatch_unpack(&device, &inter, n).expect("dispatch_unpack");
+    assert_eq!(ro, re, "real plane must be preserved");
+    assert_eq!(io, im, "imaginary plane must be preserved");
+}
+
+/// Edge case: n == 1.
+#[test]
+fn fft_pack_unpack_single_element() {
+    let device = MetalDevice::system_default().expect("device");
+    let re = vec![42.0f32];
+    let inter = dispatch_pack_real(&device, &re, 1).expect("pack single");
+    assert_eq!(inter, vec![42.0f32, 0.0f32]);
+    let (ro, io) = dispatch_unpack(&device, &inter, 1).expect("unpack single");
+    assert_eq!(ro, vec![42.0f32]);
+    assert_eq!(io, vec![0.0f32]);
+}
+
+/// Large n: exercises multi-threadgroup dispatch (n > DEFAULT_THREADGROUP_WIDTH = 256).
+#[test]
+fn fft_pack_unpack_large_n() {
+    let device = MetalDevice::system_default().expect("device");
+    let n = 1 << 20; // 1M samples
+    let re: Vec<f32> = (0..n).map(|i| (i as f32).sin()).collect();
+    let inter = dispatch_pack_real(&device, &re, n).expect("pack large");
+    assert_eq!(inter.len(), 2 * n);
+    let (ro, io) = dispatch_unpack(&device, &inter, n).expect("unpack large");
+    assert_eq!(ro, re, "large n real plane must round-trip exactly");
+    assert!(
+        io.iter().all(|&x| x == 0.0f32),
+        "large n imaginary plane must be all-zero"
+    );
 }
 
 #[test]
