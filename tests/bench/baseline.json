@@ -205,16 +205,18 @@
         "ratio_lt": 0.45
       }
     },
-    "phase8_corr_matrix_200x200k": {
-      "cpu_ms": null,
-      "metal_ms": null,
-      "ratio_metal_over_cpu": null,
-      "n_rows": 200000,
-      "n_cols": 200,
+    "phase8_corr_matrix_n1m_p50": {
+      "cpu_ms": 181.91,
+      "metal_ms": 78.87,
+      "ratio_metal_over_cpu": 0.4336,
+      "n_rows": 1000000,
+      "n_cols": 50,
       "hardware": "M2 Ultra",
-      "_notes": "M4 placeholder: 200x200000 correlation matrix via MLX matmul. Target wall-clock < 22.0 ms; ratio gate set at landing.",
-      "_pending": true,
-      "_target_ms": 22.0
+      "_notes": "M6 corr T8: honest engine-path measurement. lf.metal.corr(force_gpu=True).collect(engine=MetalEngine()) vs df.corr(). N=1M rows x p=50 F32 columns. GPU wins 2.3x (ratio 0.43). The spike's raw-MLX ~20x ceiling does not carry through: engine path adds serialize-detect + dispatch + MLX ingest + readback. Crossover vs CPU is at p>=~50 for N=1M, p>=50 for N=100K. At N=100K p=10 GPU loses (expected; routing guard uses CORR_P_MIN=8). Measured 2026-06-11, bench_corr.py. Gate: ratio < 0.5 (GPU must be >2x faster at N=1M p=50).",
+      "_pending": false,
+      "_gate": {
+        "ratio_lt": 0.5
+      }
     },
     "phase9_rolling_mean_w1000_10m": {
       "cpu_ms": 116.34,
