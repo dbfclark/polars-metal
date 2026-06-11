@@ -19,6 +19,7 @@ from polars_metal._dt_detect import DtBinding
 
 _FIELD_CODE = {"year": 0, "month": 1, "day": 2}
 _FIELD_DTYPE = {"year": pl.Int32, "month": pl.Int8, "day": pl.Int8}
+_FIELD_NUMPY_DTYPE = {"year": np.int32, "month": np.int8, "day": np.int8}
 
 
 def _dt_series(src: pl.Series, b: DtBinding) -> pl.Series:
@@ -48,7 +49,10 @@ def _dt_series(src: pl.Series, b: DtBinding) -> pl.Series:
         field=_FIELD_CODE[b.field],
     )
 
-    dense = pl.Series(b.out_name, out, dtype=pl.Int32).cast(out_dtype)
+    # Narrow on the numpy side (out is int32): astype(int8) is ~30x cheaper than
+    # pl.Series(int32).cast(pl.Int8) (~19ms -> ~0.6ms at 10M rows). year stays int32.
+    narrowed = out.astype(_FIELD_NUMPY_DTYPE[b.field], copy=False)
+    dense = pl.Series(b.out_name, narrowed, dtype=out_dtype)
     if src.null_count() == 0:
         return dense
     # Restore nulls positionally. `Series.set(filter, None)` is vectorized

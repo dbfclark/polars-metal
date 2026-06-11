@@ -125,3 +125,30 @@ def test_large_n_with_nulls_byte_exact():
     got, want = lf.collect(engine=eng), lf.collect()
     assert got.equals(want)
     assert got["o"].dtype == pl.Int32
+
+
+def test_dt_month_day_dtype_and_values_after_astype():
+    import polars as pl
+
+    import polars_metal as pm
+
+    df = pl.DataFrame(
+        {"d": pl.date_range(pl.date(2000, 1, 1), pl.date(2000, 12, 31), interval="1d", eager=True)}
+    )
+    out = (
+        df.lazy()
+        .select(
+            pl.col("d").dt.year().alias("y"),
+            pl.col("d").dt.month().alias("m"),
+            pl.col("d").dt.day().alias("dd"),
+        )
+        .collect(engine=pm.MetalEngine())
+    )
+    exp = df.select(
+        pl.col("d").dt.year().alias("y"),
+        pl.col("d").dt.month().alias("m"),
+        pl.col("d").dt.day().alias("dd"),
+    )
+    assert out.schema["y"] == pl.Int32
+    assert out.schema["m"] == pl.Int8 and out.schema["dd"] == pl.Int8
+    assert out.equals(exp)
