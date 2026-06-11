@@ -62,6 +62,9 @@ def bench_corr_sweep() -> None:
                 n_warmup=1,
                 n_measure=it,
             )
+            # force_gpu=True: deterministically exercises the GPU path at every p in the
+            # sweep (all p >= CORR_P_MIN=8, so routing would pick GPU anyway; this makes it
+            # explicit and guards against threshold changes silently shifting the bench).
             gpu = time_callable(
                 f"metal.corr[N={n:,} p={p}]",
                 lambda lf=lf, eng=eng: lf.metal.corr(force_gpu=True).collect(engine=eng),

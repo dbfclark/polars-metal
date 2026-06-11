@@ -35,10 +35,6 @@ def _capture(columns: tuple[str, ...], force_gpu: bool) -> int:
     return handle
 
 
-def pop_capture(handle: int) -> CorrSpec | None:
-    return _CORR_CACHE.pop(handle, None)
-
-
 def get_capture(handle: int) -> CorrSpec | None:
     """Non-removing read. The dispatcher ties eviction to the lf lifetime via
     weakref.finalize so repeated collects of the same lf reuse the spec, and

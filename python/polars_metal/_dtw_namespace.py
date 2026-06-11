@@ -36,10 +36,6 @@ def _capture(reference: Any, window: int | None, allow_cpu_fallback: bool, query
     return handle
 
 
-def pop_capture(handle: int) -> DtwSpec | None:
-    return _DTW_CACHE.pop(handle, None)
-
-
 def get_capture(handle: int) -> DtwSpec | None:
     """Non-removing read. The dispatcher ties eviction to the lf lifetime via
     weakref.finalize so repeated collects of the same lf reuse the spec, and

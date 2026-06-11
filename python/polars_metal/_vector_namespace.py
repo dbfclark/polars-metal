@@ -60,10 +60,6 @@ def get_capture(handle: int) -> CorpusSpec | None:
     return _CORPUS_CACHE.get(handle)
 
 
-def pop_capture(handle: int) -> CorpusSpec | None:
-    return _CORPUS_CACHE.pop(handle, None)
-
-
 def evict_capture(handle: int) -> None:
     """Remove the spec for *handle* from the cache. Registered as a weakref
     finalizer on the dispatched LazyFrame so the entry is freed on lf GC."""

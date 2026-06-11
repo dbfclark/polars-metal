@@ -130,6 +130,18 @@ def test_corr_repeated_collect_same_lf():
     np.testing.assert_allclose(out1.to_numpy(), out2.to_numpy(), atol=1e-5, equal_nan=True)
 
 
+def test_corr_constant_column_nan_via_engine():
+    """Engine-level: a zero-variance column produces NaN rows/cols matching df.corr()."""
+    rng = np.random.default_rng(21)
+    cols = {f"c{i}": rng.standard_normal(2000).astype(np.float32) for i in range(9)}
+    cols["c0"] = np.ones(2000, dtype=np.float32)  # zero-variance column → NaN corr
+    df = pl.DataFrame(cols)
+    # p=9 >= CORR_P_MIN=8 → GPU path; force_gpu not needed but would also work
+    out = df.lazy().metal.corr().collect(engine=pm.MetalEngine())
+    exp = df.corr().cast(pl.Float32)
+    np.testing.assert_allclose(out.to_numpy(), exp.to_numpy(), atol=1e-4, equal_nan=True)
+
+
 def test_corr_spec_evicted_on_lf_gc():
     """After lf is GC'd the spec must be evicted from _CORR_CACHE."""
     import gc
