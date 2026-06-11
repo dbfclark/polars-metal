@@ -12,31 +12,16 @@ import warnings
 from dataclasses import dataclass
 
 import polars as pl
-import polars.lazyframe.frame as _plf
 
+from polars_metal import _detect_common as dc
+from polars_metal._detect_common import _alias_name, _literal_int, _struct_fields
 from polars_metal._fft_namespace import FFT_SENTINEL_TAG
-from polars_metal._vector_detect import _alias_name, _literal_int, _struct_fields
 
 # id(result LazyFrame) → captured Expr objects (fast path). Evicted on consume (pop).
 _fft_lf_exprs_cache: dict[int, list[pl.Expr]] = {}
 _PATCH_ATTR = "_polars_metal_fft_original_with_columns"
 
-if not hasattr(_plf.LazyFrame, _PATCH_ATTR):
-    _orig_wc = _plf.LazyFrame.with_columns
-    setattr(_plf.LazyFrame, _PATCH_ATTR, _orig_wc)
-
-    def _patched_wc(self, *exprs, **named):  # type: ignore[no-untyped-def]
-        result = _orig_wc(self, *exprs, **named)
-        try:
-            flat: list[pl.Expr] = [e for e in exprs if isinstance(e, pl.Expr)]
-            flat += [e.alias(n) for n, e in named.items() if isinstance(e, pl.Expr)]
-            if flat:
-                _fft_lf_exprs_cache[id(result)] = flat
-        except Exception:
-            pass
-        return result
-
-    _plf.LazyFrame.with_columns = _patched_wc  # type: ignore[method-assign]
+dc.install_with_columns_capture(_PATCH_ATTR, _fft_lf_exprs_cache)
 
 
 @dataclass(frozen=True)

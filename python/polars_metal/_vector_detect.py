@@ -23,30 +23,16 @@ import warnings
 from dataclasses import dataclass
 
 import polars as pl
-import polars.lazyframe.frame as _plf
 
+from polars_metal import _detect_common as dc
+from polars_metal._detect_common import _alias_name, _literal_int, _struct_fields
 from polars_metal._vector_namespace import SENTINEL_TAG
 
 # id(result LazyFrame) → captured Expr objects (fast path). Evicted on consume (pop).
 _lf_exprs_cache: dict[int, list[pl.Expr]] = {}
 _PATCH_ATTR = "_polars_metal_vs_original_with_columns"
 
-if not hasattr(_plf.LazyFrame, _PATCH_ATTR):
-    _orig_wc = _plf.LazyFrame.with_columns
-    setattr(_plf.LazyFrame, _PATCH_ATTR, _orig_wc)
-
-    def _patched_wc(self, *exprs, **named):  # type: ignore[no-untyped-def]
-        result = _orig_wc(self, *exprs, **named)
-        try:
-            flat: list[pl.Expr] = [e for e in exprs if isinstance(e, pl.Expr)]
-            flat += [e.alias(n) for n, e in named.items() if isinstance(e, pl.Expr)]
-            if flat:
-                _lf_exprs_cache[id(result)] = flat
-        except Exception:
-            pass
-        return result
-
-    _plf.LazyFrame.with_columns = _patched_wc  # type: ignore[method-assign]
+dc.install_with_columns_capture(_PATCH_ATTR, _lf_exprs_cache)
 
 
 @dataclass(frozen=True)
@@ -54,56 +40,6 @@ class VectorBinding:
     out_name: str
     query_col: str
     handle: int
-
-
-def _struct_fields(expr_json: dict) -> list:
-    """Return the list of field-expr nodes of an as_struct Function, else []."""
-    fn = expr_json.get("Function")
-    if isinstance(fn, dict):
-        inp = fn.get("input")
-        if isinstance(inp, list):
-            return inp
-    return []
-
-
-def _alias_name(node) -> str | None:
-    if isinstance(node, dict):
-        a = node.get("Alias")
-        if isinstance(a, list) and len(a) == 2 and isinstance(a[1], str):
-            return a[1]
-    return None
-
-
-def _literal_int(node) -> int | None:
-    """Extract the Int64 handle from an Alias([Literal, name]) node.
-
-    CONFIRMED at py-1.40.1 (Phase 2): the shape is
-        {"Literal": {"Scalar": {"Int64": <value>}}}
-    i.e. value at node["Alias"][0]["Literal"]["Scalar"]["Int64"]. We match that
-    primarily, with a couple of legacy/fallback shapes for resilience.
-    """
-    if isinstance(node, dict):
-        a = node.get("Alias")
-        if isinstance(a, list) and len(a) == 2 and isinstance(a[0], dict):
-            lit = a[0].get("Literal")
-            if isinstance(lit, dict):
-                # Primary (py-1.40.1): {"Scalar": {"Int64": N}}
-                scalar = lit.get("Scalar")
-                if isinstance(scalar, dict):
-                    for key in ("Int64", "Int32", "Int"):
-                        v = scalar.get(key)
-                        if isinstance(v, int):
-                            return v
-                # Fallbacks for other Polars revs.
-                for key in ("Int64", "Int32", "Int"):
-                    v = lit.get(key)
-                    if isinstance(v, int):
-                        return v
-                    if isinstance(v, dict) and isinstance(v.get("Int"), int):
-                        return v["Int"]
-            if isinstance(lit, int):
-                return lit
-    return None
 
 
 def _binding_from_expr_json(expr_json: dict, out_name: str) -> VectorBinding | None:
