@@ -1,9 +1,14 @@
-//! M6 A3: 1-D FFT over a whole column, run on the hand-rolled MSL FFT kernel
-//! (`polars_metal_kernels::fft::fft_gpu`). The kernel handles all sizes on-GPU
-//! (pow2 four-step/recursive, mixed-radix composites, Bluestein for primes /
-//! non-smooth), replacing the MLX FFT FFI (which was correct only to 2^20).
+//! M6 A3: 1-D FFT over a whole column, run on the hand-rolled MSL FFT kernel.
+//! The kernel handles all sizes on-GPU (pow2 four-step/recursive, mixed-radix
+//! composites, Bluestein for primes / non-smooth), replacing the MLX FFT FFI
+//! (which was correct only to 2^20).
+//!
+//! `fft_core` stages inputs as planar re/im buffers directly — no host
+//! interleave/split. Real input gets a zeroed imaginary plane. The planar
+//! kernel (`fft_gpu_planar_core`) reads/writes separate re/im MTLBuffers, so
+//! the result comes back planar with no host gather.
 
-use polars_metal_buffer::MetalDevice;
+use polars_metal_buffer::{MetalBuffer, MetalDevice};
 use polars_metal_mlx_sys::FfiError;
 
 /// Input to `fft_core`: a real F32 signal, or a complex signal as two F32 streams.
@@ -14,55 +19,51 @@ pub enum FftInput<'a> {
 
 /// Run a 1-D FFT (or inverse) over the whole signal. Returns `(real_out, imag_out)`,
 /// each length `n`, row order = bin order (matches numpy.fft).
+///
+/// Inputs are staged as planar re/im MTLBuffers — no host interleave/split.
+/// Real input receives a zeroed imaginary plane. The planar kernel handles all
+/// sizes on-GPU (pow2 four-step/recursive, mixed-radix, Bluestein).
 pub fn fft_core(
     input: FftInput<'_>,
     n: i64,
     inverse: bool,
 ) -> Result<(Vec<f32>, Vec<f32>), FfiError> {
     let len = n as usize;
-    // Build the interleaved-complex `[re,im,...]` host buffer (length 2n) the
-    // kernel expects.
-    //
-    // M5b-2 finding (honest-baseline discipline): moving this CPU interleave/split
-    // onto the GPU (via `fft_gpu_planar`) was MEASURED to REGRESS, not win. The
-    // CPU scatter/gather is a cache-friendly O(N) memcpy (~4-5ms @2^23,
-    // ~8-10ms @2^24); the on-device pack and unpack each pay a full
-    // command-buffer submit + `wait_until_complete` barrier + buffer alloc
-    // (~13ms / ~21ms each) — 2-3x SLOWER than the CPU work they replace, while the
-    // host input-stage and planar readback transfers are unchanged. Same lesson
-    // as the B4 bare-reduction spike: a trivial bandwidth-shaped O(N) shuffle
-    // loses on the GPU once it pays per-dispatch sync. So `fft_core` stays on the
-    // host interleave/split path; `fft_gpu_planar` (kernels crate) is kept as the
-    // correct building block IF a future fully-fused single-command-buffer
-    // pack->fft->unpack pipeline (no intermediate barriers) is ever built.
-    let mut interleaved = vec![0.0f32; 2 * len];
-    match input {
-        FftInput::Real(re) => {
-            for (i, &v) in re.iter().enumerate() {
-                interleaved[2 * i] = v;
-            }
-        }
-        FftInput::Complex(re, im) => {
-            for i in 0..len {
-                interleaved[2 * i] = re[i];
-                interleaved[2 * i + 1] = im[i];
-            }
-        }
-    }
-
     let device = MetalDevice::system_default()
         .map_err(|e| FfiError::Runtime(format!("metal device unavailable: {e}")))?;
-    let out = polars_metal_kernels::fft::fft_gpu(&device, &interleaved, n, inverse)
-        .map_err(|e| FfiError::Runtime(format!("fft kernel: {e}")))?;
 
-    // Split the interleaved transform (length 2n) back into separate streams.
-    let mut re_out = vec![0.0f32; len];
-    let mut im_out = vec![0.0f32; len];
-    for i in 0..len {
-        re_out[i] = out[2 * i];
-        im_out[i] = out[2 * i + 1];
-    }
-    Ok((re_out, im_out))
+    // Stage planar inputs directly — no host interleave.
+    // Real input gets a zeroed imaginary plane (zero imaginary input is correct
+    // for a real signal). The planar kernel reads/writes separate re/im buffers,
+    // so the result comes back planar with no host split.
+    let (re_in, im_in) = match input {
+        FftInput::Real(re) => {
+            let re_buf = MetalBuffer::from_f32_slice(&device, re)
+                .map_err(|e| FfiError::Runtime(format!("fft re staging: {e}")))?;
+            let im_buf = device
+                .new_buffer_zeroed(len * std::mem::size_of::<f32>())
+                .map_err(|e| FfiError::Runtime(format!("fft im staging: {e}")))?;
+            (re_buf, im_buf)
+        }
+        FftInput::Complex(re, im) => {
+            let re_buf = MetalBuffer::from_f32_slice(&device, re)
+                .map_err(|e| FfiError::Runtime(format!("fft re staging: {e}")))?;
+            let im_buf = MetalBuffer::from_f32_slice(&device, im)
+                .map_err(|e| FfiError::Runtime(format!("fft im staging: {e}")))?;
+            (re_buf, im_buf)
+        }
+    };
+    let re_out = device
+        .new_buffer_zeroed(len * std::mem::size_of::<f32>())
+        .map_err(|e| FfiError::Runtime(format!("fft re_out: {e}")))?;
+    let im_out = device
+        .new_buffer_zeroed(len * std::mem::size_of::<f32>())
+        .map_err(|e| FfiError::Runtime(format!("fft im_out: {e}")))?;
+    polars_metal_kernels::fft::fft_gpu_planar_core(
+        &device, &re_in, &im_in, &re_out, &im_out, n, inverse,
+    )
+    .map_err(|e| FfiError::Runtime(format!("fft kernel: {e}")))?;
+    Ok((re_out.to_f32_vec(), im_out.to_f32_vec()))
 }
 
 use pyo3::prelude::*;
