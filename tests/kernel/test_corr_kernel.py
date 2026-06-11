@@ -4,9 +4,11 @@ from polars_metal import _native
 
 
 def _gpu_corr(x: np.ndarray) -> np.ndarray:
+    # x is sample-major (n, p); the kernel takes a variable-major (p, n) buffer.
     n, p = x.shape
-    flat = np.ascontiguousarray(x, dtype=np.float32).reshape(-1)
-    out = _native.execute_corr((flat.ctypes.data, int(flat.size)), int(n), int(p))
+    pn = np.ascontiguousarray(x.T, dtype=np.float32)  # (p, n)
+    flat = pn.reshape(-1)
+    out = _native.execute_corr((flat.ctypes.data, int(flat.size)), int(p), int(n))
     return np.asarray(out, dtype=np.float32).reshape(p, p)
 
 

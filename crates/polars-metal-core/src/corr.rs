@@ -27,13 +27,20 @@ fn view2d(data: &[f32], rows: i64, cols: i64) -> Result<MlxArrayHandle, FfiError
     mlx_array_view_metal_buffer(buf, &[rows, cols], MlxDtype::F32)
 }
 
-/// Pearson correlation matrix of a row-major (n, p) F32 matrix → p*p row-major F32.
+/// Pearson correlation matrix of a **variable-major** row-major (p, n) F32 matrix
+/// — row `j` is the `n` samples of variable `j` — → p*p row-major F32.
 ///
-/// Columns with zero variance produce NaN (norm = 0 → division by zero in the
-/// per-column normalize), which matches Polars `df.corr()`. Callers that need to
+/// This (p, n) orientation is deliberate: Polars stores columns contiguously, so
+/// the Python layer hands us each column zero-copy and stacks them into a (p, n)
+/// buffer cheaply (≈12× faster than materializing a sample-major (n, p) array,
+/// which forces a host transpose). corr is orientation-symmetric, so we reduce
+/// over axis 1 and form `C = Zn · Znᵀ` instead of `Znᵀ · Zn`.
+///
+/// Variables with zero variance produce NaN (norm = 0 → division by zero in the
+/// per-row normalize), which matches Polars `df.corr()`. Callers that need to
 /// avoid NaN must validate upstream; the engine routes null/degenerate inputs to
 /// the CPU fallback (see the Python dispatch layer).
-pub fn corr_matrix(data: &[f32], n: i64, p: i64) -> Result<Vec<f32>, FfiError> {
+pub fn corr_matrix(data: &[f32], p: i64, n: i64) -> Result<Vec<f32>, FfiError> {
     // MLX reshape dims are i32; guard the (physically unreachable but type-unchecked)
     // p > i32::MAX case so a wide p can never silently wrap to a negative dim.
     if p > i64::from(i32::MAX) {
@@ -41,34 +48,35 @@ pub fn corr_matrix(data: &[f32], n: i64, p: i64) -> Result<Vec<f32>, FfiError> {
             "corr: column count {p} exceeds i32::MAX"
         )));
     }
-    let x = view2d(data, n, p)?; // (N,p)
-    let mean = mlx_reshape(&mlx_mean_axis(&x, 0)?, &[1, p as i32])?; // (1,p)
-    let xc = mlx_sub(&x, &mean)?; // (N,p) centered columns
-    let colss = mlx_reshape(&mlx_sum_axis(&mlx_mul(&xc, &xc)?, 0)?, &[1, p as i32])?; // (1,p)
-    let norm = mlx_sqrt(&colss)?; // (1,p) column L2 norms
-    let zn = mlx_div(&xc, &norm)?; // (N,p) unit-norm columns
-    let zt = mlx_transpose(&zn, &[1, 0])?; // (p,N)
-    let c = mlx_matmul(&zt, &zn)?; // (p,p)
+    let x = view2d(data, p, n)?; // (p,n), row j = variable j
+    let mean = mlx_reshape(&mlx_mean_axis(&x, 1)?, &[p as i32, 1])?; // (p,1)
+    let xc = mlx_sub(&x, &mean)?; // (p,n) centered rows
+    let rowss = mlx_reshape(&mlx_sum_axis(&mlx_mul(&xc, &xc)?, 1)?, &[p as i32, 1])?; // (p,1)
+    let norm = mlx_sqrt(&rowss)?; // (p,1) per-variable L2 norms
+    let zn = mlx_div(&xc, &norm)?; // (p,n) unit-norm rows
+    let zt = mlx_transpose(&zn, &[1, 0])?; // (n,p)
+    let c = mlx_matmul(&zn, &zt)?; // (p,p)
     mlx_array_eval(&[c.clone()])?;
     mlx_array_to_f32_vec(&c)
 }
 
 use pyo3::prelude::*;
 
-/// PyO3 entry: (ptr,len) row-major (n,p) F32 → flat p*p F32 correlation matrix.
-/// Mirrors vector_search::execute_vector_search's (ptr,len) ABI.
+/// PyO3 entry: (ptr,len) **variable-major** row-major (p,n) F32 → flat p*p F32
+/// correlation matrix. The (p,n) layout lets the Python layer stack zero-copy
+/// columns cheaply (see `corr_matrix`). Mirrors the (ptr,len) ABI.
 #[pyfunction]
-pub fn execute_corr(data: (usize, usize), n: i64, p: i64) -> PyResult<Vec<f32>> {
+pub fn execute_corr(data: (usize, usize), p: i64, n: i64) -> PyResult<Vec<f32>> {
     let (ptr, len) = data;
-    if n < 0 || p < 0 || (n as usize).saturating_mul(p as usize) != len {
+    if n < 0 || p < 0 || (p as usize).saturating_mul(n as usize) != len {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "polars_metal: corr dimension mismatch (n*p != len)",
+            "polars_metal: corr dimension mismatch (p*n != len)",
         ));
     }
     // SAFETY: Python guarantees ptr addresses `len` contiguous live F32 (numpy
     // array kept alive across the call); read-only, no invalid f32 patterns.
     let slice = unsafe { std::slice::from_raw_parts(ptr as *const f32, len) };
-    corr_matrix(slice, n, p)
+    corr_matrix(slice, p, n)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("corr: {e}")))
 }
 
@@ -79,11 +87,11 @@ mod tests {
 
     #[test]
     fn corr_2x2_known() {
-        // X (N=4, p=2), row-major: cols [1,2,3,4] and [2,1,4,3].
-        // centered c0=[-1.5,-0.5,0.5,1.5], c1=[-0.5,-1.5,1.5,0.5];
-        // dot=3.0, ||c0||=||c1||=sqrt(5); corr = 3/5 = 0.6.
-        let data: Vec<f32> = vec![1.0, 2.0, 2.0, 1.0, 3.0, 4.0, 4.0, 3.0];
-        let c = corr_matrix(&data, 4, 2).unwrap();
+        // Variable-major (p=2, n=4): row0 = var0 = [1,2,3,4], row1 = var1 = [2,1,4,3].
+        // centered v0=[-1.5,-0.5,0.5,1.5], v1=[-0.5,-1.5,1.5,0.5];
+        // dot=3.0, ||v0||=||v1||=sqrt(5); corr = 3/5 = 0.6.
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 2.0, 1.0, 4.0, 3.0];
+        let c = corr_matrix(&data, 2, 4).unwrap();
         assert_eq!(c.len(), 4);
         assert!((c[0] - 1.0).abs() < 1e-5, "C[0,0]={}", c[0]);
         assert!((c[1] - 0.6).abs() < 1e-5, "C[0,1]={}", c[1]);

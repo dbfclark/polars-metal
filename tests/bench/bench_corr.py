@@ -25,14 +25,16 @@ import pytest
 import polars_metal as pm
 from tests.bench.m4_survey._timing import time_callable
 
-# The canonical gate shape: large N, moderate-high p.  The spike measured up to
-# ~20x here; the engine path adds ingest + dispatch overhead, so the honest
-# engine number is lower.  We gate that GPU beats CPU (ratio_metal_over_cpu < 1)
-# with headroom at a conservative 0.5 (i.e. GPU must be >2x faster).  This
-# catches a dispatch-cliff regression without asserting the exact spike number.
+# The canonical gate shape: large N, moderate-high p.  After the (p,n) zero-copy
+# ingest optimization the honest engine number is ~9.9x here (ratio ~0.10); the
+# residual gap to the spike's raw-MLX ~20x is the host->Metal staging copy.  We
+# gate at a conservative 0.2 (GPU must be >5x faster) — well clear of the ~0.10
+# measurement, so it catches an ingest/dispatch-cliff regression (e.g. a return
+# to the df.to_numpy()+transpose path, which dropped this to ~2x) without
+# asserting the exact number.
 GATE_N = 1_000_000
 GATE_P = 50
-HONEST_RATIO_BOUND = 0.5  # metal_ms / cpu_ms must be < this to pass
+HONEST_RATIO_BOUND = 0.2  # metal_ms / cpu_ms must be < this to pass
 
 
 def _make_df(n: int, p: int, *, seed: int = 0xC1) -> pl.DataFrame:

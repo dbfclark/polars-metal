@@ -554,20 +554,27 @@ execution model.
 `Float32` p×p correlation matrix. Polars `df.corr()` returns `Float64`.
 
 - Values are F32-precision (~1e-5 relative error). The GPU path computes
-  `C = Znᵀ·Zn` entirely in MLX F32 (MLX has no F64); the output dtype is
-  F32 regardless of whether routing chose GPU or CPU fallback (the CPU
-  fallback path — small p / nulls / non-numeric inputs — calls `df.corr()`
-  and casts the result to F32 before returning).
+  `C = Zn·Znᵀ` (per-variable-normalized rows of a (p,n) buffer) entirely in
+  MLX F32 (MLX has no F64); the output dtype is F32 regardless of whether
+  routing chose GPU or CPU fallback (the CPU fallback path — small p / nulls /
+  non-numeric inputs — calls `df.corr()` and casts the result to F32 before
+  returning).
 - Output dtype is therefore **path-independent**: callers always get F32.
 - Routing: GPU when `p >= CORR_P_MIN=8` or `force_gpu=True`; else CPU
   `df.corr()` cast F32. Nulls / non-numeric inputs / `N < 2` are handled on
   CPU in all cases.
 
-**Honest engine-path perf:** ~2× at N=1M, p=50. Grows with p (compute/ingest
-∝ p; ~1.0–1.5× at p=10–25). The spike measured ~20× but timed resident
-raw-MLX arrays, not the engine path (serialize-detect + ingest + readback
-dominate at small p). Same pattern as B4 (bare reductions) and B3
-(dt.year/month/day).
+**Honest engine-path perf:** **~9.9× at N=1M, p=50** (grows with p: ~2.5× @p=10,
+~7.6× @p=25). The first cut measured only ~2×, bottlenecked entirely on host-side
+numpy copies: `df.to_numpy()` yields a column-major array, then `ascontiguousarray`
+transposes it to sample-major (n,p) — ~66ms of an 84ms path, while the GPU work was
+only ~11ms. Fix: Polars columns are already contiguous, so per-column `to_numpy()` is
+**zero-copy**; `np.stack` of them builds a **(p,n) variable-major** buffer in ~3.7ms,
+fed to a (p,n)-orientation kernel (the cheap-to-build layout is the one the kernel
+consumes). GPU time fell to ~18ms. Residual gap to the spike's raw-MLX ~20× is the
+host→Metal staging copy (irreducible: Polars 64-byte vs Metal 16KB page alignment).
+The "profile the ingest, don't assume the kernel is the cost" lesson echoes B3's
+StagingPool finding.
 
 **Same divergence class as "Mean F32 returns F32 not F64"** — the existing
 conformance baseline for group-by mean/median/quantile over integer columns
