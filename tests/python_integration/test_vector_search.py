@@ -246,3 +246,30 @@ def test_empty_corpus_returns_empty_hits():
     for qi in range(2):
         assert len(out["hits"][qi]["indices"]) == 0
         assert len(out["hits"][qi]["scores"]) == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# C3 — null guard: null rows in query or corpus raise a clear ValueError.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_vector_null_query_row_raises():
+    from polars_metal import MetalEngine
+
+    q = pl.Series(
+        "emb",
+        [[1.0, 0.0, 0.0, 0.0], None, [0.0, 1.0, 0.0, 0.0]],
+        dtype=pl.Array(pl.Float32, 4),
+    )
+    corpus = pl.DataFrame(
+        {
+            "emb": pl.Series(
+                "emb", [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]], dtype=pl.Array(pl.Float32, 4)
+            )
+        }
+    ).lazy()
+    qdf = pl.DataFrame({"emb": q})
+    with pytest.raises(ValueError, match="null"):
+        qdf.lazy().with_columns(pl.col("emb").metal.cosine_topk(corpus, k=1).alias("hits")).collect(
+            engine=MetalEngine()
+        )

@@ -25,6 +25,13 @@ def _array_col_to_matrix(s: pl.Series) -> tuple[np.ndarray, int, int]:
     """Return (contiguous (N*D) f32, N, D) for an Array(Float32, D) column."""
     if not isinstance(s.dtype, pl.Array) or s.dtype.inner != pl.Float32:
         raise ValueError(f"polars_metal vector search requires Array(Float32, D); got {s.dtype}")
+    null_count = s.null_count()
+    if null_count > 0:
+        raise ValueError(
+            f"polars_metal: .metal.cosine_topk/.knn does not support null rows in the "
+            f"query or corpus embedding column (column {s.name!r} has {null_count} "
+            "null rows). Drop or impute nulls first."
+        )
     d = s.dtype.size
     n = s.len()
     flat = s.to_numpy()  # Array(F32, D) → (N, D) ndarray
