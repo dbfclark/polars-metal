@@ -219,6 +219,55 @@ kernel void fft_stockham_pow2_f32(
     for (uint i = tid; i < n; i += tg_size) out[i] = src[i] * scale;
 }
 
+// PLANAR (SoA) variant of fft_stockham_pow2_f32. Identical butterfly math; the
+// ONLY difference is the global (device) buffer I/O: separate re/im planes
+// instead of one interleaved float2 buffer. The internal threadgroup `float2`
+// working buffers and the radix-2 Stockham butterfly loop are byte-for-byte the
+// same as the interleaved kernel above — only the cooperative load (reads
+// in_re[i]/in_im[i] into a float2) and the final store (splits the float2 back
+// into out_re[i]/out_im[i]) change. Buffer indices shift +2 vs interleaved
+// (two extra planes): in_re=0, in_im=1, out_re=2, out_im=3, n=4, inv=5.
+kernel void fft_stockham_pow2_planar_f32(
+    device const float* in_re  [[buffer(0)]],
+    device const float* in_im  [[buffer(1)]],
+    device float*       out_re [[buffer(2)]],
+    device float*       out_im [[buffer(3)]],
+    constant uint&      n      [[buffer(4)]],
+    constant uint&      inv    [[buffer(5)]],
+    uint tid                   [[thread_position_in_threadgroup]],
+    uint tg_size               [[threads_per_threadgroup]]) {
+    threadgroup float2 a[FFT_BASE_MAX];
+    threadgroup float2 b[FFT_BASE_MAX];
+    // cooperative load (planar -> float2)
+    for (uint i = tid; i < n; i += tg_size) a[i] = float2(in_re[i], in_im[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float2* src = a;
+    threadgroup float2* dst = b;
+    bool inverse = inv != 0;
+    uint nhalf = n >> 1;
+    for (uint ns = 1; ns < n; ns <<= 1) {
+        for (uint i = tid; i < nhalf; i += tg_size) {
+            uint j = i & (ns - 1);        // index within the sub-transform
+            uint block = i / ns;          // which sub-transform
+            // read pair at stride n/2 from src
+            float2 u = src[i];
+            float2 v = cmul(src[i + nhalf], twiddle(int(j), int(2 * ns), inverse));
+            // scatter contiguously into dst's 2*ns-sized output slot
+            uint out0 = block * (2 * ns) + j;
+            dst[out0]      = u + v;
+            dst[out0 + ns] = u - v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float2* t = src; src = dst; dst = t;
+    }
+    float scale = inverse ? (1.0f / float(n)) : 1.0f;
+    for (uint i = tid; i < n; i += tg_size) {
+        float2 vv = src[i] * scale;
+        out_re[i] = vv.x;
+        out_im[i] = vv.y;
+    }
+}
+
 // Dispatch the forward radix-r butterfly codelet (r in {2,3,4,5,6,7,8}).
 inline void radix_dispatch(uint r, thread float2* x, thread float2* y) {
     switch (r) {
@@ -300,5 +349,77 @@ kernel void fft_mixed_radix_f32(
     for (uint i = tid; i < n; i += tg_size) {
         float2 v = src[i];
         out[i] = inverse ? float2(v.x, -v.y) * scale : v * scale;
+    }
+}
+
+// PLANAR (SoA) variant of fft_mixed_radix_f32. Identical butterfly math (gather +
+// forward twiddle, radix_dispatch codelet, scatter) and identical inverse-by-
+// conjugation; the ONLY difference is the global buffer I/O — separate re/im
+// planes instead of one interleaved float2 buffer. The cooperative load reads
+// in_re[i]/in_im[i] into a float2 (conjugating on load if inverse), and the store
+// splits the float2 back into out_re[i]/out_im[i] (conjugating + scaling if
+// inverse). The threadgroup working buffers and the mixed-radix Stockham loop are
+// byte-for-byte the same as the interleaved kernel above. Buffer indices shift +2
+// vs interleaved (two extra planes): in_re=0, in_im=1, out_re=2, out_im=3, n=4,
+// inv=5, radices=6, n_radices=7.
+kernel void fft_mixed_radix_planar_f32(
+    device const float* in_re     [[buffer(0)]],
+    device const float* in_im     [[buffer(1)]],
+    device float*       out_re    [[buffer(2)]],
+    device float*       out_im    [[buffer(3)]],
+    constant uint&      n         [[buffer(4)]],
+    constant uint&      inv       [[buffer(5)]],
+    constant uint*      radices   [[buffer(6)]],
+    constant uint&      n_radices [[buffer(7)]],
+    uint tid                      [[thread_position_in_threadgroup]],
+    uint tg_size                  [[threads_per_threadgroup]]) {
+    threadgroup float2 a[FFT_BASE_MAX];
+    threadgroup float2 b[FFT_BASE_MAX];
+    bool inverse = inv != 0;
+    // cooperative load (planar -> float2); conjugate on load if inverse
+    for (uint i = tid; i < n; i += tg_size) {
+        float2 v = float2(in_re[i], in_im[i]);
+        a[i] = inverse ? float2(v.x, -v.y) : v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float2* src = a;
+    threadgroup float2* dst = b;
+    uint p = 1;
+    for (uint s = 0; s < n_radices; ++s) {
+        uint r = radices[s];
+        uint m = n / r;  // number of butterflies this stage
+        for (uint i = tid; i < m; i += tg_size) {
+            uint k = i % p;     // twiddle index within sub-transform
+            uint blk = i / p;   // which sub-transform block
+            float2 x[8];
+            float2 y[8];
+            // gather + forward twiddle (t=0 is multiply-by-1)
+            for (uint t = 0; t < r; ++t) {
+                float2 v = src[i + t * m];
+                if (t != 0) {
+                    v = cmul(v, twiddle(int(t * k), int(r * p), false));
+                }
+                x[t] = v;
+            }
+            radix_dispatch(r, x, y);
+            // scatter into contiguous (r*p)-sized output slot
+            uint base = blk * r * p + k;
+            for (uint t = 0; t < r; ++t) {
+                dst[base + t * p] = y[t];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float2* tmp = src; src = dst; dst = tmp;
+        p *= r;
+    }
+
+    // store; conjugate + 1/n scale if inverse (planar split)
+    float scale = inverse ? (1.0f / float(n)) : 1.0f;
+    for (uint i = tid; i < n; i += tg_size) {
+        float2 v = src[i];
+        float2 vv = inverse ? float2(v.x, -v.y) * scale : v * scale;
+        out_re[i] = vv.x;
+        out_im[i] = vv.y;
     }
 }

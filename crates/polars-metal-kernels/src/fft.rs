@@ -190,6 +190,99 @@ pub fn fft_gpu_buf(
     Ok(())
 }
 
+/// On-device PLANAR (SoA) FFT core: `re_in`/`im_in` (each length `n` f32) →
+/// `re_out`/`im_out` (each length `n` f32). No interleaving — the kernels read
+/// and write separate re/im global buffers directly, eliminating the host-side
+/// planar→interleaved pack and interleaved→planar unpack that wrap [`fft_gpu_buf`].
+///
+/// This is the parallel planar path to the proven interleaved [`fft_gpu_buf`];
+/// the planar kernels differ from the interleaved ones ONLY at global buffer I/O
+/// (the threadgroup butterfly math is identical), and a differential test
+/// verifies they match.
+///
+/// (M5c-1: only the single-threadgroup base case is implemented — `n <=
+/// FFT_BASE_MAX` that is pow2 or smooth-composite. Larger pow2 (four-step) returns
+/// [`FftError::Unsupported`] until M5c-2; non-smooth (Bluestein) until M5c-3.)
+///
+/// `inverse` applies 1/N scaling. Mirrors [`fft_gpu_buf`]'s `n <= FFT_BASE_MAX`
+/// dispatch exactly — same scalar-buffer construction and `dispatch_1d_with_tg`
+/// shape — only the buffer LIST gains the two extra planes and the pipeline name
+/// is the `_planar_` variant.
+pub fn fft_gpu_planar_core(
+    device: &MetalDevice,
+    re_in: &MetalBuffer,
+    im_in: &MetalBuffer,
+    re_out: &MetalBuffer,
+    im_out: &MetalBuffer,
+    n: i64,
+    inverse: bool,
+) -> Result<(), FftError> {
+    if n <= 0 {
+        return Err(FftError::Unsupported(n));
+    }
+    if n > FFT_BASE_MAX {
+        // Larger pow2 routes to the planar four-step path (M5c-2); not yet here.
+        return Err(FftError::Unsupported(n));
+    }
+    if (n & (n - 1)) != 0 && factorize(n).is_none() {
+        // Small non-smooth n (prime factor > 7) → planar Bluestein (M5c-3).
+        return Err(FftError::Unsupported(n));
+    }
+
+    let n_buf = device.new_buffer_from_bytes(&(n as u32).to_le_bytes())?;
+    let inv_buf = device.new_buffer_from_bytes(&u32::from(inverse).to_le_bytes())?;
+
+    let lib = shared_library(device)?;
+    let mut queue = CommandQueue::new(device)?;
+    // Single-threadgroup invariant: identical to fft_gpu_buf — grid_width =
+    // tg_width = tg, n <= FFT_BASE_MAX (1024) <= maxTotalThreadsPerThreadgroup, so
+    // the dispatch never splits into multiple threadgroups; the kernel strides by
+    // tg_size to cover all n points.
+    let tg = (n as usize).min(FFT_BASE_MAX as usize);
+
+    if (n & (n - 1)) == 0 {
+        // Power-of-two: planar radix-2 Stockham.
+        let pso = lib.pipeline("fft_stockham_pow2_planar_f32")?;
+        queue.dispatch_1d_with_tg(
+            &pso,
+            &[re_in, im_in, re_out, im_out, &n_buf, &inv_buf],
+            tg,
+            tg,
+        )?;
+    } else if let Some(radices) = factorize(n) {
+        // Composite smooth n: planar mixed-radix (3..8) Stockham.
+        let mut radix_bytes = Vec::with_capacity(radices.len() * 4);
+        for r in &radices {
+            radix_bytes.extend_from_slice(&r.to_le_bytes());
+        }
+        let radices_buf = device.new_buffer_from_bytes(&radix_bytes)?;
+        let n_radices_buf = device.new_buffer_from_bytes(&(radices.len() as u32).to_le_bytes())?;
+        let pso = lib.pipeline("fft_mixed_radix_planar_f32")?;
+        queue.dispatch_1d_with_tg(
+            &pso,
+            &[
+                re_in,
+                im_in,
+                re_out,
+                im_out,
+                &n_buf,
+                &inv_buf,
+                &radices_buf,
+                &n_radices_buf,
+            ],
+            tg,
+            tg,
+        )?;
+    } else {
+        // Unreachable: small non-smooth n was rejected above before reaching the
+        // single-threadgroup base path. Kept as a defensive guard.
+        return Err(FftError::Unsupported(n));
+    }
+
+    queue.wait_until_complete()?;
+    Ok(())
+}
+
 /// Bluestein host bridge for [`fft_gpu_buf`]: read `in_buf` → host, run the
 /// existing host-internal [`bluestein_dispatch`], memcpy its result into
 /// `out_buf`. Bluestein is the non-headline (prime / non-smooth N) path — its

@@ -3,10 +3,10 @@
 //! CPU DFT oracle in `polars_metal_kernels::fft`.
 #![allow(clippy::expect_used)]
 
-use polars_metal_buffer::MetalDevice;
+use polars_metal_buffer::{MetalBuffer, MetalDevice};
 use polars_metal_kernels::fft::{
     dft_reference, dispatch_pack_complex, dispatch_pack_real, dispatch_unpack, fft_gpu,
-    fft_gpu_planar, l2_rel_err,
+    fft_gpu_planar, fft_gpu_planar_core, l2_rel_err,
 };
 
 fn interleaved_signal(n: usize, seed: u64) -> Vec<f32> {
@@ -395,5 +395,52 @@ fn radix2_inverse_and_roundtrip() {
         let fwd = fft_gpu(&device, &sig, n as i64, false).expect("fft");
         let back = fft_gpu(&device, &fwd, n as i64, true).expect("ifft");
         assert!(l2_rel_err(&back, &sig) < 1e-4, "n={n} roundtrip");
+    }
+}
+
+#[test]
+fn fft_planar_core_matches_interleaved_small() {
+    // The PLANAR (SoA) single-threadgroup path must match the proven interleaved
+    // `fft_gpu`. COMPLEX input (both re and im nonzero) exercises the full planar
+    // load, not just the real-input zero-im case.
+    let device = MetalDevice::system_default().expect("device");
+    for &n in &[
+        2i64, 4, 8, 16, 64, 256, 1024, /* smooth: */ 6, 12, 360, 720,
+    ] {
+        for &inverse in &[false, true] {
+            let nn = n as usize;
+            let re: Vec<f32> = (0..nn).map(|i| ((i as f32) * 0.13).sin()).collect();
+            let im: Vec<f32> = (0..nn).map(|i| ((i as f32) * 0.07).cos() * 0.5).collect();
+            // interleaved reference
+            let mut inter = vec![0.0f32; 2 * nn];
+            for i in 0..nn {
+                inter[2 * i] = re[i];
+                inter[2 * i + 1] = im[i];
+            }
+            let ref_out = fft_gpu(&device, &inter, n, inverse).expect("fft_gpu");
+            // planar
+            let re_in = MetalBuffer::from_f32_slice(&device, &re).expect("re_in");
+            let im_in = MetalBuffer::from_f32_slice(&device, &im).expect("im_in");
+            let re_out = device.new_buffer_zeroed(nn * 4).expect("re_out");
+            let im_out = device.new_buffer_zeroed(nn * 4).expect("im_out");
+            fft_gpu_planar_core(&device, &re_in, &im_in, &re_out, &im_out, n, inverse)
+                .expect("planar core");
+            let ro = re_out.to_f32_vec();
+            let io = im_out.to_f32_vec();
+            for i in 0..nn {
+                assert!(
+                    (ro[i] - ref_out[2 * i]).abs() < 1e-3,
+                    "re n={n} inv={inverse} i={i}: {} vs {}",
+                    ro[i],
+                    ref_out[2 * i]
+                );
+                assert!(
+                    (io[i] - ref_out[2 * i + 1]).abs() < 1e-3,
+                    "im n={n} inv={inverse} i={i}: {} vs {}",
+                    io[i],
+                    ref_out[2 * i + 1]
+                );
+            }
+        }
     }
 }
