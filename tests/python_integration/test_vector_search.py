@@ -39,8 +39,8 @@ def test_sentinel_raises_on_plain_cpu():
     corpus = df.lazy()
     expr = pl.col("emb").metal.cosine_topk(corpus, k=1)
     # The opaque map_batches sentinel field fires on a plain CPU collect (no
-    # engine="metal") and raises our RuntimeError carrying the engine hint.
-    with pytest.raises(RuntimeError, match="engine='metal'"):
+    # engine="metal") and raises ComputeError carrying the engine hint (A1 correction).
+    with pytest.raises(pl.exceptions.ComputeError, match="engine='metal'"):
         df.lazy().with_columns(expr.alias("hits")).collect()  # no engine="metal"
 
 
@@ -57,8 +57,8 @@ def test_detect_finds_sentinel_binding():
     assert len(bindings) == 1
     b = bindings[0]
     assert b.out_name == "hits"
-    assert b.query_col == "emb"
-    assert b.handle in vns._CORPUS_CACHE  # not yet popped
+    assert b.col == "emb"
+    assert b.payload in vns._CACHE._specs  # not yet popped
 
 
 def test_dispatch_builds_struct_column_cosine():

@@ -12,9 +12,10 @@ def _frame(n=2000, p=10, seed=0):
 
 
 def test_corr_sentinel_raises_on_plain_cpu():
-    # .metal.corr() builds a sentinel lf; collected WITHOUT engine="metal" it must raise.
+    # .metal.corr() builds a sentinel lf; collected WITHOUT engine="metal" it must raise
+    # ComputeError (A1 correction: was RuntimeError, now ComputeError).
     lf = _frame().lazy().metal.corr()
-    with pytest.raises(RuntimeError):
+    with pytest.raises(pl.exceptions.ComputeError):
         lf.collect()
 
 
@@ -25,7 +26,7 @@ def test_corr_detect_finds_binding():
     bindings = _corr_detect.find_corr_bindings(lf)
     assert len(bindings) == 1
     assert bindings[0].out_name  # the sentinel column name
-    assert isinstance(bindings[0].handle, int)
+    assert isinstance(bindings[0].payload, int)
 
 
 def test_apply_corr_matches_numpy_gpu_path():
@@ -143,20 +144,20 @@ def test_corr_constant_column_nan_via_engine():
 
 
 def test_corr_spec_evicted_on_lf_gc():
-    """After lf is GC'd the spec must be evicted from _CORR_CACHE."""
+    """After lf is GC'd the spec must be evicted from _CACHE._specs."""
     import gc
 
     from polars_metal._corr_detect import find_corr_bindings
-    from polars_metal._corr_namespace import _CORR_CACHE
+    from polars_metal._corr_namespace import _CACHE
 
     df = _frame(n=2000, p=10, seed=12)
     lf = df.lazy().metal.corr()
     bindings = find_corr_bindings(lf)
     assert len(bindings) == 1
-    handle = bindings[0].handle
+    handle = bindings[0].payload
     # Trigger collect so the weakref.finalize is registered
     lf.collect(engine=pm.MetalEngine())
-    assert handle in _CORR_CACHE  # still alive — lf still referenced
+    assert handle in _CACHE._specs  # still alive — lf still referenced
     del lf
     gc.collect()
-    assert handle not in _CORR_CACHE  # evicted after lf is GC'd
+    assert handle not in _CACHE._specs  # evicted after lf is GC'd

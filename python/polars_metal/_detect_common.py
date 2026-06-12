@@ -8,7 +8,13 @@ fast path instead of falling through to O(N) lf.serialize().
 
 from __future__ import annotations
 
+import itertools
+import json
+import warnings
 import weakref
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from typing import Any
 
 import polars as pl
 import polars.lazyframe.frame as _plf
@@ -113,3 +119,147 @@ def install_with_columns_capture(attr: str, cache: dict) -> None:
         return result
 
     _plf.LazyFrame.with_columns = _patched  # type: ignore[method-assign]
+
+
+# --------------------------------------------------------------------------
+# M7-A spine: one capture cache, one sentinel binding, one parser, one
+# candidate-iteration scaffold, one sentinel-field builder. Replaces the
+# 4-6 near-identical detect modules + 3 cache triplets + 3 sentinel builders.
+#
+# NOTE: the spine does NOT own the _raise_cpu guard. Each verb keeps its own
+# _raise_cpu stub (verb-specific ComputeError message, pinned by match=
+# patterns in test_vector_search/test_corr_engine/test_fft) and passes it to
+# sentinel_fields(raise_fn=...). Keeps sentinels + messages byte-identical.
+# --------------------------------------------------------------------------
+
+
+class CaptureCache:
+    """Handle -> by-reference spec registry shared by the capture-based
+    .metal verbs (vector search, dtw, corr). Each verb instantiates its own
+    cache so handle spaces stay isolated and specs stay typed. fft needs no
+    cache (its op code is inlined in the sentinel literal)."""
+
+    def __init__(self) -> None:
+        self._specs: dict[int, Any] = {}
+        self._counter = itertools.count(1)
+
+    def capture(self, spec: Any) -> int:
+        handle = next(self._counter)
+        self._specs[handle] = spec
+        return handle
+
+    def get(self, handle: int) -> Any | None:
+        return self._specs.get(handle)
+
+    def evict(self, handle: int) -> None:
+        self._specs.pop(handle, None)
+
+
+@dataclass(frozen=True)
+class SentinelBinding:
+    """A detected struct-sentinel. ``col`` is the source column the tag was
+    suffixed with (``""`` for corr's exact tag). ``payload`` is the Int64
+    carried in the tagged literal: a cache handle (vector/dtw/corr) or an op
+    code (fft)."""
+
+    out_name: str
+    col: str
+    payload: int
+
+
+def make_sentinel_parser(
+    tag: str, *, exact: bool = False
+) -> Callable[[dict, str], SentinelBinding | None]:
+    """Return a parser ``(inner_json, out_name) -> SentinelBinding | None``.
+    ``exact=False`` (default): the tag is a prefix and its suffix is the
+    source column (vector/fft/dtw). ``exact=True``: the tag alias matches
+    exactly and there is no source column (corr)."""
+
+    def parse(inner_json: dict, out_name: str) -> SentinelBinding | None:
+        try:
+            if tag not in json.dumps(inner_json):
+                return None
+            col = ""
+            payload: int | None = None
+            for fld in _struct_fields(inner_json):
+                alias = _alias_name(fld)
+                if exact:
+                    if alias == tag:
+                        payload = _literal_int(fld)
+                elif alias and alias.startswith(tag):
+                    col = alias[len(tag) :]
+                    payload = _literal_int(fld)
+            if payload is None or (not exact and not col):
+                return None
+            return SentinelBinding(out_name=out_name, col=col, payload=payload)
+        except Exception:
+            return None
+
+    return parse
+
+
+def iter_candidate_nodes(
+    lf: pl.LazyFrame, *, cache: dict, explain_tags: tuple[str, ...]
+) -> Iterator[tuple[dict, str]]:
+    """Yield ``(inner_expr_json, out_name)`` for each top-level expression in
+    ``lf`` that might carry a sentinel or native marker. Fast path: serialize
+    each expr captured by the verb's with_columns monkey-patch (``cache``).
+    Slow fallback: ``explain()``-pre-filter on ``explain_tags`` then parse the
+    last ``"exprs":[...]`` fragment of the serialized plan. Any error -> stop
+    (yields nothing further)."""
+    try:
+        cached = lookup(cache, lf)
+        if cached is not None:
+            for expr in cached:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    j = json.loads(expr.meta.serialize(format="json"))
+                name = _alias_name(j)
+                yield (j["Alias"][0] if name else j, name or "")
+            return
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            if not any(t in lf.explain() for t in explain_tags):
+                return
+            plan = lf.serialize(format="json")
+        key = '"exprs":['
+        i = plan.rfind(key)
+        if i == -1:
+            return
+        start = i + len(key) - 1
+        j = plan.rfind(',"options":', start)
+        frag = plan[start:j] if j != -1 else plan[start:]
+        nodes = json.loads(frag)
+        for node in nodes if isinstance(nodes, list) else []:
+            name = _alias_name(node)
+            yield (node["Alias"][0] if name else node, name or "")
+    except Exception:
+        return
+
+
+def sentinel_fields(
+    expr: pl.Expr,
+    *,
+    tag: str,
+    payload: int,
+    raise_alias: str,
+    raise_fn: Callable,
+    col: str = "",
+    in_alias: str | None = None,
+    tag_exact: bool = False,
+    raise_expr: pl.Expr | None = None,
+) -> list[pl.Expr]:
+    """Build the struct field list every sentinel shares: an optional
+    pass-through input field, the tagged Int64 payload literal, and the guard
+    field (``raise_fn`` is the verb's own ``_raise_cpu`` stub, kept per-verb
+    so its ComputeError message stays unchanged). Preserves the exact
+    aliases/order of the pre-spine builders so serialized plans are
+    byte-identical."""
+    fields: list[pl.Expr] = []
+    if in_alias is not None:
+        fields.append(expr.alias(in_alias))
+    fields.append(pl.lit(payload, dtype=pl.Int64).alias(tag if tag_exact else f"{tag}{col}"))
+    raise_src = raise_expr if raise_expr is not None else expr
+    fields.append(raise_src.map_batches(raise_fn, return_dtype=pl.Float32).alias(raise_alias))
+    return fields

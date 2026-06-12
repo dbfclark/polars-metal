@@ -9,12 +9,11 @@ force_gpu flag live in a module cache keyed by the handle, popped at dispatch.
 
 from __future__ import annotations
 
-import itertools
 from dataclasses import dataclass
 
 import polars as pl
 
-_HANDLE_COUNTER = itertools.count(1)
+from polars_metal._detect_common import CaptureCache, sentinel_fields
 
 CORR_SENTINEL_TAG = "__pm_corr__"
 CORR_SENTINEL_COL = "__pm_corr_sentinel"
@@ -26,30 +25,19 @@ class CorrSpec:
     force_gpu: bool
 
 
-_CORR_CACHE: dict[int, CorrSpec] = {}
+_CACHE = CaptureCache()
 
 
 def _capture(columns: tuple[str, ...], force_gpu: bool) -> int:
-    handle = next(_HANDLE_COUNTER)
-    _CORR_CACHE[handle] = CorrSpec(columns, force_gpu)
-    return handle
+    return _CACHE.capture(CorrSpec(columns, force_gpu))
 
 
-def get_capture(handle: int) -> CorrSpec | None:
-    """Non-removing read. The dispatcher ties eviction to the lf lifetime via
-    weakref.finalize so repeated collects of the same lf reuse the spec, and
-    it is freed when the lf is GC'd."""
-    return _CORR_CACHE.get(handle)
-
-
-def evict_capture(handle: int) -> None:
-    """Remove the spec for *handle* from the cache. Registered as a weakref
-    finalizer on the dispatched LazyFrame so the entry is freed on lf GC."""
-    _CORR_CACHE.pop(handle, None)
+get_capture = _CACHE.get
+evict_capture = _CACHE.evict
 
 
 def _raise_cpu(_s: pl.Series) -> pl.Series:
-    raise RuntimeError(
+    raise pl.exceptions.ComputeError(
         "polars_metal: .metal.corr() requires collect(engine='metal'); "
         "it has no plain-CPU implementation. Use df.corr() for CPU."
     )
@@ -60,12 +48,14 @@ def build_corr_sentinel(any_col: str, handle: int) -> pl.Expr:
     selected) so the input columns survive for dispatch; dropped before the
     rest-collect under engine='metal'."""
     return pl.struct(
-        [
-            pl.lit(handle, dtype=pl.Int64).alias(CORR_SENTINEL_TAG),
-            pl.col(any_col)
-            .map_batches(_raise_cpu, return_dtype=pl.Float32)
-            .alias("__pm_corr_raise"),
-        ]
+        sentinel_fields(
+            pl.col(any_col),
+            tag=CORR_SENTINEL_TAG,
+            payload=handle,
+            raise_alias="__pm_corr_raise",
+            tag_exact=True,
+            raise_fn=_raise_cpu,
+        )
     ).alias(CORR_SENTINEL_COL)
 
 

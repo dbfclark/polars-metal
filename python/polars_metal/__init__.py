@@ -270,10 +270,6 @@ def _patch_gpu_engine_callback() -> None:
             if _is_fusion_candidate(self):
                 kwargs.pop("comm_subexpr_elim", None)
                 kwargs["optimizations"] = _opt_flags_without_cse(kwargs.pop("optimizations", None))
-            # M5 rolling: serialize-detected rolling_* run on a custom Metal kernel.
-            # Skip under streaming (adapter is in-memory only) and when nothing matches.
-            from polars_metal import _rolling_detect, _rolling_dispatch
-
             streaming = bool(kwargs.get("streaming") or kwargs.get("new_streaming"))
             if streaming:
                 import warnings as _w
@@ -298,78 +294,45 @@ def _patch_gpu_engine_callback() -> None:
                         "streaming=True (they have no CPU implementation). Collect without "
                         "streaming, or use a CPU equivalent."
                     )
-            rolling_bindings = [] if streaming else _rolling_detect.find_rolling_bindings(self)
-            if rolling_bindings:
+            # M5/M6 serialize-detected .metal verbs run on the GPU via the
+            # collect-and-stitch template. The five column-stitch verbs share
+            # one dispatch shape (detect -> if bindings: apply); corr is
+            # frame-replacing (single binding) and stays separate below.
+            from polars_metal import (
+                _dt_detect,
+                _dt_dispatch,
+                _dtw_detect,
+                _dtw_dispatch,
+                _fft_detect,
+                _fft_dispatch,
+                _rolling_detect,
+                _rolling_dispatch,
+                _vector_detect,
+                _vector_dispatch,
+            )
 
-                def _collect_rest(rest_lf: Any) -> Any:
-                    return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
+            def _collect_rest(rest_lf: Any) -> Any:
+                return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
 
-                return _rolling_dispatch.apply_rolling(self, rolling_bindings, _collect_rest)
+            _STITCH_VERBS = (
+                (_rolling_detect.find_rolling_bindings, _rolling_dispatch.apply_rolling),
+                (_vector_detect.find_vector_bindings, _vector_dispatch.apply_vector_search),
+                (_fft_detect.find_fft_bindings, _fft_dispatch.apply_fft),
+                (_dtw_detect.find_dtw_bindings, _dtw_dispatch.apply_dtw),
+                (_dt_detect.find_dt_bindings, _dt_dispatch.apply_dt),
+            )
+            for _find_fn, _apply_fn in _STITCH_VERBS:
+                _bindings = [] if streaming else _find_fn(self)
+                if _bindings:
+                    return _apply_fn(self, _bindings, _collect_rest)
 
-            # M6 vector search: serialize-detected .metal.cosine_topk/.knn sentinels
-            # run on the GPU via the same M5 collect-and-stitch template. Placed after
-            # the rolling block; the two don't co-occur in one outermost layer in
-            # practice (and if they did, rolling consumes first — acceptable for MVP).
-            from polars_metal import _vector_detect, _vector_dispatch
-
-            vector_bindings = [] if streaming else _vector_detect.find_vector_bindings(self)
-            if vector_bindings:
-
-                def _collect_rest_vs(rest_lf: Any) -> Any:
-                    return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
-
-                return _vector_dispatch.apply_vector_search(self, vector_bindings, _collect_rest_vs)
-            # M6 A3 FFT: serialize-detected .metal.fft()/.ifft() sentinels run on the GPU via
-            # the same collect-and-stitch template. Independent with_columns patch/cache, so it
-            # coexists with rolling + vector search.
-            from polars_metal import _fft_detect, _fft_dispatch
-
-            fft_bindings = [] if streaming else _fft_detect.find_fft_bindings(self)
-            if fft_bindings:
-
-                def _collect_rest_fft(rest_lf: Any) -> Any:
-                    return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
-
-                return _fft_dispatch.apply_fft(self, fft_bindings, _collect_rest_fft)
-            # M6 A4 DTW: serialize-detected .metal.dtw sentinels run on the banded
-            # DTW Metal kernel via the same collect-and-stitch template. Independent
-            # with_columns patch/cache; coexists with rolling/vector/fft.
-            from polars_metal import _dtw_detect, _dtw_dispatch
-
-            dtw_bindings = [] if streaming else _dtw_detect.find_dtw_bindings(self)
-            if dtw_bindings:
-
-                def _collect_rest_dtw(rest_lf: Any) -> Any:
-                    return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
-
-                return _dtw_dispatch.apply_dtw(self, dtw_bindings, _collect_rest_dtw)
-            # M6 B3 dt: serialize-detected dt.year/month/day run on the gregorian
-            # Metal kernel via the same collect-and-stitch template. Independent
-            # with_columns patch/cache; coexists with rolling/vector/fft.
-            from polars_metal import _dt_detect, _dt_dispatch
-
-            dt_bindings = [] if streaming else _dt_detect.find_dt_bindings(self)
-            if dt_bindings:
-
-                def _collect_rest_dt(rest_lf: Any) -> Any:
-                    return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
-
-                return _dt_dispatch.apply_dt(self, dt_bindings, _collect_rest_dt)
-            # M6 corr: serialize-detected lf.metal.corr() runs the MLX corr
-            # subgraph and REPLACES the frame with the pxp matrix (frame-
-            # replacing, unlike the column-stitch verbs above). Own patch/cache.
+            # corr is frame-replacing (REPLACES the frame with the pxp matrix),
+            # so it passes a SINGLE binding, not the list — kept separate.
             from polars_metal import _corr_detect, _corr_dispatch
 
             corr_bindings = [] if streaming else _corr_detect.find_corr_bindings(self)
             if corr_bindings:
-
-                def _collect_rest_corr(rest_lf: Any) -> Any:
-                    return original_collect(rest_lf, engine="cpu", post_opt_callback=cb, **kwargs)
-
-                # apply_corr takes a SINGLE binding (not the list the sibling
-                # verbs pass): corr is frame-replacing, so at most one sentinel
-                # per lf is meaningful — pass the first directly.
-                return _corr_dispatch.apply_corr(self, corr_bindings[0], _collect_rest_corr)
+                return _corr_dispatch.apply_corr(self, corr_bindings[0], _collect_rest)
             # post_opt_callback is an internal bypass that injects a callback
             # directly, skipping _gpu_engine_callback. We run the query on
             # the CPU engine; in M0 our callback falls through, so the result

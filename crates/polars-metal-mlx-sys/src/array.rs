@@ -217,7 +217,7 @@ pub fn mlx_array_eval(handles: &[MlxArrayHandle]) -> Result<(), FfiError> {
 /// `Vec` for a zero-element array without touching the C++ side.
 ///
 /// The copy is a raw `memcpy` in storage order, so it assumes the array is **row-major
-/// contiguous** (see `mlx_array_to_i32_vec` for the strided-producer caveat).
+/// contiguous** (see the `impl_to_vec!` macro for the strided-producer caveat).
 ///
 /// # Errors
 /// Returns `FfiError::DtypeMismatch` if the array's dtype is not F32.
@@ -241,29 +241,14 @@ pub fn mlx_array_to_f32_vec(handle: &MlxArrayHandle) -> Result<Vec<f32>, FfiErro
     Ok(out)
 }
 
-/// Read a materialized I32 array back to a host `Vec<i32>`. Call after `mlx_array_eval`.
+/// Generate a `mlx_array_to_<t>_vec` readback wrapper: a row-major-contiguous
+/// `memcpy` after eval. Callers must ensure the handle's dtype matches `$t`
+/// (the subgraph builder checks via `MlxArrayHandle::dtype()` before dispatch).
 ///
-/// The copy is a raw `memcpy` in storage order, so it assumes the array is **row-major
-/// contiguous**. Any producer that yields a strided/transposed view (e.g. `mlx_transpose`,
-/// `mlx_slice`) must be materialized via `mlx::core::contiguous(...)` before readback — the
-/// shape wrappers already do this internally.
-pub fn mlx_array_to_i32_vec(handle: &MlxArrayHandle) -> Result<Vec<i32>, FfiError> {
-    let n: usize = handle.shape().iter().product();
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let mut out = vec![0i32; n];
-    // SAFETY: `out` has exactly `n` i32 slots; matches the array element count.
-    // The array is eval'd (caller contract) and I32 (caller contract), so
-    // `arr->data<int32_t>()` is valid for `n` elements.
-    unsafe { ffi::mlx_array_copy_to_i32(&handle.ptr, out.as_mut_ptr(), n) };
-    Ok(out)
-}
-
-/// Generate a `mlx_array_to_<t>_vec` readback wrapper mirroring
-/// `mlx_array_to_i32_vec`: row-major-contiguous memcpy after eval. Callers
-/// are responsible for ensuring the handle's dtype matches `$t` (the
-/// subgraph builder checks via `MlxArrayHandle::dtype()` before dispatch).
+/// The copy assumes the array is **row-major contiguous**: any producer that
+/// yields a strided/transposed view (e.g. `mlx_transpose`, `mlx_slice`) must be
+/// materialized via `mlx::core::contiguous(...)` before readback — the shape
+/// wrappers already do this internally.
 macro_rules! impl_to_vec {
     ($fn_name:ident, $t:ty, $ffi:path) => {
         #[doc = concat!("Read a materialized array back to a host `Vec<", stringify!($t), ">`. Call after `mlx_array_eval`.")]
@@ -281,6 +266,7 @@ macro_rules! impl_to_vec {
         }
     };
 }
+impl_to_vec!(mlx_array_to_i32_vec, i32, ffi::mlx_array_copy_to_i32);
 impl_to_vec!(mlx_array_to_i8_vec, i8, ffi::mlx_array_copy_to_i8);
 impl_to_vec!(mlx_array_to_i16_vec, i16, ffi::mlx_array_copy_to_i16);
 impl_to_vec!(mlx_array_to_i64_vec, i64, ffi::mlx_array_copy_to_i64);

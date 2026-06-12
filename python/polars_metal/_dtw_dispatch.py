@@ -16,7 +16,7 @@ import numpy as np
 import polars as pl
 
 from polars_metal import _native
-from polars_metal._dtw_detect import DtwBinding
+from polars_metal._detect_common import SentinelBinding
 from polars_metal._dtw_namespace import DtwSpec, evict_capture, get_capture
 
 MAX_L = 1024  # keep in sync with crates/polars-metal-kernels/src/dtw.rs
@@ -30,7 +30,7 @@ def _cpu_fallback(s: pl.Series, spec: DtwSpec, out_name: str) -> pl.Series:
     try:
         from dtaidistance import dtw as _dtwlib
     except ImportError as exc:  # pragma: no cover
-        raise RuntimeError(
+        raise pl.exceptions.ComputeError(
             "polars_metal: .metal.dtw allow_cpu_fallback=True needs the 'dtaidistance' "
             "package for unsupported shapes; install it (pip install dtaidistance)."
         ) from exc
@@ -61,11 +61,13 @@ def _seq_matrix(s: pl.Series) -> tuple[np.ndarray, int, int]:
     return m, n, L
 
 
-def _run_binding(frame: pl.DataFrame, b: DtwBinding) -> pl.Series:
-    spec: DtwSpec | None = get_capture(b.handle)
+def _run_binding(frame: pl.DataFrame, b: SentinelBinding) -> pl.Series:
+    spec: DtwSpec | None = get_capture(b.payload)
     if spec is None:
-        raise RuntimeError("polars_metal: dtw spec handle missing (already consumed?)")
-    s = frame.get_column(b.query_col).rechunk()
+        raise pl.exceptions.ComputeError(
+            "polars_metal: dtw spec handle missing (already consumed?)"
+        )
+    s = frame.get_column(b.col).rechunk()
     if not _gpu_supported(s):
         if spec.allow_cpu_fallback:
             return _cpu_fallback(s, spec, b.out_name)
@@ -119,14 +121,14 @@ def _run_binding(frame: pl.DataFrame, b: DtwBinding) -> pl.Series:
     return res
 
 
-def apply_dtw(lf: pl.LazyFrame, bindings: list[DtwBinding], collect_fn) -> pl.DataFrame:
+def apply_dtw(lf: pl.LazyFrame, bindings: list[SentinelBinding], collect_fn) -> pl.DataFrame:
     out_names = [b.out_name for b in bindings]
     order = lf.collect_schema().names()
     # Tie spec eviction to the lf lifetime (repeated collects of the same lf
     # reuse the spec; it is freed when the lf is GC'd). Registering twice is
     # harmless — both do an idempotent dict.pop.
     for b in bindings:
-        weakref.finalize(lf, evict_capture, b.handle)
+        weakref.finalize(lf, evict_capture, b.payload)
     rest_lf = lf.drop(out_names)
     df = collect_fn(rest_lf)
     cols: dict[str, pl.Series] = {c: df.get_column(c) for c in df.columns}

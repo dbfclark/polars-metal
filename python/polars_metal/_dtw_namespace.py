@@ -8,13 +8,12 @@ module-global cache keyed by the handle, popped at dispatch.
 
 from __future__ import annotations
 
-import itertools
 from dataclasses import dataclass
 from typing import Any
 
 import polars as pl
 
-_HANDLE_COUNTER = itertools.count(1)
+from polars_metal._detect_common import CaptureCache, sentinel_fields
 
 DTW_SENTINEL_TAG = "__pm_dtw__"
 
@@ -27,30 +26,19 @@ class DtwSpec:
     query_col: str
 
 
-_DTW_CACHE: dict[int, DtwSpec] = {}
+_CACHE = CaptureCache()
 
 
 def _capture(reference: Any, window: int | None, allow_cpu_fallback: bool, query_col: str) -> int:
-    handle = next(_HANDLE_COUNTER)
-    _DTW_CACHE[handle] = DtwSpec(reference, window, allow_cpu_fallback, query_col)
-    return handle
+    return _CACHE.capture(DtwSpec(reference, window, allow_cpu_fallback, query_col))
 
 
-def get_capture(handle: int) -> DtwSpec | None:
-    """Non-removing read. The dispatcher ties eviction to the lf lifetime via
-    weakref.finalize so repeated collects of the same lf reuse the spec, and
-    it is freed when the lf is GC'd."""
-    return _DTW_CACHE.get(handle)
-
-
-def evict_capture(handle: int) -> None:
-    """Remove the spec for *handle* from the cache. Registered as a weakref
-    finalizer on the dispatched LazyFrame so the entry is freed on lf GC."""
-    _DTW_CACHE.pop(handle, None)
+get_capture = _CACHE.get
+evict_capture = _CACHE.evict
 
 
 def _raise_cpu(_s: pl.Series) -> pl.Series:
-    raise RuntimeError(
+    raise pl.exceptions.ComputeError(
         "polars_metal: .metal.dtw requires collect(engine='metal'); "
         "it has no plain-CPU implementation."
     )
@@ -61,11 +49,15 @@ def build_dtw_sentinel(seq_expr: pl.Expr, query_col: str, handle: int) -> pl.Exp
     Dispatch drops this output column before the CPU collect (the map_batches
     never runs) and replaces it with the GPU F32 distance column."""
     return pl.struct(
-        [
-            seq_expr.alias("__pm_dtw_seq"),
-            pl.lit(handle, dtype=pl.Int64).alias(f"{DTW_SENTINEL_TAG}{query_col}"),
-            seq_expr.map_batches(_raise_cpu, return_dtype=pl.Float32).alias("__pm_dtw_raise"),
-        ]
+        sentinel_fields(
+            seq_expr,
+            tag=DTW_SENTINEL_TAG,
+            payload=handle,
+            col=query_col,
+            in_alias="__pm_dtw_seq",
+            raise_alias="__pm_dtw_raise",
+            raise_fn=_raise_cpu,
+        )
     )
 
 

@@ -16,15 +16,13 @@ collected lf's lifetime via weakref.finalize (so a repeated collect of the same 
 
 from __future__ import annotations
 
-import itertools
 from dataclasses import dataclass
 from typing import Any
 
 import polars as pl
 
 from polars_metal import _dtw_namespace, _fft_namespace
-
-_HANDLE_COUNTER = itertools.count(1)
+from polars_metal._detect_common import CaptureCache, sentinel_fields
 
 
 @dataclass(frozen=True)
@@ -36,38 +34,23 @@ class CorpusSpec:
     query_col: str
 
 
-# Handle-id → corpus spec, held BY-REFERENCE. Read non-removingly at dispatch
-# (get_capture) and evicted when the collected lf is GC'd (weakref.finalize →
-# evict_capture). NOTE: a captured expr that is built but never collected under
-# engine="metal" leaks its entry (and the corpus it references) until process exit —
-# inherent to the by-reference design; acceptable for the MVP.
-_CORPUS_CACHE: dict[int, CorpusSpec] = {}
-
 # Magic prefix embedded in the sentinel's Int64-literal field alias so the
 # serialize detector can find our bindings unambiguously.
 SENTINEL_TAG = "__pm_vsearch__"
 
+_CACHE = CaptureCache()
+
 
 def _capture_corpus(corpus: Any, corpus_col: str, k: int, metric: str, query_col: str = "") -> int:
-    handle = next(_HANDLE_COUNTER)
-    _CORPUS_CACHE[handle] = CorpusSpec(corpus, corpus_col, k, metric, query_col)
-    return handle
+    return _CACHE.capture(CorpusSpec(corpus, corpus_col, k, metric, query_col))
 
 
-def get_capture(handle: int) -> CorpusSpec | None:
-    """Non-removing read (repeated collect of the same lf reuses the corpus spec;
-    the dispatcher ties eviction to the lf lifetime via weakref.finalize)."""
-    return _CORPUS_CACHE.get(handle)
-
-
-def evict_capture(handle: int) -> None:
-    """Remove the spec for *handle* from the cache. Registered as a weakref
-    finalizer on the dispatched LazyFrame so the entry is freed on lf GC."""
-    _CORPUS_CACHE.pop(handle, None)
+get_capture = _CACHE.get
+evict_capture = _CACHE.evict
 
 
 def _raise_cpu(_s: pl.Series) -> pl.Series:
-    raise RuntimeError(
+    raise pl.exceptions.ComputeError(
         "polars_metal: .metal.cosine_topk/.knn require collect(engine='metal'); "
         "they have no CPU implementation."
     )
@@ -84,11 +67,15 @@ def build_sentinel(query_col_expr: pl.Expr, query_col_name: str, handle: int) ->
     map_batches never executes; on plain CPU it executes and raises.
     """
     return pl.struct(
-        [
-            query_col_expr.alias("__pm_vs_query"),
-            pl.lit(handle, dtype=pl.Int64).alias(f"{SENTINEL_TAG}{query_col_name}"),
-            query_col_expr.map_batches(_raise_cpu, return_dtype=pl.Float32).alias("__pm_vs_raise"),
-        ]
+        sentinel_fields(
+            query_col_expr,
+            tag=SENTINEL_TAG,
+            payload=handle,
+            col=query_col_name,
+            in_alias="__pm_vs_query",
+            raise_alias="__pm_vs_raise",
+            raise_fn=_raise_cpu,
+        )
     )
 
 
