@@ -38,8 +38,8 @@ def test_find_fft_bindings_recovers_col_and_op():
     bindings = _fft_detect.find_fft_bindings(lf)
     assert len(bindings) == 1
     assert bindings[0].out_name == "spec"
-    assert bindings[0].input_col == "sig"
-    assert bindings[0].op == fns.OP_FFT
+    assert bindings[0].col == "sig"
+    assert bindings[0].payload == fns.OP_FFT
 
 
 def test_fft_matches_numpy_end_to_end():

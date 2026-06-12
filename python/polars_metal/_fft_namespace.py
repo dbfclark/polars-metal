@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import polars as pl
 
+from polars_metal._detect_common import sentinel_fields
+
 # op codes carried in the sentinel's Int64 literal (must match _fft_dispatch's inverse check).
 OP_FFT = 0
 OP_IFFT = 1
@@ -39,9 +41,13 @@ def build_fft_sentinel(input_expr: pl.Expr, input_col: str, op: int) -> pl.Expr:
     map_batches never executes; on plain CPU it executes and raises.
     """
     return pl.struct(
-        [
-            input_expr.alias("__pm_fft_in"),
-            pl.lit(op, dtype=pl.Int64).alias(f"{FFT_SENTINEL_TAG}{input_col}"),
-            input_expr.map_batches(_raise_cpu, return_dtype=pl.Float32).alias("__pm_fft_raise"),
-        ]
+        sentinel_fields(
+            input_expr,
+            tag=FFT_SENTINEL_TAG,
+            payload=op,
+            col=input_col,
+            in_alias="__pm_fft_in",
+            raise_alias="__pm_fft_raise",
+            raise_fn=_raise_cpu,
+        )
     )

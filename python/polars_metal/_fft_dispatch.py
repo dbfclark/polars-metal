@@ -16,7 +16,7 @@ import numpy as np
 import polars as pl
 
 from polars_metal import _native
-from polars_metal._fft_detect import FftBinding
+from polars_metal._detect_common import SentinelBinding
 from polars_metal._fft_namespace import OP_IFFT
 
 # The hand-rolled MSL FFT kernel (polars_metal_kernels::fft) handles ALL sizes on-GPU —
@@ -67,13 +67,13 @@ def _input_streams(s: pl.Series) -> tuple[np.ndarray, np.ndarray | None, int]:
     )
 
 
-def _run_binding(df: pl.DataFrame, b: FftBinding) -> pl.Series:
-    re, im, n = _input_streams(df.get_column(b.input_col))
+def _run_binding(df: pl.DataFrame, b: SentinelBinding) -> pl.Series:
+    re, im, n = _input_streams(df.get_column(b.col))
     if n == 0:
         return pl.DataFrame(
             {"real": np.empty(0, np.float32), "imag": np.empty(0, np.float32)}
         ).to_struct(b.out_name)
-    inverse = b.op == OP_IFFT
+    inverse = b.payload == OP_IFFT
     try:
         imag_arg = None if im is None else (im.ctypes.data, im.size)
         real_bytes, imag_bytes = _native.execute_fft(
@@ -95,7 +95,7 @@ def _run_binding(df: pl.DataFrame, b: FftBinding) -> pl.Series:
     return pl.DataFrame({"real": real_out, "imag": imag_out}).to_struct(b.out_name)
 
 
-def apply_fft(lf: pl.LazyFrame, bindings: list[FftBinding], collect_fn) -> pl.DataFrame:
+def apply_fft(lf: pl.LazyFrame, bindings: list[SentinelBinding], collect_fn) -> pl.DataFrame:
     """Dispatch FFT bindings to the GPU and stitch struct columns in. *collect_fn(rest_lf)*
     collects the non-sentinel columns; dropping the sentinel output columns elides their
     computation (including the opaque map_batches(_raise)) via projection pushdown."""
