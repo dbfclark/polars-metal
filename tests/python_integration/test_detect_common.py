@@ -38,3 +38,47 @@ def test_lookup_does_not_pop_and_evicts_on_gc():
     del lf
     gc.collect()
     assert len(cache) == 0  # weakref callback evicted on GC
+
+
+def test_capture_cache_roundtrip():
+    cache = dc.CaptureCache()
+    h1 = cache.capture("spec-a")
+    h2 = cache.capture("spec-b")
+    assert h1 != h2
+    assert cache.get(h1) == "spec-a"
+    assert cache.get(h2) == "spec-b"
+    cache.evict(h1)
+    assert cache.get(h1) is None
+    assert cache.get(h2) == "spec-b"
+    cache.evict(99999)  # evicting an absent handle is a no-op
+
+
+def test_sentinel_binding_fields():
+    b = dc.SentinelBinding(out_name="o", col="c", payload=7)
+    assert (b.out_name, b.col, b.payload) == ("o", "c", 7)
+
+
+def test_make_sentinel_parser_prefix():
+    tag = "__pm_test__"
+    parse = dc.make_sentinel_parser(tag)
+    fields = [
+        {"Alias": [{"Column": "x"}, "__pm_in"]},
+        {"Alias": [{"Literal": {"Scalar": {"Int64": 42}}}, f"{tag}myCol"]},
+    ]
+    node = {"Function": {"input": fields, "function": {"AsStruct": None}}}
+    b = parse(node, "out")
+    assert b == dc.SentinelBinding(out_name="out", col="myCol", payload=42)
+
+
+def test_make_sentinel_parser_exact():
+    tag = "__pm_corr__"
+    parse = dc.make_sentinel_parser(tag, exact=True)
+    fields = [{"Alias": [{"Literal": {"Scalar": {"Int64": 5}}}, tag]}]
+    node = {"Function": {"input": fields, "function": {"AsStruct": None}}}
+    b = parse(node, "out")
+    assert b == dc.SentinelBinding(out_name="out", col="", payload=5)
+
+
+def test_make_sentinel_parser_no_tag_returns_none():
+    parse = dc.make_sentinel_parser("__pm_test__")
+    assert parse({"Column": "x"}, "out") is None
