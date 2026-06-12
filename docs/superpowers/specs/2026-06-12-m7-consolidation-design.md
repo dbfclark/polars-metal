@@ -107,6 +107,15 @@ consolidate the second routing point — move `decide_groupby_dispatch` toward `
 it must stay at execution time (expressions have no per-agg fallback), document why at the call
 site so it can't silently drift from `router/cost.rs`.
 
+**B4. MLX FFI wrapper parametrization (pure DRY).** Collapse the 8 per-width integer copy
+functions in `crates/polars-metal-mlx-sys/src/lib.rs` (`mlx_array_copy_to_i32`, `_i8`, `_i16`,
+`_i64`, `_u8`, `_u16`, `_u32`, `_u64`) into one parametric `mlx_array_copy_to_dtype(arr,
+dtype_tag, out_ptr, n)` FFI entry + a Rust-side dispatcher on `MlxDtype`. Reduces the FFI
+boundary from 8 near-identical wrappers to 1. Behavior-identical; pin with existing
+vector/fft/int-readback tests before folding. (Pulled into M7 from the M8 deferral list — it is
+pure consolidation with no perf implication; the FFT dual-core fold stays in M8 because it
+carries behavior risk, B4 does not.)
+
 ### Workstream C — Coverage & hardening
 
 **C1. Restore the differential harness (highest-leverage; do first).** Build a lean
@@ -137,16 +146,15 @@ A1 verb-contract doc.
    non-goal). B2 *folds* the existing dtype arms; it adds **no new groupby dtypes** (the survey's
    "integer groupby parity gap" is intentionally *not* filled — extending groupby violates the
    non-goal).
-4. **No new perf kernels.** FFT dual-core fold and MLX-wrapper parametrization are deferred to
-   M8 (see §5).
+4. **No new perf kernels.** The FFT dual-core fold is deferred to M8 (see §5). (The MLX-wrapper
+   parametrization, originally bundled with it, was pulled into M7 as B4 — it is pure DRY with
+   no perf or behavior implication.)
 
 ## 5. Explicitly out of scope (deferred to M8)
 
 - **FFT dual-core fold** (~187 lines planar duplicating interleaved). Real consolidation, but
   delicate — Bluestein (prime/non-smooth sizes) and the differential oracle depend on the
   interleaved core — so it carries behavior risk disproportionate to a cleanup milestone.
-- **MLX per-width copy-wrapper parametrization** (8 fns → 1 dispatcher). Pure DRY, but it touches
-  the `-sys` FFI boundary; bundled with the FFT fold as an M8 kernel/FFI-layer pass.
 - **All perf-deepening** (cooperative-wavefront DTW, fused single-command-buffer pipelines,
   custom `corr.metal`) — these are M8+ flagship candidates, not M7.
 - **Large Python files** (`_walker.py`, `_udf.py`, `_fusion_analyzer.py`, ~1.5k lines each):
@@ -161,7 +169,8 @@ parallel** (disjoint files: Python vs Rust). Coverage/doc tidy (C2, C3) last.
 **Definition of done:**
 - `make gate` green; the differential harness runs under `make test-diff`.
 - Line-count reductions realized: Python namespace ≈525 → ≈165; the three Rust dtype-dispatch
-  sites folded via `per_dtype!`; `udf.rs` split into the four named modules.
+  sites folded via `per_dtype!`; `udf.rs` split into the four named modules; the 8 MLX integer
+  copy wrappers folded to one parametric FFI entry.
 - The verb-contract doc and the rolling-F64-is-CPU note are committed.
 - Zero behavior changes except the deliberately-corrected contracts, each test-pinned.
 
