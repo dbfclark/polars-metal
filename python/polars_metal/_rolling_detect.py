@@ -86,12 +86,14 @@ Slow fallback (full plan serialize + partial JSON parse, O(N)):
     2. lf.serialize(format="json") + rfind-based partial parse of the "exprs"
        fragment — avoids json.loads on the full (potentially huge) plan string.
   This still pays O(N) for the serialize, but avoids the O(N) json.loads.
+
+M7 A-2: rolling keeps its rich, schema-validated RollingBinding (not the
+generic SentinelBinding) -- it shares only the candidate-iteration scaffold
+from _detect_common.iter_candidate_nodes.
 """
 
 from __future__ import annotations
 
-import json
-import warnings
 from dataclasses import dataclass
 
 import polars as pl
@@ -231,69 +233,30 @@ def _parse_rolling_expr(
         return None
 
 
-def _extract_hstack(plan: dict) -> dict | None:
-    """Extract the HStack node from a plan dict.
-
-    Handles two forms:
-      - Direct: {"HStack": {...}}
-      - After schema resolution: {"IR": {"dsl": {"HStack": {...}}, ...}}
-
-    Returns the HStack dict, or None if not present in either form.
-    """
-    hstack = plan.get("HStack")
-    if isinstance(hstack, dict):
-        return hstack
-    ir = plan.get("IR")
-    if isinstance(ir, dict):
-        dsl = ir.get("dsl")
-        if isinstance(dsl, dict):
-            hstack = dsl.get("HStack")
-            if isinstance(hstack, dict):
-                return hstack
-    return None
-
-
-def _bindings_from_polars_exprs(
-    exprs: list[pl.Expr],
+def _parse_rolling_node(
+    inner_json: dict,
+    out_name: str,
     schema: dict[str, pl.DataType],
-) -> list[RollingBinding]:
-    """Parse a list of Polars Expr objects captured at with_columns() time.
+) -> RollingBinding | None:
+    """Bespoke per-node parser: schema-validate inner_json and produce a complete
+    RollingBinding (with out_name resolved). Returns None on any rejection. Never raises.
 
-    Serializes each expression individually (~200 B per expr, < 1 ms total)
-    and parses for rolling bindings.  This is the O(1)-in-N fast path.
-    """
-    results: list[RollingBinding] = []
-    for expr in exprs:
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                ser = expr.meta.serialize(format="json")
-            expr_json = json.loads(ser)
-
-            # Expression may be bare (Function) or Alias([Function, name]).
-            out_name = ""
-            inner_json = expr_json
-
-            alias = expr_json.get("Alias")
-            if isinstance(alias, list) and len(alias) == 2:
-                inner_json, out_name = alias[0], alias[1]
-            if not isinstance(out_name, str):
-                continue
-
-            binding = _parse_rolling_expr(inner_json, schema)
-            if binding is not None:
-                results.append(
-                    RollingBinding(
-                        op=binding.op,
-                        column=binding.column,
-                        window=binding.window,
-                        out_name=out_name or binding.column,
-                        ddof=binding.ddof,
-                    )
-                )
-        except Exception:
-            continue
-    return results
+    rolling keeps its rich, schema-validated RollingBinding (not the generic
+    SentinelBinding) -- it shares only the candidate-iteration scaffold."""
+    try:
+        binding = _parse_rolling_expr(inner_json, schema)
+        if binding is None:
+            return None
+        resolved = out_name or binding.column
+        return RollingBinding(
+            op=binding.op,
+            column=binding.column,
+            window=binding.window,
+            out_name=resolved,
+            ddof=binding.ddof,
+        )
+    except Exception:
+        return None
 
 
 def find_rolling_bindings(lf: pl.LazyFrame) -> list[RollingBinding]:
@@ -313,92 +276,26 @@ def find_rolling_bindings(lf: pl.LazyFrame) -> list[RollingBinding]:
       2. lf.serialize() + rfind-based partial parse of the "exprs" fragment
          — avoids json.loads on the full (potentially huge) plan string.
 
+    Both paths are provided by dc.iter_candidate_nodes; this function
+    applies the bespoke RollingBinding parser and the source-shadowing guard.
+
     Returns an empty list on any parse failure — this function never raises.
     """
     try:
-        # ── Fast path: expression objects captured at with_columns() time ─────
-        # M7a: get-not-pop via dc.lookup() so a repeated collect() of the same
-        # LazyFrame stays on the fast path.  Weakref eviction in the cache keeps
-        # growth bounded and prevents stale id() hits after GC.
-        cached_exprs = dc.lookup(_lf_exprs_cache, lf)
-        if cached_exprs is not None:
-            # Collect schema (fast — already resolved by the time detect runs).
-            schema: dict[str, pl.DataType] = dict(lf.collect_schema())
-            results = _bindings_from_polars_exprs(cached_exprs, schema)
-            if results:
-                # Reject if any output name shadows a source column.
-                sources = {b.column for b in results}
-                if any(b.out_name in sources for b in results):
-                    return []
-                return results
+        schema: dict[str, pl.DataType] | None = None
+        results: list[RollingBinding] = []
 
-        # ── Slow fallback: serialize + partial JSON parse ─────────────────────
+        for inner, name in dc.iter_candidate_nodes(
+            lf, cache=_lf_exprs_cache, explain_tags=_ROLLING_EXPLAIN_TAGS
+        ):
+            if schema is None:
+                schema = dict(lf.collect_schema())
+            binding = _parse_rolling_node(inner, name, schema)
+            if binding is not None:
+                results.append(binding)
 
-        # Phase 1: cheap pre-filter via explain() (~1 ms).
-        # explain() does not serialize the DataFrame — it only walks the plan.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=UserWarning)
-            explain_text = lf.explain()
-
-        if not any(tag in explain_text for tag in _ROLLING_EXPLAIN_TAGS):
+        if not results:
             return []
-
-        # Phase 2: serialize the full plan (unavoidable; O(N) for DataFrameScan).
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=UserWarning)
-            plan_str = lf.serialize(format="json")
-
-        # Collect schema AFTER serializing to avoid IR-wrapper mutation.
-        schema = dict(lf.collect_schema())
-
-        # Phase 3: partial JSON parse — only the "exprs" fragment.
-        # The plan always ends with: ...,"exprs":[{...}],"options":{...}}}
-        # We use rfind to locate the fragment and parse only that tiny array.
-        exprs_key = '"exprs":['
-        idx = plan_str.rfind(exprs_key)
-        if idx == -1:
-            return []
-        exprs_array_start = idx + len(exprs_key) - 1  # points at '['
-
-        options_key = ',"options":'
-        opts_idx = plan_str.rfind(options_key, exprs_array_start)
-        if opts_idx == -1:
-            return []
-
-        # exprs_json_str is the JSON array "[{...}, ...]" — typically < 1 KB.
-        exprs_json_str = plan_str[exprs_array_start:opts_idx]
-        alias_nodes: list = json.loads(exprs_json_str)
-
-        if not isinstance(alias_nodes, list):
-            return []
-
-        results = []
-        for alias_node in alias_nodes:
-            try:
-                if not isinstance(alias_node, dict):
-                    continue
-                alias = alias_node.get("Alias")
-                # Alias is a two-element list: [<expr>, <name>]
-                if not isinstance(alias, list) or len(alias) != 2:
-                    continue
-                expr_json, out_name = alias[0], alias[1]
-                if not isinstance(out_name, str):
-                    continue
-
-                binding = _parse_rolling_expr(expr_json, schema)
-                if binding is not None:
-                    # Replace the placeholder out_name with the actual alias
-                    results.append(
-                        RollingBinding(
-                            op=binding.op,
-                            column=binding.column,
-                            window=binding.window,
-                            out_name=out_name,
-                            ddof=binding.ddof,
-                        )
-                    )
-            except Exception:
-                continue
 
         # Reject if any output name shadows a source column we must read: the split
         # (lf.drop(out_names)) would remove a column the kernel needs, and an

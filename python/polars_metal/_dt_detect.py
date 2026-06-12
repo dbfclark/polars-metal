@@ -12,12 +12,14 @@ NOT in the expr JSON -- it comes from the column's schema dtype.
 
 Independent with_columns patch + cache (each detector pops only its own
 cache) so this chains safely with the rolling / vector / fft patches.
+
+M7 A-2: dt keeps its rich, schema-validated DtBinding (not the generic
+SentinelBinding) -- it shares only the candidate-iteration scaffold from
+_detect_common.iter_candidate_nodes.
 """
 
 from __future__ import annotations
 
-import json
-import warnings
 from dataclasses import dataclass
 
 import polars as pl
@@ -95,90 +97,44 @@ def _parse_dt_expr(expr_json: dict, schema: dict) -> DtBinding | None:
         return None
 
 
-def _bindings_from_polars_exprs(exprs: list[pl.Expr], schema: dict) -> list[DtBinding]:
-    results: list[DtBinding] = []
-    for expr in exprs:
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                ser = expr.meta.serialize(format="json")
-            expr_json = json.loads(ser)
-            inner, out_name = expr_json, ""
-            alias = expr_json.get("Alias")
-            if isinstance(alias, list) and len(alias) == 2:
-                inner, out_name = alias[0], alias[1]
-            if not isinstance(out_name, str):
-                continue
-            b = _parse_dt_expr(inner, schema)
-            if b is not None:
-                results.append(
-                    DtBinding(b.field, b.column, out_name or b.column, b.is_date, b.units_per_day)
-                )
-        except Exception:
-            continue
-    return results
+def _parse_dt_node(inner_json: dict, out_name: str, schema: dict) -> DtBinding | None:
+    """Bespoke per-node parser: schema-validate inner_json and produce a complete
+    DtBinding (with out_name resolved). Returns None on any rejection. Never raises.
+
+    dt keeps its rich, schema-validated DtBinding (not the generic SentinelBinding)
+    -- it shares only the candidate-iteration scaffold."""
+    try:
+        b = _parse_dt_expr(inner_json, schema)
+        if b is None:
+            return None
+        resolved = out_name or b.column
+        if not resolved:
+            return None
+        return DtBinding(b.field, b.column, resolved, b.is_date, b.units_per_day)
+    except Exception:
+        return None
 
 
 def find_dt_bindings(lf: pl.LazyFrame) -> list[DtBinding]:
     """Return handleable dt.year/month/day bindings in the outermost
     with_columns layer. Never raises (returns [] on any failure)."""
     try:
-        cached = dc.lookup(_dt_lf_exprs_cache, lf)
-        if cached is not None:
-            schema = dict(lf.collect_schema())
-            results = _bindings_from_polars_exprs(cached, schema)
-            if results:
-                sources = {b.column for b in results}
-                if any(b.out_name in sources for b in results):
-                    return []
-                return results
+        schema = None
+        out: list[DtBinding] = []
+        for inner, name in dc.iter_candidate_nodes(
+            lf, cache=_dt_lf_exprs_cache, explain_tags=_DT_EXPLAIN_TAGS
+        ):
+            if schema is None:
+                schema = dict(lf.collect_schema())
+            b = _parse_dt_node(inner, name, schema)
+            if b is not None and b.out_name:
+                out.append(b)
 
-        # Slow fallback: explain() pre-filter, then serialize + bounded parse.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=UserWarning)
-            explain_text = lf.explain()
-        if not any(tag in explain_text for tag in _DT_EXPLAIN_TAGS):
+        if not out:
             return []
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=UserWarning)
-            plan_str = lf.serialize(format="json")
-        schema = dict(lf.collect_schema())
-
-        exprs_key = '"exprs":['
-        idx = plan_str.rfind(exprs_key)
-        if idx == -1:
+        sources = {b.column for b in out}
+        if any(b.out_name in sources for b in out):
             return []
-        start = idx + len(exprs_key) - 1
-        opts_idx = plan_str.rfind(',"options":', start)
-        if opts_idx == -1:
-            return []
-        alias_nodes = json.loads(plan_str[start:opts_idx])
-        if not isinstance(alias_nodes, list):
-            return []
-
-        results = []
-        for node in alias_nodes:
-            try:
-                if not isinstance(node, dict):
-                    continue
-                alias = node.get("Alias")
-                if not isinstance(alias, list) or len(alias) != 2:
-                    continue
-                expr_json, out_name = alias[0], alias[1]
-                if not isinstance(out_name, str):
-                    continue
-                b = _parse_dt_expr(expr_json, schema)
-                if b is not None:
-                    results.append(
-                        DtBinding(b.field, b.column, out_name, b.is_date, b.units_per_day)
-                    )
-            except Exception:
-                continue
-
-        sources = {b.column for b in results}
-        if any(b.out_name in sources for b in results):
-            return []
-        return results
+        return out
     except Exception:
         return []
