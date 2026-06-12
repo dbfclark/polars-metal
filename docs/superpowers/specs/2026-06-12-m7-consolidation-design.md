@@ -61,6 +61,44 @@ hole), and F64/integer rolling fallback is untested. Stale `test-kernel` Makefil
 
 ### Workstream A — Python `.metal` namespace spine
 
+**A status (2026-06-12): DELIVERED, gate-green** (commits `cd1f8b9`→`029463f`).
+- **A1:** characterization tests (`tests/python_integration/test_metal_namespace_contracts.py`, 171
+  tests passing) + verb-contract doc (`docs/metal-namespace-contracts.md`) + RuntimeError→ComputeError
+  correction at 8 engine-boundary sites incl. `_raise_cpu`, `handle_missing_dep`, and the
+  `missing_handle` guard.
+- **A2:** namespace spine in `_detect_common.py` (`CaptureCache`, `SentinelBinding`,
+  `make_sentinel_parser`, `iter_candidate_nodes`, `sentinel_fields`); vector/fft/dtw/corr migrated
+  (byte-identical sentinels, bespoke parsers retained where needed); dt/rolling brought onto the
+  shared candidate scaffold; loop-driven dispatch registry replaces the 5 copy-paste blocks in
+  `__init__.py`.
+- **Realized LOC (detect + sentinel machinery, the ~525→165 target):**
+
+  | File                    | Baseline | Current |   Delta |
+  |-------------------------|---------:|--------:|--------:|
+  | `_vector_detect.py`     |      109 |      30 |     −79 |
+  | `_fft_detect.py`        |       93 |      29 |     −64 |
+  | `_dtw_detect.py`        |        93 |      25 |     −68 |
+  | `_corr_detect.py`       |       88 |      29 |     −59 |
+  | `_dt_detect.py`         |      184 |     143 |     −41 |
+  | `_rolling_detect.py`    |      414 |     314 |    −100 |
+  | `_detect_common.py`     |      115 |     265 |    +150 |
+  | `_vector_namespace.py`  |      148 |     135 |     −13 |
+  | `_fft_namespace.py`     |       47 |      53 |      +6 |
+  | `_dtw_namespace.py`     |       87 |      79 |      −8 |
+  | `_corr_namespace.py`    |       88 |      78 |     −10 |
+  | `__init__.py`           |      404 |     367 |     −37 |
+  | **Total (above 12)**    | **1870** | **1547**| **−323** |
+
+  The 4 verb detect modules (vector/fft/dtw/corr) collapsed from 383 → 113 lines (−270); the
+  shared spine in `_detect_common.py` grew 115 → 265 (+150) absorbing them. Net across all
+  namespace machinery: −323 lines. Rolling's detect module stayed large (314 lines) because it
+  is ~100 lines of bespoke schema validation parser logic, not scaffold — precisely as the spec
+  predicted ("rolling-detect stays large because it's mostly schema validation, which is parser
+  logic, not scaffold"). The dispatch modules (_vector/fft/dtw/corr/rolling/dt_dispatch.py) were
+  not modified (they were already clean).
+- **M7 (A+B+C) is now complete and gate-green.** All 171 python_integration namespace tests pass;
+  `make gate` green; `make test-diff` green.
+
 **A1. Contract first (de-risks everything else).** Write down the intended per-verb contract on
 three axes — **null handling, boundary error type, streaming** — and add characterization
 tests pinning each verb's *current* behavior before any refactor. The goal is **intentional
@@ -212,6 +250,15 @@ parallel** (disjoint files: Python vs Rust). Coverage/doc tidy (C2, C3) last.
   copy wrappers folded to one parametric FFI entry.
 - The verb-contract doc and the rolling-F64-is-CPU note are committed.
 - Zero behavior changes except the deliberately-corrected contracts, each test-pinned.
+
+**M7 status (2026-06-12): COMPLETE, gate-green.**
+- Workstream C (differential harness + coverage): DELIVERED (`bc33537`, `3f4b901`).
+- Workstream B (udf.rs decomposition + dtype folds): DELIVERED (`6d9436c`→`0de0e78`).
+- Workstream A (Python namespace spine): DELIVERED (`cd1f8b9`→`029463f`).
+- `make gate` green; `make test-diff` green (14 Rust proptest + 6 Python diff, all pass);
+  171 Python namespace integration tests pass (no failures); conformance suite green with
+  only the documented pre-existing deviations (Mean F32→F32, prop_gpu_sum_f32 1e11 flake,
+  lazyframe/group_by). No new regressions introduced by any workstream.
 
 ## 7. Testing strategy
 
