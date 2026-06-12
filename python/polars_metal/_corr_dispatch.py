@@ -17,8 +17,8 @@ import numpy as np
 import polars as pl
 
 from polars_metal import _native
-from polars_metal._corr_detect import CorrBinding
 from polars_metal._corr_namespace import CorrSpec, evict_capture, get_capture
+from polars_metal._detect_common import SentinelBinding
 
 CORR_P_MIN = 8  # spike crossover: p>=~8 GPU wins; below, CPU df.corr() is faster.
 
@@ -80,8 +80,8 @@ def _run_corr(df: pl.DataFrame, spec: CorrSpec) -> pl.DataFrame:
     return _gpu_corr_f32(df, columns)
 
 
-def apply_corr(lf: pl.LazyFrame, binding: CorrBinding, collect_fn) -> pl.DataFrame:
-    spec: CorrSpec | None = get_capture(binding.handle)
+def apply_corr(lf: pl.LazyFrame, binding: SentinelBinding, collect_fn) -> pl.DataFrame:
+    spec: CorrSpec | None = get_capture(binding.payload)
     if spec is None:
         raise pl.exceptions.ComputeError(
             "polars_metal: corr spec handle missing (already consumed?)"
@@ -89,7 +89,7 @@ def apply_corr(lf: pl.LazyFrame, binding: CorrBinding, collect_fn) -> pl.DataFra
     # Tie eviction to the lf lifetime: when this lf is GC'd the cache entry is
     # freed. Registering twice (two collects of the same lf) is harmless —
     # both do an idempotent dict.pop.
-    weakref.finalize(lf, evict_capture, binding.handle)
+    weakref.finalize(lf, evict_capture, binding.payload)
     rest_lf = lf.drop(binding.out_name)  # drop sentinel; input columns remain
     df = collect_fn(rest_lf)
     return _run_corr(df, spec)

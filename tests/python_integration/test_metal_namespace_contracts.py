@@ -195,8 +195,8 @@ def test_corr_handle_missing_raises_compute_error():
     lf = pl.LazyFrame({"a": [1.0, 2.0, 3.0], "b": [2.0, 4.0, 6.0]})
     built = lf.metal.corr()
     # Evict all cached corr specs to trigger the handle-missing path.
-    # Reaches into the current _CORR_CACHE global; update if cache is refactored.
-    for h in list(ns._CORR_CACHE.keys()):
+    # Reaches into _CACHE._specs (CaptureCache); updated from _CORR_CACHE in M7 A-2.
+    for h in list(ns._CACHE._specs.keys()):
         ns.evict_capture(h)
     with pytest.raises(ComputeError):
         built.collect(engine=MetalEngine())
