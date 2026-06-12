@@ -64,6 +64,8 @@ pub fn execute_dtw(
     .map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("polars_metal: dtw query staging: {e}"))
     })?;
+    // SAFETY: as `qb` above — `r_ptr` addresses `r_n` live, contiguous f32 for
+    // the whole call; page-aligned uses bytesNoCopy, else copies in.
     let rb = unsafe {
         polars_metal_buffer::MetalBuffer::from_borrowed_f32(&device, r_ptr as *const f32, r_n)
     }
