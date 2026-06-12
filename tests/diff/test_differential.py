@@ -16,6 +16,8 @@ from polars.testing import assert_frame_equal
 import polars_metal
 from tests.diff.strategies import (
     m1_null_density_dataframe,
+    m1_predicate_expr,
+    m1_projection_subset,
     null_heavy_frame,
     numeric_frame,
 )
@@ -98,3 +100,36 @@ def test_fused_f32_chain_matches_cpu(n, ops, reducer, seed) -> None:  # type: ig
         rel_tol=1e-3,
         abs_tol=1e-4,
     )
+
+
+# --- M7 C1: filter / predicate / projection differential slice ----------------
+
+
+@st.composite
+def _frame_and_predicate(draw):  # type: ignore[no-untyped-def]
+    df = draw(m1_null_density_dataframe())
+    pred = draw(m1_predicate_expr(df.schema))
+    return df, pred
+
+
+@st.composite
+def _frame_and_projection(draw):  # type: ignore[no-untyped-def]
+    df = draw(m1_null_density_dataframe())
+    cols = draw(m1_projection_subset(df.schema))
+    return df, cols
+
+
+@given(_frame_and_predicate())
+@settings(max_examples=100, deadline=None)
+def test_m1_filter_predicate_matches_cpu(case) -> None:  # type: ignore[no-untyped-def]
+    df, pred = case
+    lf = df.lazy().filter(pred)
+    assert lf.collect(engine=_ENG).equals(lf.collect())
+
+
+@given(_frame_and_projection())
+@settings(max_examples=100, deadline=None)
+def test_m1_projection_matches_cpu(case) -> None:  # type: ignore[no-untyped-def]
+    df, cols = case
+    lf = df.lazy().select(cols)
+    assert lf.collect(engine=_ENG).equals(lf.collect())
