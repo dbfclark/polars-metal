@@ -57,8 +57,8 @@ def test_detect_finds_sentinel_binding():
     assert len(bindings) == 1
     b = bindings[0]
     assert b.out_name == "hits"
-    assert b.query_col == "emb"
-    assert b.handle in vns._CORPUS_CACHE  # not yet popped
+    assert b.col == "emb"
+    assert b.payload in vns._CACHE._specs  # not yet popped
 
 
 def test_dispatch_builds_struct_column_cosine():

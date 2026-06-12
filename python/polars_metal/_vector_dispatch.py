@@ -16,7 +16,7 @@ import numpy as np
 import polars as pl
 
 from polars_metal import _native
-from polars_metal._vector_detect import VectorBinding
+from polars_metal._detect_common import SentinelBinding
 from polars_metal._vector_namespace import evict_capture, get_capture
 
 _OP_CODE = {"cosine": 0, "knn": 1}
@@ -76,13 +76,13 @@ def _build_struct(
     )
 
 
-def _run_binding(qframe: pl.DataFrame, b: VectorBinding) -> pl.Series:
-    spec = get_capture(b.handle)
+def _run_binding(qframe: pl.DataFrame, b: SentinelBinding) -> pl.Series:
+    spec = get_capture(b.payload)
     if spec is None:
         raise pl.exceptions.ComputeError(
             "polars_metal: vector-search corpus handle missing (already consumed?)"
         )
-    qmat, q_rows, qd = _array_col_to_matrix(qframe.get_column(b.query_col).rechunk())
+    qmat, q_rows, qd = _array_col_to_matrix(qframe.get_column(b.col).rechunk())
     cmat, n_rows, cd = _corpus_matrix(spec.corpus, spec.corpus_col)
     if qd != cd:
         raise ValueError(f"query D={qd} != corpus D={cd}")
@@ -114,7 +114,7 @@ def _run_binding(qframe: pl.DataFrame, b: VectorBinding) -> pl.Series:
 
 
 def apply_vector_search(
-    lf: pl.LazyFrame, bindings: list[VectorBinding], collect_fn
+    lf: pl.LazyFrame, bindings: list[SentinelBinding], collect_fn
 ) -> pl.DataFrame:
     """Dispatch vector-search bindings to the GPU and stitch struct columns in.
 
@@ -128,7 +128,7 @@ def apply_vector_search(
     # reuse the spec; it is freed when the lf is GC'd). Registering twice is
     # harmless — both do an idempotent dict.pop.
     for b in bindings:
-        weakref.finalize(lf, evict_capture, b.handle)
+        weakref.finalize(lf, evict_capture, b.payload)
     rest_lf = lf.drop(out_names)
     df = collect_fn(rest_lf)
     cols: dict[str, pl.Series] = {c: df.get_column(c) for c in df.columns}

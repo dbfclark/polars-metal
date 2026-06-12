@@ -180,9 +180,8 @@ def test_vector_handle_missing_raises_compute_error():
         pl.col("emb").metal.cosine_topk(corpus, k=1, corpus_col="emb").alias("hits")
     )
     # Evict all cached corpus specs to trigger the handle-missing path.
-    # Reaches into the current per-verb cache global; if a later refactor
-    # changes the cache type, update this helper.
-    for h in list(ns._CORPUS_CACHE.keys()):
+    # Reaches into _CACHE._specs (CaptureCache); updated from _CORPUS_CACHE in M7 A-2.
+    for h in list(ns._CACHE._specs.keys()):
         ns.evict_capture(h)
     with pytest.raises(ComputeError):
         built.collect(engine=MetalEngine())
