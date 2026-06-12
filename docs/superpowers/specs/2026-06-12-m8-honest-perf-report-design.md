@@ -24,6 +24,17 @@ This scope was chosen deliberately (brainstorm 2026-06-12): on the M8 fork the a
 **"Prove it / release" → "Honest perf report"** over new compute-bound ops, the `build_index()`
 statefulness subsystem, or coverage breadth.
 
+**The report is internal decision-input, not a published artifact.** Its explicit job is to
+answer the architect's next-direction question: **do we pick up bandwidth-shaped work
+(joins, etc.) or stay compute-focused?** CLAUDE.md currently has hash join "deferred
+indefinitely unless a non-TPC-H workload demands it"; the architect wants to revisit that on
+data. We cannot benchmark a join we have not built — but the report's **bandwidth-vs-compute
+scorecard is the evidence base for that call.** Our existing bandwidth-shaped ops (TPC-H
+Q1/Q6, bare reductions) already lose 2.8–19.6×, and a hash join is the same roofline shape;
+the report makes that current and concrete so the join decision is made on measurement, not
+vibes. Presentation is tuned for one reader (the architect) — clarity over polish, no
+marketing framing.
+
 ## 2. Decisions locked in the brainstorm
 
 1. **Headline baseline = both columns, side by side.** Per op, report **engine vs Polars CPU**
@@ -149,8 +160,13 @@ Self-describing, five blocks:
    (CLAUDE.md / survey / memory) → *measured* engine ×CPU, one line per gap. Example: "FFT:
    claimed 77× was raw-MLX-vs-numpy; measured 3–4.6× engine path, tax ≈1.5× from planar host I/O."
 
-5. **Mission verdict (prose)** — where we clear the order-of-magnitude bar, where we tie/lose,
-   and an honest read on whether the bar is still the right bar for this workload class.
+5. **Mission verdict + next-direction read (prose)** — where we clear the order-of-magnitude
+   bar, where we tie/lose, and an honest read on whether the bar is still the right bar for
+   this workload class. **Then the decision the report exists to inform:** the
+   bandwidth-vs-compute split as measured, and what it implies for whether joins (and other
+   bandwidth-shaped work) are worth building. The TPC-H Q1/Q6 + bare-reduction losses are the
+   join proxy — if those lose by 3–20× on the same roofline a hash join would sit on, that is
+   the data point. State it plainly so the join go/no-go is answerable from this report.
 
 ## 6. Reproducibility
 
@@ -190,9 +206,11 @@ failing test; a correctness regression is.
 ## 9. Out of scope (deferred)
 
 - **Release/packaging/usability hardening** (wheel, install story, public API docs) — the other
-  half of the "prove it / release" fork; revisit after the report tells us where we stand.
-- **Mission re-scoping / new perf kernels** — M8 *informs* whether the bar is right; acting on
-  that (new compute-bound ops, cooperative-wavefront DTW, `build_index()`) is M9+.
+  half of the "prove it / release" fork; not the driver here (the report is internal
+  decision-input). Revisit if/when the next-direction call points at release.
+- **Acting on the next-direction decision** — M8 *produces the evidence* for the joins-vs-compute
+  call; actually building joins, new compute-bound ops, cooperative-wavefront DTW, or
+  `build_index()` is M9+, decided after reading this report.
 - **Multi-machine portability matrix** — the report is M2 Ultra primary, self-describing by
   machine; a base-M1/M2 sweep is a future add, not this milestone.
 
