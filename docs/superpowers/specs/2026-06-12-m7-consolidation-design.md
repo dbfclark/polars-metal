@@ -116,6 +116,13 @@ vector/fft/int-readback tests before folding. (Pulled into M7 from the M8 deferr
 pure consolidation with no perf implication; the FFT dual-core fold stays in M8 because it
 carries behavior risk, B4 does not.)
 
+**B status (2026-06-12): DELIVERED, gate-green** (commits 6d9436c→0de0e78). B-1 decomposed
+`udf.rs` (3,000 → 118-line `udf/mod.rs` + 10 focused submodules; `lib.rs` unchanged). B-2 folded
+the dtype dispatch (cmp 4-pyfn macro fold 235→145; `build_agg_kind_and_vcol` 21-arm → lookup +
+per-dtype, char-test-pinned), tidied (1 dtw SAFETY comment, mlx i32 wrapper into `impl_to_vec!`),
+and split groupby into `groupby/mod.rs` (live fused) + `groupby/legacy.rs` (conformance per-agg).
+Only Workstream A remains for M7.
+
 **B execution note (2026-06-12, after reading the actual code).** Planning surfaced that the
 code diverges from the survey's framing, so B is delivered as **two plans**:
 - **B-1 (`udf.rs` decomposition, plan `2026-06-12-m7-b1-udf-decomposition.md`)** — the real file is a
