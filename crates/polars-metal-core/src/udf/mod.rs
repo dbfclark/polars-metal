@@ -21,6 +21,17 @@
 //! directly via PyO3 `call_method1`. `PyDataFrame.select` is a synchronous,
 //! in-place column reorder/subset that bypasses the lazy plan entirely.
 
+mod common;
+mod compact;
+mod compare;
+mod dt;
+mod dtw;
+mod fused_expr;
+mod groupby;
+mod logical;
+mod predicate;
+mod rolling;
+
 use crate::plan::{AggExpr, AggOp, BinaryOp, MetalDtype, MetalPlanNode, PredicateAst};
 use polars_metal_buffer::MetalDevice;
 use polars_metal_kernels::aggregate_fused::cache::FusedLibraryCache;
