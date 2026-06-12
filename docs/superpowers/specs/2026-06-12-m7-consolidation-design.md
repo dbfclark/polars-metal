@@ -116,6 +116,23 @@ vector/fft/int-readback tests before folding. (Pulled into M7 from the M8 deferr
 pure consolidation with no perf implication; the FFT dual-core fold stays in M8 because it
 carries behavior risk, B4 does not.)
 
+**B execution note (2026-06-12, after reading the actual code).** Planning surfaced that the
+code diverges from the survey's framing, so B is delivered as **two plans**:
+- **B-1 (`udf.rs` decomposition, plan `2026-06-12-m7-b1-udf-decomposition.md`)** — the real file is a
+  **3,000-line god-module with ~9 pyfunction families** (not just groupby/parser/cmp: also
+  `execute_rolling`/`dtw`/`dt`/`fused_expr`/`compact`/`logical`). Pure behavior-preserving move into
+  focused submodules under `udf/`. This is the bigger cognitive-load win.
+- **B-2 (folds + tidy, plan TBD after B-1)** — the `cmp` 4→1 generic fold (live, C1-pinned), the
+  `build_agg_kind_and_vcol` 21-arm fold **(architect chose to fold it despite groupby being
+  conformance-only — for the LOC win; it is the riskiest fold (per-arm `unsafe` reinterprets), so it
+  gets a dtype×agg characterization test FIRST)**, the groupby core/legacy internal split (coupled to
+  that fold — not a pure move, hence deferred out of B-1), B3 (only **1** genuinely-missing SAFETY
+  comment + document `decide_groupby_dispatch`'s single caller), and B4.
+- **B4 is mostly already done:** the MLX readback wrappers are **already macro-folded** via
+  `impl_to_vec!` in `mlx-sys/src/array.rs`, and `eval_to_metal_buffers` already uses a `write_back!`
+  macro — so B4 shrinks to a ~1-line tidy folding the one hand-written `mlx_array_to_i32_vec` into the
+  existing macro. The survey's "8 wrappers → 1 parametric FFI" framing was stale.
+
 ### Workstream C — Coverage & hardening
 
 **C1. Differential safety net — Rust-first (do first).** Per the testing strategy ("proptest
