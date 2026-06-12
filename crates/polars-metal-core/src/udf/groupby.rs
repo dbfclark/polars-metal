@@ -674,6 +674,73 @@ fn build_agg_kind_and_vcol<'a>(
     Ok((kind, vc))
 }
 
+/// M2's per-agg groupby path (conformance-only): builds one
+/// `(AggRequest, ValueColumn)` per agg and dispatches the per-agg kernel.
+/// Invoked when the router chose `PerAgg`, or when the fused path rejected with
+/// `NgroupsExceedsFusedCap` on a query with no `Expression` aggs. The fused
+/// path lives inline in `execute_groupby`; this is the legacy fallback.
+fn execute_peragg(
+    device: &MetalDevice,
+    queue: &mut CommandQueue,
+    key_cols: &[KeyColumn],
+    parsed: &ParsedGroupByPlan,
+    name_byte_refs: &HashMap<String, (String, &[u8], &[u8])>,
+    n_rows: usize,
+) -> PyResult<polars_metal_kernels::groupby::GroupByResult> {
+    // Len uses a zero-length I64 placeholder; Simple looks up its single input
+    // column from `name_byte_refs`.
+    let empty_data: &[u8] = &[];
+    let empty_valid: &[u8] = &[];
+    // SAFETY: &[] cast to &[i64] is a zero-length slice — no pointer arithmetic
+    // occurs and the pointer is non-null (a valid empty slice). Established
+    // pattern for zero-length typed slices in this codebase.
+    let empty_i64: &[i64] =
+        unsafe { std::slice::from_raw_parts(empty_data.as_ptr() as *const i64, 0) };
+
+    let mut agg_specs: Vec<(AggRequest, ValueColumn<'_>)> = Vec::with_capacity(parsed.aggs.len());
+    for (i, agg) in parsed.aggs.iter().enumerate() {
+        match agg {
+            ParsedAgg::Length { .. } => {
+                agg_specs.push((
+                    AggRequest {
+                        kind: AggKind::Len,
+                        input_col_idx: i,
+                    },
+                    ValueColumn::I64 {
+                        data: empty_i64,
+                        valid: empty_valid,
+                    },
+                ));
+            }
+            ParsedAgg::Simple { input_col, op, .. } => {
+                let (dtype_tag, data, valid) = name_byte_refs.get(input_col).ok_or_else(|| {
+                    PyValueError::new_err(
+                        "polars_metal: internal error: missing byte ref for Simple agg",
+                    )
+                })?;
+                let (kind, vcol) = build_agg_kind_and_vcol(*op, dtype_tag, data, valid, n_rows)?;
+                agg_specs.push((
+                    AggRequest {
+                        kind,
+                        input_col_idx: i,
+                    },
+                    vcol,
+                ));
+            }
+            ParsedAgg::Expression { .. } => {
+                // Expression specs should never route here (the router decides
+                // Fused above). Defensive guard.
+                return Err(PyValueError::new_err(
+                    "polars_metal: AggSpec::Expression routed to per-agg path; this is a routing bug",
+                ));
+            }
+        }
+    }
+
+    polars_metal_kernels::groupby::dispatch_groupby(device, queue, key_cols, &agg_specs, n_rows)
+        .map_err(groupby_err)
+}
+
 /// Encode a [`DecodedColumn`] (key output) into `(dtype_tag, data_bytes,
 /// valid_bytes)` for the wire return format.
 fn encode_decoded_column(
@@ -1187,67 +1254,17 @@ pub fn execute_groupby<'py>(
         None => None,
     };
 
-    let result = if let Some(r) = early_result {
-        r
-    } else {
-        // M2's per-agg path. Len uses a zero-length I64 placeholder; Simple
-        // looks up its single input column from `name_byte_refs`.
-        let empty_data: &[u8] = &[];
-        let empty_valid: &[u8] = &[];
-        // SAFETY: &[] cast to &[i64] is a zero-length slice — no pointer
-        // arithmetic occurs. The slice is valid and the pointer is
-        // non-null (a valid empty slice). This is the established
-        // pattern for zero-length typed slices in this codebase.
-        let empty_i64: &[i64] =
-            unsafe { std::slice::from_raw_parts(empty_data.as_ptr() as *const i64, 0) };
-
-        let mut agg_specs: Vec<(AggRequest, ValueColumn<'_>)> =
-            Vec::with_capacity(parsed.aggs.len());
-        for (i, agg) in parsed.aggs.iter().enumerate() {
-            match agg {
-                ParsedAgg::Length { .. } => {
-                    agg_specs.push((
-                        AggRequest {
-                            kind: AggKind::Len,
-                            input_col_idx: i,
-                        },
-                        ValueColumn::I64 {
-                            data: empty_i64,
-                            valid: empty_valid,
-                        },
-                    ));
-                }
-                ParsedAgg::Simple { input_col, op, .. } => {
-                    let (dtype_tag, data, valid) =
-                        name_byte_refs.get(input_col).ok_or_else(|| {
-                            PyValueError::new_err(
-                                "polars_metal: internal error: missing byte ref for Simple agg",
-                            )
-                        })?;
-                    let (kind, vcol) =
-                        build_agg_kind_and_vcol(*op, dtype_tag, data, valid, n_rows)?;
-                    agg_specs.push((
-                        AggRequest {
-                            kind,
-                            input_col_idx: i,
-                        },
-                        vcol,
-                    ));
-                }
-                ParsedAgg::Expression { .. } => {
-                    // Expression specs should never route here (the
-                    // router decides Fused above). Defensive guard.
-                    return Err(PyValueError::new_err(
-                            "polars_metal: AggSpec::Expression routed to per-agg path; this is a routing bug",
-                        ));
-                }
-            }
-        }
-
-        polars_metal_kernels::groupby::dispatch_groupby(
-            &device, &mut queue, &key_cols, &agg_specs, n_rows,
-        )
-        .map_err(groupby_err)?
+    let result = match early_result {
+        Some(r) => r,
+        // M2's per-agg path (conformance-only) — see `execute_peragg`.
+        None => execute_peragg(
+            &device,
+            &mut queue,
+            &key_cols,
+            &parsed,
+            &name_byte_refs,
+            n_rows,
+        )?,
     };
 
     // 7. Encode result as a list of (name, dtype_tag, data, valid) tuples.
