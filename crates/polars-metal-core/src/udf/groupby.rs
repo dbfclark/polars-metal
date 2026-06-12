@@ -585,6 +585,59 @@ fn build_value_column<'a>(
     }
 }
 
+/// Map `(op, dtype_tag)` → the kernel `AggKind`. `Count` maps to
+/// `AggKind::Count` for every supported value dtype; the other ops carry the
+/// dtype in their variant. Errors on an unsupported `(op, dtype)` pair.
+fn agg_kind_for(op: AggOp, dtype_tag: &str) -> PyResult<AggKind> {
+    let kind = match (op, dtype_tag) {
+        (AggOp::Count, "I64" | "F64" | "I32" | "F32") => AggKind::Count,
+        (AggOp::Sum, "I64") => AggKind::SumI64,
+        (AggOp::Mean, "I64") => AggKind::MeanI64,
+        (AggOp::Min, "I64") => AggKind::MinI64,
+        (AggOp::Max, "I64") => AggKind::MaxI64,
+        (AggOp::Sum, "F64") => AggKind::SumF64,
+        (AggOp::Mean, "F64") => AggKind::MeanF64,
+        (AggOp::Min, "F64") => AggKind::MinF64,
+        (AggOp::Max, "F64") => AggKind::MaxF64,
+        (AggOp::Sum, "I32") => AggKind::SumI32,
+        (AggOp::Mean, "I32") => AggKind::MeanI32,
+        (AggOp::Min, "I32") => AggKind::MinI32,
+        (AggOp::Max, "I32") => AggKind::MaxI32,
+        (AggOp::Sum, "F32") => AggKind::SumF32,
+        (AggOp::Mean, "F32") => AggKind::MeanF32,
+        (AggOp::Min, "F32") => AggKind::MinF32,
+        (AggOp::Max, "F32") => AggKind::MaxF32,
+        (op, dtype) => {
+            return Err(PyValueError::new_err(format!(
+                "polars_metal: unsupported (agg_op, dtype) combination: {op:?} / {dtype}"
+            )))
+        }
+    };
+    Ok(kind)
+}
+
+/// Buffer-check `data` (≥ `n_rows * size_of::<T>()` bytes) and reinterpret it
+/// as `&[T]`. `T` must be a plain numeric scalar with no invalid bit patterns
+/// (i32/i64/f32/f64); the byte buffer is an Arrow value buffer (64-byte
+/// aligned). `tag` names the dtype for the error message.
+fn checked_reinterpret<'a, T>(data: &'a [u8], n_rows: usize, tag: &str) -> PyResult<&'a [T]> {
+    let expected = n_rows * std::mem::size_of::<T>();
+    if data.len() < expected {
+        return Err(PyValueError::new_err(format!(
+            "polars_metal: {tag} value buffer too short: {got} < {expected}",
+            got = data.len()
+        )));
+    }
+    // SAFETY: `T` has no invalid bit patterns (numeric scalar); `data.len() >=
+    // n_rows * size_of::<T>()` (checked above) and Arrow value buffers are
+    // 64-byte aligned, so the reinterpret is well-aligned and in-bounds.
+    Ok(unsafe { std::slice::from_raw_parts(data.as_ptr() as *const T, n_rows) })
+}
+
+/// Build the `(AggKind, ValueColumn)` for one aggregation over a value column.
+/// Folds the former 21-arm `(op, dtype)` match into an `AggKind` lookup plus a
+/// per-dtype reinterpret (M7 B-2). Supported value dtypes: I64/F64/I32/F32 —
+/// the project does not extend groupby past these (conformance-only).
 fn build_agg_kind_and_vcol<'a>(
     op: AggOp,
     dtype_tag: &str,
@@ -592,278 +645,33 @@ fn build_agg_kind_and_vcol<'a>(
     valid: &'a [u8],
     n_rows: usize,
 ) -> PyResult<(AggKind, ValueColumn<'a>)> {
-    match (op, dtype_tag) {
-        (AggOp::Sum, "I64") => {
-            let expected = n_rows * 8;
-            if data.len() < expected {
-                return Err(PyValueError::new_err(format!(
-                    "polars_metal: Sum/I64 data buffer too short: {got} < {expected}",
-                    got = data.len()
-                )));
-            }
-            // SAFETY: i64 has no invalid bit patterns; data.len() >= n_rows*8
-            // and Arrow buffers are 64-byte aligned, so the reinterpret is
-            // well-aligned for i64 (8-byte alignment).
-            let typed: &[i64] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i64, n_rows) };
-            Ok((AggKind::SumI64, ValueColumn::I64 { data: typed, valid }))
+    let kind = agg_kind_for(op, dtype_tag)?;
+    // `agg_kind_for` already validated `(op, dtype_tag)`; the dtype is one of
+    // I64/F64/I32/F32 here. The per-dtype arm picks the width + ValueColumn.
+    let vc = match dtype_tag {
+        "I64" => ValueColumn::I64 {
+            data: checked_reinterpret::<i64>(data, n_rows, dtype_tag)?,
+            valid,
+        },
+        "F64" => ValueColumn::F64 {
+            data: checked_reinterpret::<f64>(data, n_rows, dtype_tag)?,
+            valid,
+        },
+        "I32" => ValueColumn::I32 {
+            data: checked_reinterpret::<i32>(data, n_rows, dtype_tag)?,
+            valid,
+        },
+        "F32" => ValueColumn::F32 {
+            data: checked_reinterpret::<f32>(data, n_rows, dtype_tag)?,
+            valid,
+        },
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "polars_metal: unsupported value dtype: {other}"
+            )))
         }
-        (AggOp::Sum, "F64") => {
-            let expected = n_rows * 8;
-            if data.len() < expected {
-                return Err(PyValueError::new_err(format!(
-                    "polars_metal: Sum/F64 data buffer too short: {got} < {expected}",
-                    got = data.len()
-                )));
-            }
-            // SAFETY: f64 has no invalid bit patterns; same alignment argument
-            // as the i64 path.
-            let typed: &[f64] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f64, n_rows) };
-            Ok((AggKind::SumF64, ValueColumn::F64 { data: typed, valid }))
-        }
-        (AggOp::Mean, "I64") => {
-            let expected = n_rows * 8;
-            if data.len() < expected {
-                return Err(PyValueError::new_err(format!(
-                    "polars_metal: Mean/I64 data buffer too short: {got} < {expected}",
-                    got = data.len()
-                )));
-            }
-            // SAFETY: see Sum/I64.
-            let typed: &[i64] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i64, n_rows) };
-            Ok((AggKind::MeanI64, ValueColumn::I64 { data: typed, valid }))
-        }
-        (AggOp::Mean, "F64") => {
-            let expected = n_rows * 8;
-            if data.len() < expected {
-                return Err(PyValueError::new_err(format!(
-                    "polars_metal: Mean/F64 data buffer too short: {got} < {expected}",
-                    got = data.len()
-                )));
-            }
-            // SAFETY: see Sum/F64.
-            let typed: &[f64] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f64, n_rows) };
-            Ok((AggKind::MeanF64, ValueColumn::F64 { data: typed, valid }))
-        }
-        (AggOp::Min, "I64") => {
-            let expected = n_rows * 8;
-            if data.len() < expected {
-                return Err(PyValueError::new_err(format!(
-                    "polars_metal: Min/I64 data buffer too short: {got} < {expected}",
-                    got = data.len()
-                )));
-            }
-            // SAFETY: see Sum/I64.
-            let typed: &[i64] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i64, n_rows) };
-            Ok((AggKind::MinI64, ValueColumn::I64 { data: typed, valid }))
-        }
-        (AggOp::Min, "F64") => {
-            let expected = n_rows * 8;
-            if data.len() < expected {
-                return Err(PyValueError::new_err(format!(
-                    "polars_metal: Min/F64 data buffer too short: {got} < {expected}",
-                    got = data.len()
-                )));
-            }
-            // SAFETY: see Sum/F64.
-            let typed: &[f64] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f64, n_rows) };
-            Ok((AggKind::MinF64, ValueColumn::F64 { data: typed, valid }))
-        }
-        (AggOp::Max, "I64") => {
-            let expected = n_rows * 8;
-            if data.len() < expected {
-                return Err(PyValueError::new_err(format!(
-                    "polars_metal: Max/I64 data buffer too short: {got} < {expected}",
-                    got = data.len()
-                )));
-            }
-            // SAFETY: see Sum/I64.
-            let typed: &[i64] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i64, n_rows) };
-            Ok((AggKind::MaxI64, ValueColumn::I64 { data: typed, valid }))
-        }
-        (AggOp::Max, "F64") => {
-            let expected = n_rows * 8;
-            if data.len() < expected {
-                return Err(PyValueError::new_err(format!(
-                    "polars_metal: Max/F64 data buffer too short: {got} < {expected}",
-                    got = data.len()
-                )));
-            }
-            // SAFETY: see Sum/F64.
-            let typed: &[f64] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f64, n_rows) };
-            Ok((AggKind::MaxF64, ValueColumn::F64 { data: typed, valid }))
-        }
-        (AggOp::Count, "I64") => {
-            let expected = n_rows * 8;
-            if data.len() < expected {
-                return Err(PyValueError::new_err(format!(
-                    "polars_metal: Count/I64 data buffer too short: {got} < {expected}",
-                    got = data.len()
-                )));
-            }
-            // SAFETY: see Sum/I64.
-            let typed: &[i64] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i64, n_rows) };
-            Ok((AggKind::Count, ValueColumn::I64 { data: typed, valid }))
-        }
-        (AggOp::Count, "F64") => {
-            let expected = n_rows * 8;
-            if data.len() < expected {
-                return Err(PyValueError::new_err(format!(
-                    "polars_metal: Count/F64 data buffer too short: {got} < {expected}",
-                    got = data.len()
-                )));
-            }
-            // SAFETY: see Sum/F64.
-            let typed: &[f64] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f64, n_rows) };
-            Ok((AggKind::Count, ValueColumn::F64 { data: typed, valid }))
-        }
-        // --- I32 variants ---
-        (AggOp::Sum, "I32") => {
-            let expected = n_rows * 4;
-            if data.len() < expected {
-                return Err(PyValueError::new_err(format!(
-                    "polars_metal: Sum/I32 data buffer too short: {got} < {expected}",
-                    got = data.len()
-                )));
-            }
-            // SAFETY: i32 has no invalid bit patterns; data.len() >= n_rows*4
-            // and Arrow buffers are 64-byte aligned.
-            let typed: &[i32] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, n_rows) };
-            Ok((AggKind::SumI32, ValueColumn::I32 { data: typed, valid }))
-        }
-        (AggOp::Mean, "I32") => {
-            let expected = n_rows * 4;
-            if data.len() < expected {
-                return Err(PyValueError::new_err(format!(
-                    "polars_metal: Mean/I32 data buffer too short: {got} < {expected}",
-                    got = data.len()
-                )));
-            }
-            // SAFETY: see Sum/I32.
-            let typed: &[i32] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, n_rows) };
-            Ok((AggKind::MeanI32, ValueColumn::I32 { data: typed, valid }))
-        }
-        (AggOp::Min, "I32") => {
-            let expected = n_rows * 4;
-            if data.len() < expected {
-                return Err(PyValueError::new_err(format!(
-                    "polars_metal: Min/I32 data buffer too short: {got} < {expected}",
-                    got = data.len()
-                )));
-            }
-            // SAFETY: see Sum/I32.
-            let typed: &[i32] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, n_rows) };
-            Ok((AggKind::MinI32, ValueColumn::I32 { data: typed, valid }))
-        }
-        (AggOp::Max, "I32") => {
-            let expected = n_rows * 4;
-            if data.len() < expected {
-                return Err(PyValueError::new_err(format!(
-                    "polars_metal: Max/I32 data buffer too short: {got} < {expected}",
-                    got = data.len()
-                )));
-            }
-            // SAFETY: see Sum/I32.
-            let typed: &[i32] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, n_rows) };
-            Ok((AggKind::MaxI32, ValueColumn::I32 { data: typed, valid }))
-        }
-        (AggOp::Count, "I32") => {
-            let expected = n_rows * 4;
-            if data.len() < expected {
-                return Err(PyValueError::new_err(format!(
-                    "polars_metal: Count/I32 data buffer too short: {got} < {expected}",
-                    got = data.len()
-                )));
-            }
-            // SAFETY: see Sum/I32.
-            let typed: &[i32] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, n_rows) };
-            Ok((AggKind::Count, ValueColumn::I32 { data: typed, valid }))
-        }
-        // --- F32 variants ---
-        (AggOp::Sum, "F32") => {
-            let expected = n_rows * 4;
-            if data.len() < expected {
-                return Err(PyValueError::new_err(format!(
-                    "polars_metal: Sum/F32 data buffer too short: {got} < {expected}",
-                    got = data.len()
-                )));
-            }
-            // SAFETY: f32 has no invalid bit patterns; data.len() >= n_rows*4
-            // and Arrow buffers are 64-byte aligned.
-            let typed: &[f32] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_rows) };
-            Ok((AggKind::SumF32, ValueColumn::F32 { data: typed, valid }))
-        }
-        (AggOp::Mean, "F32") => {
-            let expected = n_rows * 4;
-            if data.len() < expected {
-                return Err(PyValueError::new_err(format!(
-                    "polars_metal: Mean/F32 data buffer too short: {got} < {expected}",
-                    got = data.len()
-                )));
-            }
-            // SAFETY: see Sum/F32.
-            let typed: &[f32] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_rows) };
-            Ok((AggKind::MeanF32, ValueColumn::F32 { data: typed, valid }))
-        }
-        (AggOp::Min, "F32") => {
-            let expected = n_rows * 4;
-            if data.len() < expected {
-                return Err(PyValueError::new_err(format!(
-                    "polars_metal: Min/F32 data buffer too short: {got} < {expected}",
-                    got = data.len()
-                )));
-            }
-            // SAFETY: see Sum/F32.
-            let typed: &[f32] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_rows) };
-            Ok((AggKind::MinF32, ValueColumn::F32 { data: typed, valid }))
-        }
-        (AggOp::Max, "F32") => {
-            let expected = n_rows * 4;
-            if data.len() < expected {
-                return Err(PyValueError::new_err(format!(
-                    "polars_metal: Max/F32 data buffer too short: {got} < {expected}",
-                    got = data.len()
-                )));
-            }
-            // SAFETY: see Sum/F32.
-            let typed: &[f32] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_rows) };
-            Ok((AggKind::MaxF32, ValueColumn::F32 { data: typed, valid }))
-        }
-        (AggOp::Count, "F32") => {
-            let expected = n_rows * 4;
-            if data.len() < expected {
-                return Err(PyValueError::new_err(format!(
-                    "polars_metal: Count/F32 data buffer too short: {got} < {expected}",
-                    got = data.len()
-                )));
-            }
-            // SAFETY: see Sum/F32.
-            let typed: &[f32] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, n_rows) };
-            Ok((AggKind::Count, ValueColumn::F32 { data: typed, valid }))
-        }
-        (op, dtype) => Err(PyValueError::new_err(format!(
-            "polars_metal: unsupported (agg_op, dtype) combination: {op:?} / {dtype}"
-        ))),
-    }
+    };
+    Ok((kind, vc))
 }
 
 /// Encode a [`DecodedColumn`] (key output) into `(dtype_tag, data_bytes,
