@@ -1478,3 +1478,189 @@ pub fn execute_groupby<'py>(
 
     Ok(out_list)
 }
+
+#[cfg(test)]
+mod build_agg_tests {
+    //! M7 B-2 characterization: pin the full (op, dtype) → (AggKind, ValueColumn)
+    //! matrix of `build_agg_kind_and_vcol` before the 21-arm fold, so the fold
+    //! cannot silently break a dtype/agg arm. Asserts variant identity (not data).
+    use super::*;
+
+    /// Build zero buffers of the right width and assert the returned AggKind /
+    /// ValueColumn variants for a supported (op, dtype) pair.
+    macro_rules! check_ok {
+        ($op:expr, $tag:expr, $width:expr, $kpat:pat, $vpat:pat) => {{
+            let n = 4usize;
+            let data = vec![0u8; n * $width];
+            let valid = vec![0u8; n.div_ceil(8)];
+            let (k, vc) = build_agg_kind_and_vcol($op, $tag, &data, &valid, n)
+                .unwrap_or_else(|e| panic!("{:?}/{} should be supported: {e}", $op, $tag));
+            assert!(matches!(k, $kpat), "{:?}/{}: wrong AggKind", $op, $tag);
+            assert!(matches!(vc, $vpat), "{:?}/{}: wrong ValueColumn", $op, $tag);
+        }};
+    }
+
+    #[test]
+    fn dtype_agg_matrix_is_pinned() {
+        // I64 (width 8)
+        check_ok!(
+            AggOp::Sum,
+            "I64",
+            8,
+            AggKind::SumI64,
+            ValueColumn::I64 { .. }
+        );
+        check_ok!(
+            AggOp::Mean,
+            "I64",
+            8,
+            AggKind::MeanI64,
+            ValueColumn::I64 { .. }
+        );
+        check_ok!(
+            AggOp::Min,
+            "I64",
+            8,
+            AggKind::MinI64,
+            ValueColumn::I64 { .. }
+        );
+        check_ok!(
+            AggOp::Max,
+            "I64",
+            8,
+            AggKind::MaxI64,
+            ValueColumn::I64 { .. }
+        );
+        check_ok!(
+            AggOp::Count,
+            "I64",
+            8,
+            AggKind::Count,
+            ValueColumn::I64 { .. }
+        );
+        // F64 (width 8)
+        check_ok!(
+            AggOp::Sum,
+            "F64",
+            8,
+            AggKind::SumF64,
+            ValueColumn::F64 { .. }
+        );
+        check_ok!(
+            AggOp::Mean,
+            "F64",
+            8,
+            AggKind::MeanF64,
+            ValueColumn::F64 { .. }
+        );
+        check_ok!(
+            AggOp::Min,
+            "F64",
+            8,
+            AggKind::MinF64,
+            ValueColumn::F64 { .. }
+        );
+        check_ok!(
+            AggOp::Max,
+            "F64",
+            8,
+            AggKind::MaxF64,
+            ValueColumn::F64 { .. }
+        );
+        check_ok!(
+            AggOp::Count,
+            "F64",
+            8,
+            AggKind::Count,
+            ValueColumn::F64 { .. }
+        );
+        // I32 (width 4)
+        check_ok!(
+            AggOp::Sum,
+            "I32",
+            4,
+            AggKind::SumI32,
+            ValueColumn::I32 { .. }
+        );
+        check_ok!(
+            AggOp::Mean,
+            "I32",
+            4,
+            AggKind::MeanI32,
+            ValueColumn::I32 { .. }
+        );
+        check_ok!(
+            AggOp::Min,
+            "I32",
+            4,
+            AggKind::MinI32,
+            ValueColumn::I32 { .. }
+        );
+        check_ok!(
+            AggOp::Max,
+            "I32",
+            4,
+            AggKind::MaxI32,
+            ValueColumn::I32 { .. }
+        );
+        check_ok!(
+            AggOp::Count,
+            "I32",
+            4,
+            AggKind::Count,
+            ValueColumn::I32 { .. }
+        );
+        // F32 (width 4)
+        check_ok!(
+            AggOp::Sum,
+            "F32",
+            4,
+            AggKind::SumF32,
+            ValueColumn::F32 { .. }
+        );
+        check_ok!(
+            AggOp::Mean,
+            "F32",
+            4,
+            AggKind::MeanF32,
+            ValueColumn::F32 { .. }
+        );
+        check_ok!(
+            AggOp::Min,
+            "F32",
+            4,
+            AggKind::MinF32,
+            ValueColumn::F32 { .. }
+        );
+        check_ok!(
+            AggOp::Max,
+            "F32",
+            4,
+            AggKind::MaxF32,
+            ValueColumn::F32 { .. }
+        );
+        check_ok!(
+            AggOp::Count,
+            "F32",
+            4,
+            AggKind::Count,
+            ValueColumn::F32 { .. }
+        );
+    }
+
+    #[test]
+    fn buffer_too_short_errors() {
+        // n=4 i64 needs 32 bytes; give 8.
+        let short = vec![0u8; 8];
+        let valid = vec![0u8; 1];
+        assert!(build_agg_kind_and_vcol(AggOp::Sum, "I64", &short, &valid, 4).is_err());
+    }
+
+    #[test]
+    fn unsupported_dtype_errors() {
+        let data = vec![0u8; 8];
+        let valid = vec![0u8; 1];
+        // Bool is not a supported agg value dtype.
+        assert!(build_agg_kind_and_vcol(AggOp::Sum, "Bool", &data, &valid, 1).is_err());
+    }
+}
