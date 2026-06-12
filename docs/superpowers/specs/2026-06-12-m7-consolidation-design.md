@@ -118,11 +118,26 @@ carries behavior risk, B4 does not.)
 
 ### Workstream C — Coverage & hardening
 
-**C1. Restore the differential harness (highest-leverage; do first).** Build a lean
-`hypothesis`-based random-input oracle sweeping the namespace verbs + fused F32/int chains
-against CPU Polars (byte-exact, including null-heavy / empty / single-row inputs, per the
-testing strategy). Wire `make test-diff` to actually run it — today it's a hole (`tests/diff/`
-was retired). This is the safety net the A/B refactors lean on.
+**C1. Differential safety net — Rust-first (do first).** Per the testing strategy ("proptest
+for Rust-level, hypothesis for Python-level") and the architect's steer to prefer Rust
+property tests where possible. The Rust proptest net is **already mature and gated** (runs under
+`make test-unit` / `test-kernel`): `test_cmp_{i64,f64}` (CPU-reference proptest), `proptest_subgraph`
+(random F32 op-chains vs Rust scalar reference), `test_fused_vs_per_agg` / `test_groupby_aggregate`
+(agg dispatch), and `test_int_readback` (the exact MLX wrappers B4 folds). So C1 is a **targeted
+top-up**, not a rebuild:
+- **Pin the `per_dtype!` fold surface (Rust):** `proptest_subgraph` is F32-only; extend the
+  dtype-dispatch / readback proptest (`proptest_subgraph.rs` + `test_subgraph_int.rs`) to exercise
+  **all 10 dtypes** through `eval_to_metal_buffers`, so B2's macro fold is fully pinned before it
+  lands. Confirm cmp + agg fold sites cover their full op/dtype matrix; add any missing arms.
+- **Restore the lean Python plan-level slice (hypothesis):** resurrect the retired
+  `tests/diff/strategies.py` (filter / predicate / projection over random null-heavy frames; it's
+  recoverable from git `f669dd4^`) and extend it with F32 fused-chain + reduction strategies. This
+  is the **irreducibly-Python** surface — the engine-plugin entry, serialize-detect, and routing
+  that has no Rust entry point (Workstream A's net). Keep it lean; the kernels are Rust's job.
+- **Add a discoverable `make test-diff` target** aggregating the differential/property suite (the
+  Rust proptest subset + the Python slice) and wire it into `gate`. Today there is no such target
+  (the survey's "hole" — the Rust nets are gated, but not grouped or named as the differential suite).
+This is the safety net the A/B refactors lean on.
 
 **C2. Rolling F64/integer = CPU-fallback (hardware constraint, not a TODO).** Apple Silicon GPUs
 have **no FP64** — MSL has no `double` type (same root constraint as the lack of 64-bit atomics
