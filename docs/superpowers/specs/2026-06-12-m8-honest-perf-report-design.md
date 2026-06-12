@@ -25,15 +25,24 @@ This scope was chosen deliberately (brainstorm 2026-06-12): on the M8 fork the a
 statefulness subsystem, or coverage breadth.
 
 **The report is internal decision-input, not a published artifact.** Its explicit job is to
-answer the architect's next-direction question: **do we pick up bandwidth-shaped work
-(joins, etc.) or stay compute-focused?** CLAUDE.md currently has hash join "deferred
-indefinitely unless a non-TPC-H workload demands it"; the architect wants to revisit that on
-data. We cannot benchmark a join we have not built — but the report's **bandwidth-vs-compute
-scorecard is the evidence base for that call.** Our existing bandwidth-shaped ops (TPC-H
-Q1/Q6, bare reductions) already lose 2.8–19.6×, and a hash join is the same roofline shape;
-the report makes that current and concrete so the join decision is made on measurement, not
-vibes. Presentation is tuned for one reader (the architect) — clarity over polish, no
-marketing framing.
+ground the architect's next-direction question in measured numbers: **run every real
+benchmark we have, then reason about which existing data-processing challenges our wins
+actually let us win at.** The output that matters is not a single op table — it is the
+**workload-mapping synthesis**: given the measured per-shape wins (compute-fusion chains,
+vector search, FFT, DTW, corr) and the measured losses (bandwidth-shaped: TPC-H, bare
+reductions, dt/int), what classes of real-world data work can `engine="metal"` credibly be
+blazing-fast at *today*, and where does it force the user to think too hard?
+
+The **joins question is downstream of that synthesis, not its frame.** CLAUDE.md has hash
+join "deferred indefinitely unless a non-TPC-H workload demands it." We revisit that **only
+if the workload-mapping surfaces a realistic challenge whose fusion graph wants to cross a
+join boundary** — at which point the next milestone builds a mixed-pipeline benchmark to
+measure the GPU↔CPU crossing tax that a resident GPU join would erase. M8 does **not** build
+that synthetic mixed-pipeline benchmark; it produces the workload map that tells us whether
+it is worth building. (The per-op **tax** column M8 *does* measure gives an early read on how
+expensive crossings are in general.)
+
+Presentation is tuned for one reader (the architect) — clarity over polish, no marketing framing.
 
 ## 2. Decisions locked in the brainstorm
 
@@ -160,13 +169,21 @@ Self-describing, five blocks:
    (CLAUDE.md / survey / memory) → *measured* engine ×CPU, one line per gap. Example: "FFT:
    claimed 77× was raw-MLX-vs-numpy; measured 3–4.6× engine path, tax ≈1.5× from planar host I/O."
 
-5. **Mission verdict + next-direction read (prose)** — where we clear the order-of-magnitude
-   bar, where we tie/lose, and an honest read on whether the bar is still the right bar for
-   this workload class. **Then the decision the report exists to inform:** the
-   bandwidth-vs-compute split as measured, and what it implies for whether joins (and other
-   bandwidth-shaped work) are worth building. The TPC-H Q1/Q6 + bare-reduction losses are the
-   join proxy — if those lose by 3–20× on the same roofline a hash join would sit on, that is
-   the data point. State it plainly so the join go/no-go is answerable from this report.
+5. **Mission verdict + workload-mapping synthesis (prose)** — the section the report exists
+   for. Three moves:
+   - **Mission verdict:** where we clear the order-of-magnitude bar, where we tie/lose, and an
+     honest read on whether the bar is still right for this workload class.
+   - **Workload map:** translate the measured per-shape wins into **real-world data-processing
+     challenges we can credibly win at today** — e.g. "F32 transcendental feature pipelines
+     (finance/geo/scientific) → fusion chains win 20–28×"; "embedding similarity / retrieval →
+     vector search wins N×"; "signal/spectral batch work → FFT"; "time-series alignment → DTW".
+     For each, name the win, its size dependence, and the tax it carries. Conversely, name what
+     forces the user to think too hard (bandwidth-shaped ops, mid-pipeline CPU-fallback
+     boundaries).
+   - **Next-direction trigger (not a decision):** flag whether any identified workload's natural
+     fusion graph wants to cross a join (or other currently-CPU-fallback) boundary. If yes, that
+     is the signal to build a mixed-pipeline crossing-tax benchmark next and reconsider GPU
+     joins; if no, joins stay deferred. State the trigger condition; do not pre-decide it.
 
 ## 6. Reproducibility
 
@@ -208,8 +225,12 @@ failing test; a correctness regression is.
 - **Release/packaging/usability hardening** (wheel, install story, public API docs) — the other
   half of the "prove it / release" fork; not the driver here (the report is internal
   decision-input). Revisit if/when the next-direction call points at release.
-- **Acting on the next-direction decision** — M8 *produces the evidence* for the joins-vs-compute
-  call; actually building joins, new compute-bound ops, cooperative-wavefront DTW, or
+- **The synthetic mixed-pipeline / cross-join-boundary benchmark** — M8 does *not* build it. It
+  is the *next* milestone's job, and only if the workload-mapping synthesis (§5 block 5) surfaces
+  a realistic challenge whose fusion graph wants to span a join boundary. M8 produces the map
+  that decides whether that benchmark is worth building.
+- **Acting on the next-direction decision** — M8 *produces the evidence* (the workload map);
+  actually building GPU joins, new compute-bound ops, cooperative-wavefront DTW, or
   `build_index()` is M9+, decided after reading this report.
 - **Multi-machine portability matrix** — the report is M2 Ultra primary, self-describing by
   machine; a base-M1/M2 sweep is a future add, not this milestone.
