@@ -67,7 +67,7 @@ def evict_capture(handle: int) -> None:
 
 
 def _raise_cpu(_s: pl.Series) -> pl.Series:
-    raise RuntimeError(
+    raise pl.exceptions.ComputeError(
         "polars_metal: .metal.cosine_topk/.knn require collect(engine='metal'); "
         "they have no CPU implementation."
     )

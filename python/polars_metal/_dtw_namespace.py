@@ -50,7 +50,7 @@ def evict_capture(handle: int) -> None:
 
 
 def _raise_cpu(_s: pl.Series) -> pl.Series:
-    raise RuntimeError(
+    raise pl.exceptions.ComputeError(
         "polars_metal: .metal.dtw requires collect(engine='metal'); "
         "it has no plain-CPU implementation."
     )

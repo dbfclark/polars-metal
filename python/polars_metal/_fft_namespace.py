@@ -22,7 +22,7 @@ FFT_SENTINEL_TAG = "__pm_fft__"
 
 
 def _raise_cpu(_s: pl.Series) -> pl.Series:
-    raise RuntimeError(
+    raise pl.exceptions.ComputeError(
         "polars_metal: .metal.fft/.ifft require collect(engine='metal'); "
         "they have no CPU implementation."
     )

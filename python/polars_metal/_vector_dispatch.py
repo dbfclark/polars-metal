@@ -79,7 +79,9 @@ def _build_struct(
 def _run_binding(qframe: pl.DataFrame, b: VectorBinding) -> pl.Series:
     spec = get_capture(b.handle)
     if spec is None:
-        raise RuntimeError("polars_metal: vector-search corpus handle missing (already consumed?)")
+        raise pl.exceptions.ComputeError(
+            "polars_metal: vector-search corpus handle missing (already consumed?)"
+        )
     qmat, q_rows, qd = _array_col_to_matrix(qframe.get_column(b.query_col).rechunk())
     cmat, n_rows, cd = _corpus_matrix(spec.corpus, spec.corpus_col)
     if qd != cd:

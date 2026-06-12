@@ -164,3 +164,40 @@ def test_fft_repeated_collect_no_eviction():
     first = built.collect(engine=MetalEngine())
     second = built.collect(engine=MetalEngine())
     assert first.equals(second)
+
+
+# ---------- handle-missing -> ComputeError (A1 correction) ----------
+
+
+def test_vector_handle_missing_raises_compute_error():
+    """Simulate the race where the captured corpus spec was GC'd/evicted before dispatch.
+    After the A1 correction, this must raise ComputeError (not RuntimeError)."""
+    import polars_metal._vector_namespace as ns
+
+    corpus = pl.DataFrame({"emb": [[1.0, 0.0]]}).select(pl.col("emb").cast(pl.Array(pl.Float32, 2)))
+    lf = pl.LazyFrame({"emb": [[1.0, 0.0]]}).select(pl.col("emb").cast(pl.Array(pl.Float32, 2)))
+    built = lf.with_columns(
+        pl.col("emb").metal.cosine_topk(corpus, k=1, corpus_col="emb").alias("hits")
+    )
+    # Evict all cached corpus specs to trigger the handle-missing path.
+    # Reaches into the current per-verb cache global; if a later refactor
+    # changes the cache type, update this helper.
+    for h in list(ns._CORPUS_CACHE.keys()):
+        ns.evict_capture(h)
+    with pytest.raises(ComputeError):
+        built.collect(engine=MetalEngine())
+
+
+def test_corr_handle_missing_raises_compute_error():
+    """Simulate the race where the captured corr spec was GC'd/evicted before dispatch.
+    After the A1 correction, this must raise ComputeError (not RuntimeError)."""
+    import polars_metal._corr_namespace as ns
+
+    lf = pl.LazyFrame({"a": [1.0, 2.0, 3.0], "b": [2.0, 4.0, 6.0]})
+    built = lf.metal.corr()
+    # Evict all cached corr specs to trigger the handle-missing path.
+    # Reaches into the current _CORR_CACHE global; update if cache is refactored.
+    for h in list(ns._CORR_CACHE.keys()):
+        ns.evict_capture(h)
+    with pytest.raises(ComputeError):
+        built.collect(engine=MetalEngine())

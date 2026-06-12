@@ -26,8 +26,10 @@ def test_fft_verb_builds_sentinel_and_raises_on_cpu():
     expr = pl.col("sig").metal.fft()
     j = json.loads(expr.meta.serialize(format="json"))
     assert fns.FFT_SENTINEL_TAG in json.dumps(j)
-    with pytest.raises(RuntimeError, match="engine='metal'"):
-        df.lazy().with_columns(expr.alias("spec")).collect()  # plain CPU → raises
+    with pytest.raises(pl.exceptions.ComputeError, match="engine='metal'"):
+        df.lazy().with_columns(
+            expr.alias("spec")
+        ).collect()  # plain CPU → raises (A1: ComputeError)
 
 
 def test_find_fft_bindings_recovers_col_and_op():

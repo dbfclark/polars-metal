@@ -83,7 +83,9 @@ def _run_corr(df: pl.DataFrame, spec: CorrSpec) -> pl.DataFrame:
 def apply_corr(lf: pl.LazyFrame, binding: CorrBinding, collect_fn) -> pl.DataFrame:
     spec: CorrSpec | None = get_capture(binding.handle)
     if spec is None:
-        raise RuntimeError("polars_metal: corr spec handle missing (already consumed?)")
+        raise pl.exceptions.ComputeError(
+            "polars_metal: corr spec handle missing (already consumed?)"
+        )
     # Tie eviction to the lf lifetime: when this lf is GC'd the cache entry is
     # freed. Registering twice (two collects of the same lf) is harmless —
     # both do an idempotent dict.pop.

@@ -30,7 +30,7 @@ def _cpu_fallback(s: pl.Series, spec: DtwSpec, out_name: str) -> pl.Series:
     try:
         from dtaidistance import dtw as _dtwlib
     except ImportError as exc:  # pragma: no cover
-        raise RuntimeError(
+        raise pl.exceptions.ComputeError(
             "polars_metal: .metal.dtw allow_cpu_fallback=True needs the 'dtaidistance' "
             "package for unsupported shapes; install it (pip install dtaidistance)."
         ) from exc
@@ -64,7 +64,9 @@ def _seq_matrix(s: pl.Series) -> tuple[np.ndarray, int, int]:
 def _run_binding(frame: pl.DataFrame, b: DtwBinding) -> pl.Series:
     spec: DtwSpec | None = get_capture(b.handle)
     if spec is None:
-        raise RuntimeError("polars_metal: dtw spec handle missing (already consumed?)")
+        raise pl.exceptions.ComputeError(
+            "polars_metal: dtw spec handle missing (already consumed?)"
+        )
     s = frame.get_column(b.query_col).rechunk()
     if not _gpu_supported(s):
         if spec.allow_cpu_fallback:

@@ -12,9 +12,10 @@ def _frame(n=2000, p=10, seed=0):
 
 
 def test_corr_sentinel_raises_on_plain_cpu():
-    # .metal.corr() builds a sentinel lf; collected WITHOUT engine="metal" it must raise.
+    # .metal.corr() builds a sentinel lf; collected WITHOUT engine="metal" it must raise
+    # ComputeError (A1 correction: was RuntimeError, now ComputeError).
     lf = _frame().lazy().metal.corr()
-    with pytest.raises(RuntimeError):
+    with pytest.raises(pl.exceptions.ComputeError):
         lf.collect()
 
 
