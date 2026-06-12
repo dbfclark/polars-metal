@@ -24,10 +24,11 @@ def test_dtw_builds_tagged_sentinel():
 
 def test_dtw_captures_spec():
     ref = np.arange(4, dtype=np.float32)
-    n_before = len(_dtw_namespace._DTW_CACHE)
+    # Reaches into _CACHE._specs (CaptureCache); updated from _DTW_CACHE in M7 A-2.
+    n_before = len(_dtw_namespace._CACHE._specs)
     pl.col("seq").metal.dtw(ref, window=2, allow_cpu_fallback=True)
-    assert len(_dtw_namespace._DTW_CACHE) == n_before + 1
-    spec = list(_dtw_namespace._DTW_CACHE.values())[-1]
+    assert len(_dtw_namespace._CACHE._specs) == n_before + 1
+    spec = list(_dtw_namespace._CACHE._specs.values())[-1]
     assert spec.window == 2
     assert spec.allow_cpu_fallback is True
     assert spec.query_col == "seq"
@@ -44,7 +45,7 @@ def test_find_dtw_bindings_recognizes_sentinel():
     bindings = _dtw_detect.find_dtw_bindings(lf)
     assert len(bindings) == 1
     assert bindings[0].out_name == "d"
-    assert bindings[0].query_col == "seq"
+    assert bindings[0].col == "seq"
 
 
 def test_find_dtw_bindings_ignores_plain_exprs():
