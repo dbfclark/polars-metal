@@ -127,7 +127,10 @@ def find_dt_bindings(lf: pl.LazyFrame) -> list[DtBinding]:
             if schema is None:
                 schema = dict(lf.collect_schema())
             b = _parse_dt_node(inner, name, schema)
-            if b is not None and b.out_name:
+            # Skip in-place dt.* (out_name == source column): same semantics
+            # as rolling — old slow path never yielded bare exprs, so
+            # skipping individually preserves sibling aliased bindings.
+            if b is not None and b.out_name and b.out_name != b.column:
                 out.append(b)
 
         if not out:

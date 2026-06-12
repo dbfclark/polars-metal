@@ -291,16 +291,19 @@ def find_rolling_bindings(lf: pl.LazyFrame) -> list[RollingBinding]:
             if schema is None:
                 schema = dict(lf.collect_schema())
             binding = _parse_rolling_node(inner, name, schema)
-            if binding is not None:
+            # Skip in-place rolling (out_name == source column): it can't be
+            # expressed as orig-source + rolled-output from one plan, and must
+            # fall back to CPU.  Skipping it individually preserves sibling
+            # aliased bindings (old slow path never yielded bare exprs at all,
+            # so this matches pre-scaffold behaviour exactly).
+            if binding is not None and binding.out_name != binding.column:
                 results.append(binding)
 
         if not results:
             return []
 
         # Reject if any output name shadows a source column we must read: the split
-        # (lf.drop(out_names)) would remove a column the kernel needs, and an
-        # in-place rolling (out_name == column) can't be expressed as orig-source
-        # + rolled-output from one plan. Fall back to CPU for the whole query.
+        # (lf.drop(out_names)) would remove a column the kernel needs.
         sources = {b.column for b in results}
         if any(b.out_name in sources for b in results):
             return []
