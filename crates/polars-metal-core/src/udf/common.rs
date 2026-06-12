@@ -3,6 +3,14 @@ use polars_metal_kernels::command::CommandQueue;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+/// Minimum bytes for a bit-packed output bitmap of `n_rows` rows, mirroring
+/// the kernel-side ``out_min_bytes`` (4-byte-aligned for atomic_uint, min 4).
+pub(crate) fn cmp_out_min_bytes(n_rows: usize) -> usize {
+    let raw = (n_rows + 7) / 8;
+    let padded = (raw + 3) & !3;
+    padded.max(4)
+}
+
 /// Build a `(MetalDevice, CommandQueue)` pair for one comparison-kernel
 /// dispatch. The kernel dispatcher reuses the queue across its three
 /// internal passes (load + compute + readback) so callers don't share
