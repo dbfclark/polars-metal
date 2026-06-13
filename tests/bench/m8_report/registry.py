@@ -78,7 +78,28 @@ def _frame_allclose(
         a = engine_out[col].to_numpy()
         b = cpu_out[col].to_numpy()
         if np.issubdtype(a.dtype, np.number):
-            np.testing.assert_allclose(a, b, rtol=rtol, atol=atol, err_msg=f"col {col}")
+            np.testing.assert_allclose(
+                a, b, rtol=rtol, atol=atol, equal_nan=True, err_msg=f"col {col}"
+            )
+
+
+def _make_signal_1col(n: int, seed: int = 0x501) -> pl.DataFrame:
+    rng = np.random.default_rng(seed)
+    return pl.DataFrame({"x": rng.standard_normal(n).astype(np.float32)})
+
+
+def _rolling_entry(stat: str, window: int) -> BenchEntry:
+    expr = getattr(pl.col("x"), f"rolling_{stat}")(window_size=window)
+    return BenchEntry(
+        name=f"rolling_{stat}_w{window}",
+        category="rolling",
+        sizes=[1_000_000, 10_000_000],
+        make_input=_make_signal_1col,
+        engine_fn=lambda df, e=expr: df.lazy().with_columns(r=e).collect(engine=_ENGINE),
+        cpu_fn=lambda df, e=expr: df.lazy().with_columns(r=e).collect(),
+        ceiling_fn=None,
+        check=_frame_allclose,
+    )
 
 
 # ---- registry ------------------------------------------------------------
@@ -106,4 +127,11 @@ ENTRIES: list[BenchEntry] = [
         ceiling_fn=None,
         check=_frame_allclose,
     ),
+]
+
+ENTRIES += [
+    _rolling_entry("mean", 1000),
+    _rolling_entry("sum", 1000),
+    _rolling_entry("var", 1000),
+    _rolling_entry("std", 1000),
 ]
