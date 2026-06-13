@@ -240,3 +240,92 @@ ENTRIES += [
         check=_check_topk,
     ),
 ]
+
+# ---- fft helpers -------------------------------------------------------------
+
+
+def _make_fft_signal(n: int, seed: int = 0xFF7) -> pl.DataFrame:
+    rng = np.random.default_rng(seed)
+    return pl.DataFrame({"sig": rng.standard_normal(n).astype(np.float32)})
+
+
+def _engine_fft(df: pl.DataFrame) -> pl.DataFrame:
+    return df.lazy().with_columns(pl.col("sig").metal.fft().alias("spec")).collect(engine=_ENGINE)
+
+
+def _cpu_fft(df: pl.DataFrame) -> pl.DataFrame:
+    spec = np.fft.fft(df["sig"].to_numpy().astype(np.float64))
+    return pl.DataFrame({"spec_re": spec.real, "spec_im": spec.imag})
+
+
+def _engine_fft_to_complex(out: pl.DataFrame) -> np.ndarray:
+    # Engine output: Struct({'real': Float32, 'imag': Float32}) — one struct per row.
+    spec = out["spec"]
+    re = spec.struct.field("real").to_numpy()
+    im = spec.struct.field("imag").to_numpy()
+    return re + 1j * im
+
+
+def _check_fft(engine_out: pl.DataFrame, cpu_out: pl.DataFrame) -> None:
+    ev = _engine_fft_to_complex(engine_out)
+    cv = cpu_out["spec_re"].to_numpy() + 1j * cpu_out["spec_im"].to_numpy()
+    np.testing.assert_allclose(np.abs(ev), np.abs(cv), rtol=1e-2, atol=1e-1)
+
+
+ENTRIES += [
+    BenchEntry(
+        name="fft",
+        category="fft",
+        sizes=[1 << 20, 1 << 23, 1 << 25],
+        make_input=_make_fft_signal,
+        engine_fn=_engine_fft,
+        cpu_fn=_cpu_fft,
+        ceiling_fn=None,  # numpy IS the bar; raw MLX fft broken >2^20
+        check=_check_fft,
+    ),
+]
+
+# ---- dtw helpers -------------------------------------------------------------
+
+_DTW_L = 256
+_DTW_W = 16
+_DTW_REF = np.random.default_rng(0xD7).standard_normal(_DTW_L).astype(np.float32)
+
+
+def _make_dtw_seqs(n: int, seed: int = 0xD75) -> pl.DataFrame:
+    rng = np.random.default_rng(seed)
+    seqs = rng.standard_normal((n, _DTW_L)).astype(np.float32)
+    return pl.DataFrame({"seq": seqs.tolist()}, schema={"seq": pl.Array(pl.Float32, _DTW_L)})
+
+
+def _engine_dtw(df: pl.DataFrame) -> np.ndarray:
+    # Engine output is a plain Float32 column named "d".
+    out = (
+        df.lazy()
+        .with_columns(pl.col("seq").metal.dtw(_DTW_REF, window=_DTW_W).alias("d"))
+        .collect(engine=_ENGINE)
+    )
+    return out["d"].to_numpy()
+
+
+def _cpu_dtw(df: pl.DataFrame) -> np.ndarray:
+    from dtaidistance import dtw
+
+    seqs = np.asarray(df["seq"].to_list(), dtype=np.float64)
+    ref = _DTW_REF.astype(np.float64)
+    # engine window=W  <->  dtaidistance window=W+1  (confirmed in test_dtw_e2e.py)
+    return np.array([dtw.distance(s, ref, window=_DTW_W + 1) for s in seqs])
+
+
+ENTRIES += [
+    BenchEntry(
+        name="dtw",
+        category="dtw",
+        sizes=[1_000, 50_000],
+        make_input=_make_dtw_seqs,
+        engine_fn=_engine_dtw,
+        cpu_fn=_cpu_dtw,
+        ceiling_fn=None,
+        check=lambda e, c: np.testing.assert_allclose(e, c, rtol=1e-2, atol=1e-2),
+    ),
+]
