@@ -44,6 +44,8 @@ class BenchEntry:
 
 def _black_scholes_expr() -> pl.Expr:
     # F32 transcendental chain on a single price column.
+    import math
+
     s = pl.col("s")
     k, r, t, vol = 100.0, 0.02, 1.0, 0.3
     d1 = ((s / k).log() + (r + 0.5 * vol * vol) * t) / (vol * (t**0.5))
@@ -53,7 +55,9 @@ def _black_scholes_expr() -> pl.Expr:
     def ncdf(x: pl.Expr) -> pl.Expr:
         return 0.5 * (1.0 + (x * 0.7978845608).tanh())
 
-    return s * ncdf(d1) - k * (-r * t).exp() * ncdf(d2)
+    # discount factor is a scalar constant — compute in Python, not as a Polars expr.
+    discount = math.exp(-r * t)
+    return s * ncdf(d1) - k * discount * ncdf(d2)
 
 
 def _make_prices(n: int, seed: int = 0xB5) -> pl.DataFrame:
