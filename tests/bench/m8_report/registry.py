@@ -16,12 +16,15 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
 import numpy as np
 import polars as pl
 
 import polars_metal as pm
+from tests.bench._canonical_q1_fixture_f32 import make_canonical_q1_fixture_f32
+from tests.bench._q6_fixture_f32 import make_q6_fixture_f32
 from tests.bench.m4_engine.bench_haversine_e2e import _haversine_expr, _make_taxi
 
 _ENGINE = pm.MetalEngine()
@@ -390,5 +393,87 @@ ENTRIES += [
         cpu_fn=lambda df: df.lazy().select(s=pl.col("v").sum()).collect(),
         ceiling_fn=None,
         check=_frame_allclose,
+    ),
+]
+
+# ---- conformance-loser helpers -----------------------------------------------
+
+_Q1_THRESHOLD = date(1998, 9, 2)
+
+
+def _apply_q1(df: pl.DataFrame, engine) -> pl.DataFrame:
+    return (
+        df.lazy()
+        .filter(pl.col("l_shipdate") <= _Q1_THRESHOLD)
+        .group_by("l_returnflag", "l_linestatus")
+        .agg(
+            pl.col("l_quantity").sum().alias("sum_qty"),
+            pl.col("l_extendedprice").sum().alias("sum_base_price"),
+            (pl.col("l_extendedprice") * (1.0 - pl.col("l_discount")))
+            .sum()
+            .alias("sum_disc_price"),
+            (pl.col("l_extendedprice") * (1.0 - pl.col("l_discount")) * (1.0 + pl.col("l_tax")))
+            .sum()
+            .alias("sum_charge"),
+            pl.col("l_quantity").mean().alias("avg_qty"),
+            pl.col("l_extendedprice").mean().alias("avg_price"),
+            pl.col("l_discount").mean().alias("avg_disc"),
+            pl.len().alias("count_order"),
+        )
+        .sort("l_returnflag", "l_linestatus")
+        .collect(engine=engine)
+    )
+
+
+def _apply_q6(df: pl.DataFrame, engine) -> pl.DataFrame:
+    return (
+        df.lazy()
+        .filter(
+            (pl.col("l_shipdate") >= date(1994, 1, 1))
+            & (pl.col("l_shipdate") < date(1995, 1, 1))
+            & (pl.col("l_discount") >= 0.05)
+            & (pl.col("l_discount") <= 0.07)
+            & (pl.col("l_quantity") < 24)
+        )
+        .select((pl.col("l_extendedprice") * pl.col("l_discount")).sum().alias("revenue"))
+        .collect(engine=engine)
+    )
+
+
+ENTRIES += [
+    BenchEntry(
+        name="tpch_q1",
+        category="conformance-loser",
+        sizes=[10_000_000],
+        make_input=lambda n: make_canonical_q1_fixture_f32(n_rows=n),
+        engine_fn=lambda df: _apply_q1(df, _ENGINE),
+        cpu_fn=lambda df: _apply_q1(df, "cpu"),
+        ceiling_fn=None,
+        # Q1 output is sorted by (l_returnflag, l_linestatus) — deterministic order.
+        check=_frame_allclose,
+    ),
+    BenchEntry(
+        name="tpch_q6",
+        category="conformance-loser",
+        sizes=[10_000_000],
+        make_input=lambda n: make_q6_fixture_f32(n_rows=n),
+        engine_fn=lambda df: _apply_q6(df, _ENGINE),
+        cpu_fn=lambda df: _apply_q6(df, "cpu"),
+        ceiling_fn=None,
+        check=_frame_allclose,
+    ),
+    BenchEntry(
+        name="bare_sum_f32",
+        category="conformance-loser",
+        sizes=[1_000_000, 100_000_000],
+        make_input=lambda n: pl.DataFrame(
+            {"x": np.random.default_rng(0xBA5).standard_normal(n).astype(np.float32)}
+        ),
+        engine_fn=lambda df: df.lazy().select(s=pl.col("x").sum()).collect(engine=_ENGINE),
+        cpu_fn=lambda df: df.lazy().select(s=pl.col("x").sum()).collect(),
+        ceiling_fn=None,
+        # bare F32 sum at 1e8 magnitude diverges in low digits (known: prop_gpu_sum_f32
+        # 1e11 flake). Relative tolerance scaled to the sum magnitude.
+        check=lambda e, c: _frame_allclose(e, c, rtol=1e-2, atol=1.0),
     ),
 ]
