@@ -135,3 +135,108 @@ ENTRIES += [
     _rolling_entry("var", 1000),
     _rolling_entry("std", 1000),
 ]
+
+# ---- vector-search helpers -----------------------------------------------
+
+_VEC_D = 768
+_VEC_K = 10
+_VEC_CORPUS_N = 50_000
+_VEC_CPU_CHUNK = 64  # query rows per block for chunked CPU baselines
+
+
+def _make_queries(n: int, seed: int = 0x7EC) -> pl.DataFrame:
+    rng = np.random.default_rng(seed)
+    emb = rng.standard_normal((n, _VEC_D)).astype(np.float32)
+    return pl.DataFrame({"emb": emb.tolist()}, schema={"emb": pl.Array(pl.Float32, _VEC_D)})
+
+
+def _vec_corpus(seed: int = 0xC0A) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return rng.standard_normal((_VEC_CORPUS_N, _VEC_D)).astype(np.float32)
+
+
+_CORPUS = _vec_corpus()
+# Precompute normalized corpus for cosine once.
+_CORPUS_NORMS = np.linalg.norm(_CORPUS, axis=1, keepdims=True)
+_CORPUS_N = _CORPUS / np.maximum(_CORPUS_NORMS, 1e-12)
+
+
+def _cpu_cosine_topk(df: pl.DataFrame) -> np.ndarray:
+    q = np.asarray(df["emb"].to_list(), dtype=np.float32)
+    qn = q / np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-12)
+    # Chunk over queries to cap memory at _VEC_CPU_CHUNK * N floats (~200 MB/chunk).
+    rows: list[np.ndarray] = []
+    for start in range(0, len(qn), _VEC_CPU_CHUNK):
+        block = qn[start : start + _VEC_CPU_CHUNK]
+        sims = block @ _CORPUS_N.T
+        idx = np.argpartition(-sims, kth=_VEC_K - 1, axis=1)[:, :_VEC_K]
+        rows.append(np.sort(idx, axis=1))
+    return np.concatenate(rows, axis=0)
+
+
+def _engine_cosine_topk(df: pl.DataFrame) -> np.ndarray:
+    out = (
+        df.lazy()
+        .with_columns(pl.col("emb").metal.cosine_topk(_CORPUS, k=_VEC_K).alias("h"))
+        .collect(engine=_ENGINE)
+    )
+    # Output: Struct({'indices': List(UInt32), 'scores': List(Float32)})
+    hits = np.asarray(out["h"].struct.field("indices").to_list(), dtype=np.int64)
+    return np.sort(hits, axis=1)
+
+
+def _cpu_knn(df: pl.DataFrame) -> np.ndarray:
+    q = np.asarray(df["emb"].to_list(), dtype=np.float32)
+    # Chunk to avoid materializing (Q, N, D) tensor — each block is at most
+    # _VEC_CPU_CHUNK * N * 4 bytes (~12 GB at chunk=64, N=50k → ~12 MB, fine).
+    rows: list[np.ndarray] = []
+    for start in range(0, len(q), _VEC_CPU_CHUNK):
+        block = q[start : start + _VEC_CPU_CHUNK]
+        diff = block[:, None, :] - _CORPUS[None, :, :]  # (chunk, N, D)
+        d2 = (diff * diff).sum(-1)  # (chunk, N)
+        idx = np.argpartition(d2, kth=_VEC_K - 1, axis=1)[:, :_VEC_K]
+        rows.append(np.sort(idx, axis=1))
+    return np.concatenate(rows, axis=0)
+
+
+def _engine_knn(df: pl.DataFrame) -> np.ndarray:
+    out = (
+        df.lazy()
+        .with_columns(pl.col("emb").metal.knn(_CORPUS, k=_VEC_K).alias("h"))
+        .collect(engine=_ENGINE)
+    )
+    # Output: Struct({'indices': List(UInt32), 'scores': List(Float32)})
+    hits = np.asarray(out["h"].struct.field("indices").to_list(), dtype=np.int64)
+    return np.sort(hits, axis=1)
+
+
+def _check_topk(engine_out: np.ndarray, cpu_out: np.ndarray) -> None:
+    assert engine_out.shape == cpu_out.shape, (engine_out.shape, cpu_out.shape)
+    for i in range(engine_out.shape[0]):
+        assert set(engine_out[i].tolist()) == set(cpu_out[i].tolist()), (
+            f"row {i}: engine={engine_out[i].tolist()} cpu={cpu_out[i].tolist()}"
+        )
+
+
+ENTRIES += [
+    BenchEntry(
+        name="cosine_topk",
+        category="vector-search",
+        sizes=[1_000, 100_000],
+        make_input=_make_queries,
+        engine_fn=_engine_cosine_topk,
+        cpu_fn=_cpu_cosine_topk,
+        ceiling_fn=None,
+        check=_check_topk,
+    ),
+    BenchEntry(
+        name="knn",
+        category="vector-search",
+        sizes=[1_000, 100_000],
+        make_input=_make_queries,
+        engine_fn=_engine_knn,
+        cpu_fn=_cpu_knn,
+        ceiling_fn=None,
+        check=_check_topk,
+    ),
+]
