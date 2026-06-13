@@ -353,3 +353,42 @@ def _corr_entry(p: int) -> BenchEntry:
 
 
 ENTRIES += [_corr_entry(10), _corr_entry(50)]
+
+# ---- temporal-int helpers -----------------------------------------------
+
+
+def _make_datetimes(n: int, seed: int = 0xD7E) -> pl.DataFrame:
+    rng = np.random.default_rng(seed)
+    ms = rng.integers(0, 1_262_304_000_000, size=n)  # epoch-ms over ~40 years
+    return pl.DataFrame({"ts": ms}).with_columns(ts=pl.col("ts").cast(pl.Datetime(time_unit="ms")))
+
+
+def _make_ints(n: int, seed: int = 0x1A7) -> pl.DataFrame:
+    rng = np.random.default_rng(seed)
+    return pl.DataFrame({"v": rng.integers(-1_000_000, 1_000_000, size=n).astype(np.int32)})
+
+
+ENTRIES += [
+    BenchEntry(
+        name="dt_year",
+        category="temporal-int",
+        sizes=[1_000_000, 10_000_000, 50_000_000],
+        make_input=_make_datetimes,
+        engine_fn=lambda df: (
+            df.lazy().with_columns(y=pl.col("ts").dt.year()).collect(engine=_ENGINE)
+        ),
+        cpu_fn=lambda df: df.lazy().with_columns(y=pl.col("ts").dt.year()).collect(),
+        ceiling_fn=None,
+        check=_frame_allclose,
+    ),
+    BenchEntry(
+        name="int_sum",
+        category="temporal-int",
+        sizes=[1_000_000, 10_000_000, 100_000_000],
+        make_input=_make_ints,
+        engine_fn=lambda df: df.lazy().select(s=pl.col("v").sum()).collect(engine=_ENGINE),
+        cpu_fn=lambda df: df.lazy().select(s=pl.col("v").sum()).collect(),
+        ceiling_fn=None,
+        check=_frame_allclose,
+    ),
+]
