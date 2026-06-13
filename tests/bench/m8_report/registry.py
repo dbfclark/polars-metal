@@ -189,14 +189,16 @@ def _engine_cosine_topk(df: pl.DataFrame) -> np.ndarray:
 
 
 def _cpu_knn(df: pl.DataFrame) -> np.ndarray:
+    # HONEST baseline: the squared-distance identity ‖q-c‖² = ‖q‖² + ‖c‖² - 2·q·cᵀ
+    # turns the inner loop into a BLAS matmul (q @ cᵀ) — what a competent CPU knn
+    # does. (A naive (Q,N,D) broadcast is ~30x slower and would inflate the win.)
     q = np.asarray(df["emb"].to_list(), dtype=np.float32)
-    # Chunk to avoid materializing (Q, N, D) tensor — each block is at most
-    # _VEC_CPU_CHUNK * N * 4 bytes (~12 GB at chunk=64, N=50k → ~12 MB, fine).
+    c2 = np.einsum("ij,ij->i", _CORPUS, _CORPUS)[None, :]  # (1, N) ‖c‖²
     rows: list[np.ndarray] = []
     for start in range(0, len(q), _VEC_CPU_CHUNK):
-        block = q[start : start + _VEC_CPU_CHUNK]
-        diff = block[:, None, :] - _CORPUS[None, :, :]  # (chunk, N, D)
-        d2 = (diff * diff).sum(-1)  # (chunk, N)
+        block = q[start : start + _VEC_CPU_CHUNK]  # (chunk, D)
+        q2 = np.einsum("ij,ij->i", block, block)[:, None]  # (chunk, 1) ‖q‖²
+        d2 = q2 + c2 - 2.0 * (block @ _CORPUS.T)  # (chunk, N) via BLAS
         idx = np.argpartition(d2, kth=_VEC_K - 1, axis=1)[:, :_VEC_K]
         rows.append(np.sort(idx, axis=1))
     return np.concatenate(rows, axis=0)
@@ -225,7 +227,11 @@ ENTRIES += [
     BenchEntry(
         name="cosine_topk",
         category="vector-search",
-        sizes=[1_000, 100_000],
+        # 10k (not 100k): the engine materializes the full Qxcorpus score
+        # matrix on-GPU; at Q=100k/corpus=50k/D=768 that's ~20GB, which exceeds
+        # Metal's maxBufferLength and OOMs. 10k-by-50k (~2GB) is the largest that
+        # fits. The Q=100k OOM cliff is recorded in the report verdict.
+        sizes=[1_000, 10_000],
         make_input=_make_queries,
         engine_fn=_engine_cosine_topk,
         cpu_fn=_cpu_cosine_topk,
@@ -235,7 +241,7 @@ ENTRIES += [
     BenchEntry(
         name="knn",
         category="vector-search",
-        sizes=[1_000, 100_000],
+        sizes=[1_000, 10_000],  # see cosine_topk note: 100k OOMs the GPU score matrix
         make_input=_make_queries,
         engine_fn=_engine_knn,
         cpu_fn=_cpu_knn,
@@ -314,10 +320,13 @@ def _engine_dtw(df: pl.DataFrame) -> np.ndarray:
 def _cpu_dtw(df: pl.DataFrame) -> np.ndarray:
     from dtaidistance import dtw
 
-    seqs = np.asarray(df["seq"].to_list(), dtype=np.float64)
-    ref = _DTW_REF.astype(np.float64)
+    # HONEST baseline: distance_fast is dtaidistance's C implementation — what a
+    # user reaching for the library actually gets. The pure-Python `distance` is
+    # ~100x slower and would massively inflate the win.
+    seqs = np.ascontiguousarray(np.asarray(df["seq"].to_list(), dtype=np.float64))
+    ref = np.ascontiguousarray(_DTW_REF.astype(np.float64))
     # engine window=W  <->  dtaidistance window=W+1  (confirmed in test_dtw_e2e.py)
-    return np.array([dtw.distance(s, ref, window=_DTW_W + 1) for s in seqs])
+    return np.array([dtw.distance_fast(s, ref, window=_DTW_W + 1) for s in seqs])
 
 
 ENTRIES += [
