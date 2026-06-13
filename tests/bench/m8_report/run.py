@@ -99,3 +99,15 @@ def run(entries: list[BenchEntry] = ENTRIES) -> list[Row]:
                 f"cpu={cpu_ms:8.2f}ms  {engine_vs_cpu:6.2f}× {_verdict(engine_vs_cpu)}"  # noqa: RUF001
             )
     return rows
+
+
+def main() -> None:
+    from tests.bench.m8_report.emit import write_report
+
+    rows = run()
+    write_report(rows, md_path="docs/perf-report.md", json_path="perf-report.json")
+    print(f"\nWrote docs/perf-report.md + perf-report.json ({len(rows)} rows)")
+
+
+if __name__ == "__main__":
+    main()
