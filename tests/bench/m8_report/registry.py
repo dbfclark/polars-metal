@@ -329,3 +329,27 @@ ENTRIES += [
         check=lambda e, c: np.testing.assert_allclose(e, c, rtol=1e-2, atol=1e-2),
     ),
 ]
+
+# ---- corr helpers -------------------------------------------------------------
+
+
+def _make_corr_df(n: int, p: int, seed: int = 0xC1) -> pl.DataFrame:
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((n, p)).astype(np.float32)
+    return pl.DataFrame(x, schema=[f"c{i}" for i in range(p)])
+
+
+def _corr_entry(p: int) -> BenchEntry:
+    return BenchEntry(
+        name=f"corr_p{p}",
+        category="corr",
+        sizes=[100_000, 1_000_000],
+        make_input=lambda n, p=p: _make_corr_df(n, p),
+        engine_fn=lambda df: df.lazy().metal.corr(force_gpu=True).collect(engine=_ENGINE),
+        cpu_fn=lambda df: df.corr(),
+        ceiling_fn=None,
+        check=_frame_allclose,
+    )
+
+
+ENTRIES += [_corr_entry(10), _corr_entry(50)]
