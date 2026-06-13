@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import time
 
 from tests.bench.m8_report._timing import Stats, measure
+from tests.bench.m8_report.emit import build_header, to_json, to_markdown
 from tests.bench.m8_report.registry import ENTRIES, BenchEntry
+from tests.bench.m8_report.run import Row
 
 
 def test_measure_excludes_warmup_and_reports_median():
@@ -41,3 +44,39 @@ def test_registry_entries_are_well_formed():
 def test_fusion_chain_category_present():
     cats = {e.category for e in ENTRIES}
     assert "fusion-chain" in cats
+
+
+def _sample_rows():
+    return [
+        Row("haversine", "fusion-chain", 10_000_000, 12.0, 180.0, 3.5, 15.0, 51.4, 3.43, "✅ ≥10×"),  # noqa: RUF001
+        Row(
+            "tpch_q1",
+            "conformance-loser",
+            10_000_000,
+            300.0,
+            60.0,
+            None,
+            0.2,
+            None,
+            None,
+            "🔴 loss",
+        ),
+    ]
+
+
+def test_to_markdown_has_columns_and_rows():
+    md = to_markdown(_sample_rows(), build_header())
+    assert "engine ×CPU" in md  # noqa: RUF001
+    assert "tax" in md
+    assert "haversine" in md
+    assert "🔴 loss" in md
+    assert "fusion-chain" in md
+    assert "conformance-loser" in md
+
+
+def test_to_json_roundtrips():
+    payload = to_json(_sample_rows(), build_header())
+    parsed = json.loads(payload)
+    assert parsed["rows"][0]["name"] == "haversine"
+    assert parsed["rows"][0]["engine_vs_cpu"] == 15.0
+    assert "polars_version" in parsed["header"]
