@@ -341,6 +341,10 @@ def _engine_knn(df: pl.DataFrame) -> np.ndarray:
 
 
 def _check_topk(engine_out: np.ndarray, cpu_out: np.ndarray) -> None:
+    # Set-compare per row (top-k order is not defined). Assumes no score ties at
+    # the k-boundary, which holds for random standard-normal float32 embeddings
+    # (exact ties are measure-zero); a quantized/integer fixture could surface a
+    # spurious mismatch here and would need a score-tolerant comparison.
     assert engine_out.shape == cpu_out.shape, (engine_out.shape, cpu_out.shape)
     for i in range(engine_out.shape[0]):
         assert set(engine_out[i].tolist()) == set(cpu_out[i].tolist()), (

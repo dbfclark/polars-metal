@@ -77,7 +77,9 @@ def run(entries: list[BenchEntry] = ENTRIES) -> list[Row]:
                 if e.ceiling_fn is not None
                 else None
             )
-            engine_vs_cpu = cpu_ms / engine_ms
+            # engine_ms is always > 0 (min sizes >= 1000), but guard defensively
+            # to match the ceiling-ratio style and never raise on a degenerate run.
+            engine_vs_cpu = (cpu_ms / engine_ms) if engine_ms else float("inf")
             ceiling_vs_cpu = (cpu_ms / ceiling_ms) if ceiling_ms else None
             tax = (engine_ms / ceiling_ms) if ceiling_ms else None
             rows.append(
