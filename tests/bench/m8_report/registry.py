@@ -14,11 +14,13 @@ Fixtures are imported from existing m4_* benches, not rebuilt.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
+import mlx.core as mx
 import numpy as np
 import polars as pl
 
@@ -28,6 +30,29 @@ from tests.bench._q6_fixture_f32 import make_q6_fixture_f32
 from tests.bench.m4_engine.bench_haversine_e2e import _haversine_expr, _make_taxi
 
 _ENGINE = pm.MetalEngine()
+
+# ---------------------------------------------------------------------------
+# Ceiling memoization: host->mx transfer excluded from the timed region.
+#
+# measure() discards warmup; the first warmup call populates the cache so
+# all measured calls reuse already-resident mx.arrays (pure GPU compute).
+# The data object is held alive by the caller throughout measure(), so
+# id(data) is stable.
+# ---------------------------------------------------------------------------
+_CEIL_CACHE: dict[int, Any] = {}
+
+
+def _ceil_inputs(data: Any, builder: Callable[[Any], Any]) -> Any:
+    """Return memoized mx.array(s) for *data*, building once on first call."""
+    key = id(data)
+    if key not in _CEIL_CACHE:
+        arrs = builder(data)
+        if isinstance(arrs, tuple):
+            mx.eval(*arrs)
+        else:
+            mx.eval(arrs)
+        _CEIL_CACHE[key] = arrs
+    return _CEIL_CACHE[key]
 
 
 @dataclass
@@ -47,8 +72,6 @@ class BenchEntry:
 
 def _black_scholes_expr() -> pl.Expr:
     # F32 transcendental chain on a single price column.
-    import math
-
     s = pl.col("s")
     k, r, t, vol = 100.0, 0.02, 1.0, 0.3
     d1 = ((s / k).log() + (r + 0.5 * vol * vol) * t) / (vol * (t**0.5))
@@ -58,9 +81,63 @@ def _black_scholes_expr() -> pl.Expr:
     def ncdf(x: pl.Expr) -> pl.Expr:
         return 0.5 * (1.0 + (x * 0.7978845608).tanh())
 
-    # discount factor is a scalar constant — compute in Python, not as a Polars expr.
+    # discount factor is a scalar constant -- compute in Python, not as a Polars expr.
     discount = math.exp(-r * t)
     return s * ncdf(d1) - k * discount * ncdf(d2)
+
+
+# ---- haversine ceiling ----------------------------------------------------
+
+
+def _ceil_haversine(df: pl.DataFrame) -> mx.array:
+    """Raw MLX haversine: same formula as _haversine_expr, cached mx inputs."""
+    R = 6371.0
+    deg2rad = float(np.pi / 180.0)
+
+    def _build(data: pl.DataFrame) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+        return (
+            mx.array(data["pickup_lat"].to_numpy()),
+            mx.array(data["pickup_lon"].to_numpy()),
+            mx.array(data["drop_lat"].to_numpy()),
+            mx.array(data["drop_lon"].to_numpy()),
+        )
+
+    p_lat, p_lon, d_lat, d_lon = _ceil_inputs(df, _build)
+    p_lat_r = p_lat * deg2rad
+    d_lat_r = d_lat * deg2rad
+    dlat = (d_lat_r - p_lat_r) / 2.0
+    dlon = (d_lon - p_lon) * deg2rad / 2.0
+    a = mx.sin(dlat) ** 2 + mx.cos(p_lat_r) * mx.cos(d_lat_r) * mx.sin(dlon) ** 2
+    out = 2.0 * R * mx.arcsin(mx.sqrt(a))
+    mx.eval(out)
+    return out
+
+
+# ---- black_scholes ceiling ------------------------------------------------
+
+_BS_K = 100.0
+_BS_R = 0.02
+_BS_T = 1.0
+_BS_VOL = 0.3
+_BS_DISCOUNT = math.exp(-_BS_R * _BS_T)
+
+
+def _ceil_black_scholes(df: pl.DataFrame) -> mx.array:
+    """Raw MLX Black-Scholes: same tanh-approx formula as _black_scholes_expr."""
+
+    def _build(data: pl.DataFrame) -> mx.array:
+        return mx.array(data["s"].to_numpy())
+
+    s = _ceil_inputs(df, _build)
+    d1 = (mx.log(s / _BS_K) + (_BS_R + 0.5 * _BS_VOL * _BS_VOL) * _BS_T) / (_BS_VOL * (_BS_T**0.5))
+    d2 = d1 - _BS_VOL * (_BS_T**0.5)
+
+    def ncdf_mx(x: mx.array) -> mx.array:
+        return 0.5 * (1.0 + mx.tanh(x * 0.7978845608))
+
+    out = s * ncdf_mx(d1) - _BS_K * _BS_DISCOUNT * ncdf_mx(d2)
+    mx.eval(out)
+    return out
 
 
 def _make_prices(n: int, seed: int = 0xB5) -> pl.DataFrame:
@@ -115,7 +192,7 @@ ENTRIES: list[BenchEntry] = [
         make_input=_make_taxi,
         engine_fn=lambda df: df.lazy().with_columns(d=_haversine_expr()).collect(engine=_ENGINE),
         cpu_fn=lambda df: df.lazy().with_columns(d=_haversine_expr()).collect(),
-        ceiling_fn=None,
+        ceiling_fn=_ceil_haversine,
         check=_frame_allclose,
     ),
     BenchEntry(
@@ -127,7 +204,7 @@ ENTRIES: list[BenchEntry] = [
             df.lazy().with_columns(c=_black_scholes_expr()).collect(engine=_ENGINE)
         ),
         cpu_fn=lambda df: df.lazy().with_columns(c=_black_scholes_expr()).collect(),
-        ceiling_fn=None,
+        ceiling_fn=_ceil_black_scholes,
         check=_frame_allclose,
     ),
 ]
@@ -162,6 +239,54 @@ _CORPUS = _vec_corpus()
 # Precompute normalized corpus for cosine once.
 _CORPUS_NORMS = np.linalg.norm(_CORPUS, axis=1, keepdims=True)
 _CORPUS_N = _CORPUS / np.maximum(_CORPUS_NORMS, 1e-12)
+
+# Corpus mx.arrays are module-level constants (corpus never changes across
+# benchmark sizes).  Transfer them once at import time so they are always
+# resident on GPU when ceiling_fn is called.
+_CORPUS_N_MX: mx.array = mx.array(_CORPUS_N)
+_CORPUS_MX: mx.array = mx.array(_CORPUS)
+mx.eval(_CORPUS_N_MX, _CORPUS_MX)
+
+
+# ---- cosine_topk ceiling --------------------------------------------------
+
+
+def _ceil_cosine_topk(df: pl.DataFrame) -> mx.array:
+    """Raw MLX cosine top-k: normalize queries on GPU, matmul with pre-resident
+    normalized corpus, argpartition.  Host->mx transfer for queries is memoized
+    (excluded from timed region); corpus is already resident above."""
+
+    def _build(data: pl.DataFrame) -> mx.array:
+        q_np = np.asarray(data["emb"].to_list(), dtype=np.float32)
+        q_norms = np.linalg.norm(q_np, axis=1, keepdims=True)
+        qn = q_np / np.maximum(q_norms, 1e-12)
+        return mx.array(qn)
+
+    q_mx = _ceil_inputs(df, _build)
+    sims = q_mx @ _CORPUS_N_MX.T
+    idx = mx.argpartition(-sims, kth=_VEC_K - 1, axis=1)[:, :_VEC_K]
+    mx.eval(idx)
+    return idx
+
+
+# ---- knn ceiling ----------------------------------------------------------
+
+
+def _ceil_knn(df: pl.DataFrame) -> mx.array:
+    """Raw MLX L2 k-NN: squared-distance identity via matmul, argpartition.
+    Query host->mx transfer is memoized; corpus is already resident above."""
+
+    def _build(data: pl.DataFrame) -> mx.array:
+        q_np = np.asarray(data["emb"].to_list(), dtype=np.float32)
+        return mx.array(q_np)
+
+    q_mx = _ceil_inputs(df, _build)
+    q2 = (q_mx * q_mx).sum(axis=1, keepdims=True)
+    c2 = (_CORPUS_MX * _CORPUS_MX).sum(axis=1)
+    dist2 = q2 + c2 - 2.0 * (q_mx @ _CORPUS_MX.T)
+    idx = mx.argpartition(dist2, kth=_VEC_K - 1, axis=1)[:, :_VEC_K]
+    mx.eval(idx)
+    return idx
 
 
 def _cpu_cosine_topk(df: pl.DataFrame) -> np.ndarray:
@@ -235,7 +360,7 @@ ENTRIES += [
         make_input=_make_queries,
         engine_fn=_engine_cosine_topk,
         cpu_fn=_cpu_cosine_topk,
-        ceiling_fn=None,
+        ceiling_fn=_ceil_cosine_topk,
         check=_check_topk,
     ),
     BenchEntry(
@@ -245,7 +370,7 @@ ENTRIES += [
         make_input=_make_queries,
         engine_fn=_engine_knn,
         cpu_fn=_cpu_knn,
-        ceiling_fn=None,
+        ceiling_fn=_ceil_knn,
         check=_check_topk,
     ),
 ]
@@ -351,6 +476,32 @@ def _make_corr_df(n: int, p: int, seed: int = 0xC1) -> pl.DataFrame:
     return pl.DataFrame(x, schema=[f"c{i}" for i in range(p)])
 
 
+def _ceil_corr(df: pl.DataFrame) -> mx.array:
+    """Raw MLX correlation matrix: standardize(X) @ standardize(X).T / (n-1).
+
+    Replicates the spike_corr_crossover.py gpu_corr() formula, which matches
+    df.corr() (Pearson, ddof=1) byte-for-byte within F32 tolerance.
+    Input layout: (n, p) row-major (same as what the engine ingests).
+    Host->mx transfer is memoized; only the standardize+GEMM+eval is timed."""
+    n = len(df)
+
+    def _build(data: pl.DataFrame) -> mx.array:
+        # Stack columns into (n, p) contiguous F32 array; mx.array takes it directly.
+        np_mat = np.column_stack([data[c].to_numpy().astype(np.float32) for c in data.columns])
+        return mx.array(np_mat)
+
+    Xmx = _ceil_inputs(df, _build)
+    mu = mx.mean(Xmx, axis=0, keepdims=True)
+    xc = Xmx - mu
+    # ddof=1 variance to match Pearson normalization in the GEMM
+    var = mx.sum(xc * xc, axis=0, keepdims=True) / (n - 1)
+    std = mx.sqrt(var)
+    z = xc / std
+    c = mx.matmul(z.T, z) / (n - 1)
+    mx.eval(c)
+    return c
+
+
 def _corr_entry(p: int) -> BenchEntry:
     return BenchEntry(
         name=f"corr_p{p}",
@@ -359,7 +510,7 @@ def _corr_entry(p: int) -> BenchEntry:
         make_input=lambda n, p=p: _make_corr_df(n, p),
         engine_fn=lambda df: df.lazy().metal.corr(force_gpu=True).collect(engine=_ENGINE),
         cpu_fn=lambda df: df.corr(),
-        ceiling_fn=None,
+        ceiling_fn=_ceil_corr,
         check=_frame_allclose,
     )
 
