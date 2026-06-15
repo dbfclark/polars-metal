@@ -447,11 +447,15 @@ def _dispatch_filter(df_pydf: Any, filter_plan: dict) -> pl.DataFrame:
         upstream_pydf = _native.execute_plan(df_pydf, upstream_plan)
         upstream = pl.DataFrame._from_pydf(upstream_pydf)
 
-    # GPU column compaction doesn't speak Utf8 yet; fall back to the
-    # Polars CPU filter path which compacts all dtypes in one pass.
-    # (This mirrors the route used when a GroupBy sits above the Filter
-    # — see `_filter_via_polars`.)
-    if any(str(dt) in ("String", "Utf8") for dt in upstream.schema.values()):
+    # Fall back to the Polars CPU filter path for any column the GPU compaction
+    # path can't handle: String/Utf8 (compaction doesn't speak variable-width
+    # data) OR any dtype absent from the GPU registry (Date, Datetime, and other
+    # temporal/unsupported types). Previously only String/Utf8 was checked, which
+    # crashed on a Date column (e.g. l_shipdate in TPC-H Q6).
+    if any(
+        str(dt) in ("String", "Utf8") or str(dt) not in _DTYPE_TO_TAG
+        for dt in upstream.schema.values()
+    ):
         return _filter_via_polars(df_pydf, filter_plan)
 
     n_rows = upstream.height

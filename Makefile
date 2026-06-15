@@ -1,5 +1,5 @@
 # Makefile — single entry point per gate. See docs/superpowers/specs/2026-05-19-m0-skeleton-design.md.
-.PHONY: build wheel test-unit test-kernel test-conformance test-diff bench lint gate refresh-refs help
+.PHONY: build wheel test-unit test-kernel test-conformance test-diff bench perf-report lint gate refresh-refs help
 
 help:
 	@grep '^[a-zA-Z][a-zA-Z-]*:' $(MAKEFILE_LIST) | grep -v '^help:' | awk -F: '{print $$1}' | sort
@@ -12,6 +12,7 @@ wheel:
 
 test-unit:
 	cargo test --workspace -- --test-threads=1
+	pytest tests/bench/m8_report/test_smoke.py tests/bench/m8_report/test_harness.py -q
 
 test-kernel:
 	# kernel correctness suite (proptest + differential, --test-threads=1 for Metal queue safety)
@@ -30,6 +31,9 @@ test-diff:
 bench:
 	cargo bench --workspace
 	pytest tests/bench --benchmark-only
+
+perf-report:
+	python -m tests.bench.m8_report.run
 
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
