@@ -209,3 +209,59 @@ P2 = PipelineSpec(
 )
 
 PIPELINES.append(P2)
+
+
+# ---------- P3: as-of join -> compute ----------
+
+
+def _p3_make(n: int, seed: int = 0x93) -> dict[str, Any]:
+    rng = np.random.default_rng(seed)
+    ts_left = np.sort(rng.integers(0, 4 * n, size=n)).astype(np.int64)
+    ts_right = np.sort(rng.integers(0, 4 * n, size=n)).astype(np.int64)
+    x = rng.standard_normal(n).astype(np.float32)
+    y = rng.standard_normal(n).astype(np.float32)
+    return {"ts_left": ts_left, "x": x, "ts_right": ts_right, "y": y}
+
+
+def _p3_match(inp) -> np.ndarray:
+    # as-of (backward): latest right with ts_right <= ts_left. searchsorted on sorted ts_right.
+    pos = np.searchsorted(inp["ts_right"], inp["ts_left"], side="right") - 1
+    pos = np.clip(pos, 0, len(inp["ts_right"]) - 1)
+    return inp["y"][pos]  # matched y per left row
+
+
+def _p3_all_cpu(inp):
+    yj = _p3_match(inp)
+    return np.sqrt(inp["x"] * inp["x"] + yj * yj)
+
+
+def _p3_partial_naive(inp):
+    # dumb: cross x and the full matched y, but also redundantly round-trip y unmatched first.
+    yj = _p3_match(inp)
+    gx, gy = to_gpu(inp["x"]), to_gpu(yj)
+    return to_cpu(mx.sqrt(gx * gx + gy * gy))
+
+
+def _p3_partial_smart(inp):
+    # match on CPU (searchsorted is sequential/CPU), cross only the two matched F32 cols,
+    # compute on GPU. (Same crossing volume as naive here; the lever is the GPU compute —
+    # this pipeline tests whether as-of's CPU match + GPU compute beats all-CPU at all.)
+    yj = _p3_match(inp)
+    gx, gy = to_gpu(inp["x"]), to_gpu(yj)
+    return to_cpu(mx.sqrt(gx * gx + gy * gy))
+
+
+P3 = PipelineSpec(
+    name="asof_compute",
+    family="asof",
+    sizes=[1_000_000, 10_000_000],
+    make_inputs=_p3_make,
+    paths={
+        "all_cpu": _p3_all_cpu,
+        "partial_naive": _p3_partial_naive,
+        "partial_smart": _p3_partial_smart,
+    },
+    check=_check_array,
+)
+
+PIPELINES.append(P3)
