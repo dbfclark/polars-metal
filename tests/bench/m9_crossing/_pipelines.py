@@ -14,6 +14,7 @@ from typing import Any
 
 import mlx.core as mx
 import numpy as np
+import polars as pl
 
 from tests.bench.m9_crossing._crossing import to_cpu, to_gpu
 
@@ -265,3 +266,62 @@ P3 = PipelineSpec(
 )
 
 PIPELINES.append(P3)
+
+
+# ---------- P4: hash equi-join -> compute ----------
+
+
+def _p4_make(n: int, seed: int = 0x94) -> dict[str, Any]:
+    rng = np.random.default_rng(seed)
+    # right has unique keys 0..n-1; left references them (many-to-one), so the join is 1:1 per left row.
+    left = pl.DataFrame(
+        {
+            "key": rng.integers(0, n, size=n).astype(np.int64),
+            "x": rng.standard_normal(n).astype(np.float32),
+        }
+    )
+    right = pl.DataFrame(
+        {
+            "key": np.arange(n, dtype=np.int64),
+            "y": rng.standard_normal(n).astype(np.float32),
+        }
+    )
+    return {"left": left, "right": right}
+
+
+def _p4_joined_xy(inp) -> tuple[np.ndarray, np.ndarray]:
+    j = inp["left"].join(inp["right"], on="key", how="inner")
+    return j["x"].to_numpy(), j["y"].to_numpy()
+
+
+def _p4_all_cpu(inp):
+    x, y = _p4_joined_xy(inp)
+    return np.sort(np.sqrt(x * x + y * y))  # sort: join output order is not defined
+
+
+def _p4_partial_naive(inp):
+    x, y = _p4_joined_xy(inp)  # hash join on CPU (no GPU path)
+    gx, gy = to_gpu(x), to_gpu(y)
+    return np.sort(to_cpu(mx.sqrt(gx * gx + gy * gy)))
+
+
+def _p4_partial_smart(inp):
+    x, y = _p4_joined_xy(inp)
+    gx, gy = to_gpu(x), to_gpu(y)
+    return np.sort(to_cpu(mx.sqrt(gx * gx + gy * gy)))
+
+
+P4 = PipelineSpec(
+    name="hashjoin_compute",
+    family="hash",
+    sizes=[1_000_000, 10_000_000],
+    make_inputs=_p4_make,
+    paths={
+        "all_cpu": _p4_all_cpu,
+        "partial_naive": _p4_partial_naive,
+        "partial_smart": _p4_partial_smart,
+    },
+    check=_check_array,
+)
+
+PIPELINES.append(P4)
