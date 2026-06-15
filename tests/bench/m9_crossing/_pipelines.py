@@ -133,3 +133,79 @@ P1 = PipelineSpec(
 )
 
 PIPELINES: list[PipelineSpec] = [P1]
+
+
+# ---------- P2: fact -> dim lookup -> compute chain ----------
+
+_P2_DIM = 20_000
+
+
+def _p2_make(n: int, seed: int = 0x92) -> dict[str, Any]:
+    rng = np.random.default_rng(seed)
+    return {
+        "value": rng.uniform(50, 150, size=n).astype(np.float32),
+        "id": rng.integers(0, _P2_DIM, size=n).astype(np.int64),
+        "dim": rng.uniform(0.1, 0.5, size=_P2_DIM).astype(np.float32),  # e.g. per-key volatility
+    }
+
+
+def _p2_chain_np(s: np.ndarray, vol: np.ndarray) -> np.ndarray:
+    # Black-Scholes-shaped chain on fact value `s` and gathered dim `vol`.
+    k, r, t = 100.0, 0.02, 1.0
+    d1 = (np.log(s / k) + (r + 0.5 * vol * vol) * t) / (vol * np.sqrt(t))
+    return s * 0.5 * (1.0 + np.tanh(0.7978845608 * d1))
+
+
+def _p2_all_cpu(inp):
+    vol = inp["dim"][inp["id"]]  # gather
+    return _p2_chain_np(inp["value"], vol)
+
+
+def _p2_partial_naive(inp):
+    # dumb: cross the full gathered dim column AND value back and forth without reducing.
+    gdim = to_gpu(inp["dim"])
+    gid = to_gpu(inp["id"])
+    vol_g = mx.take(gdim, gid, axis=0)
+    vol = to_cpu(vol_g)  # cross full N gathered vols
+    return _p2_chain_np(inp["value"], vol)  # chain on CPU
+
+
+def _p2_partial_smart(inp):
+    # smart: do the gather on CPU (it's an int index op, cheap), cross only the two
+    # F32 columns the GPU chain needs, run the heavy transcendental chain on GPU.
+    vol = inp["dim"][inp["id"]]  # CPU gather (cheap integer indexing)
+    gs, gvol = to_gpu(inp["value"]), to_gpu(vol)
+    k, r, t = 100.0, 0.02, 1.0
+    d1 = (mx.log(gs / k) + (r + 0.5 * gvol * gvol) * t) / (gvol * (t**0.5))
+    out_g = gs * 0.5 * (1.0 + mx.tanh(0.7978845608 * d1))
+    return to_cpu(out_g)
+
+
+def _p2_resident(inp):
+    gdim, gid, gs = to_gpu(inp["dim"]), to_gpu(inp["id"]), to_gpu(inp["value"])
+    gvol = mx.take(gdim, gid, axis=0)  # resident gather
+    k, r, t = 100.0, 0.02, 1.0
+    d1 = (mx.log(gs / k) + (r + 0.5 * gvol * gvol) * t) / (gvol * (t**0.5))
+    out_g = gs * 0.5 * (1.0 + mx.tanh(0.7978845608 * d1))
+    return to_cpu(out_g)
+
+
+def _check_array(a: np.ndarray, b: np.ndarray) -> None:
+    np.testing.assert_allclose(a, b, rtol=1e-3, atol=1e-3)
+
+
+P2 = PipelineSpec(
+    name="fact_dim_chain",
+    family="gather",
+    sizes=[1_000_000, 10_000_000],
+    make_inputs=_p2_make,
+    paths={
+        "all_cpu": _p2_all_cpu,
+        "partial_naive": _p2_partial_naive,
+        "partial_smart": _p2_partial_smart,
+        "resident": _p2_resident,
+    },
+    check=_check_array,
+)
+
+PIPELINES.append(P2)
