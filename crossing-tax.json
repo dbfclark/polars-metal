@@ -1,0 +1,238 @@
+{
+  "header": {
+    "machine": "arm64",
+    "platform": "macOS-26.2-arm64-arm-64bit",
+    "polars_version": "1.40.1",
+    "mlx_version": "0.25.1"
+  },
+  "cost_model": {
+    "alpha_ms_per_byte": 4.959853375571442e-08,
+    "beta_ms_per_crossing": 0.0015882247585601408
+  },
+  "rows": [
+    {
+      "pipeline": "retrieve_rerank",
+      "family": "gather",
+      "size": 1000,
+      "path": "all_cpu",
+      "ms": 466.593417,
+      "vs_all_cpu": 1.0
+    },
+    {
+      "pipeline": "retrieve_rerank",
+      "family": "gather",
+      "size": 1000,
+      "path": "partial_naive",
+      "ms": 376.153166,
+      "vs_all_cpu": 1.2404346398615718
+    },
+    {
+      "pipeline": "retrieve_rerank",
+      "family": "gather",
+      "size": 1000,
+      "path": "partial_smart",
+      "ms": 20.406125,
+      "vs_all_cpu": 22.865361110940956
+    },
+    {
+      "pipeline": "retrieve_rerank",
+      "family": "gather",
+      "size": 1000,
+      "path": "resident",
+      "ms": 20.579292,
+      "vs_all_cpu": 22.6729576994194
+    },
+    {
+      "pipeline": "retrieve_rerank",
+      "family": "gather",
+      "size": 10000,
+      "path": "all_cpu",
+      "ms": 4078.651417,
+      "vs_all_cpu": 1.0
+    },
+    {
+      "pipeline": "retrieve_rerank",
+      "family": "gather",
+      "size": 10000,
+      "path": "partial_naive",
+      "ms": 3719.607375,
+      "vs_all_cpu": 1.096527403513926
+    },
+    {
+      "pipeline": "retrieve_rerank",
+      "family": "gather",
+      "size": 10000,
+      "path": "partial_smart",
+      "ms": 134.173833,
+      "vs_all_cpu": 30.39826265528242
+    },
+    {
+      "pipeline": "retrieve_rerank",
+      "family": "gather",
+      "size": 10000,
+      "path": "resident",
+      "ms": 134.253583,
+      "vs_all_cpu": 30.3802053238311
+    },
+    {
+      "pipeline": "fact_dim_chain",
+      "family": "gather",
+      "size": 1000000,
+      "path": "all_cpu",
+      "ms": 4.674875,
+      "vs_all_cpu": 1.0
+    },
+    {
+      "pipeline": "fact_dim_chain",
+      "family": "gather",
+      "size": 1000000,
+      "path": "partial_naive",
+      "ms": 4.991708,
+      "vs_all_cpu": 0.9365281382644979
+    },
+    {
+      "pipeline": "fact_dim_chain",
+      "family": "gather",
+      "size": 1000000,
+      "path": "partial_smart",
+      "ms": 2.156958,
+      "vs_all_cpu": 2.167346327559461
+    },
+    {
+      "pipeline": "fact_dim_chain",
+      "family": "gather",
+      "size": 1000000,
+      "path": "resident",
+      "ms": 1.389208,
+      "vs_all_cpu": 3.365136826162821
+    },
+    {
+      "pipeline": "fact_dim_chain",
+      "family": "gather",
+      "size": 10000000,
+      "path": "all_cpu",
+      "ms": 50.313708,
+      "vs_all_cpu": 1.0
+    },
+    {
+      "pipeline": "fact_dim_chain",
+      "family": "gather",
+      "size": 10000000,
+      "path": "partial_naive",
+      "ms": 46.190916,
+      "vs_all_cpu": 1.0892554717901675
+    },
+    {
+      "pipeline": "fact_dim_chain",
+      "family": "gather",
+      "size": 10000000,
+      "path": "partial_smart",
+      "ms": 12.070291,
+      "vs_all_cpu": 4.168392294767376
+    },
+    {
+      "pipeline": "fact_dim_chain",
+      "family": "gather",
+      "size": 10000000,
+      "path": "resident",
+      "ms": 6.109167,
+      "vs_all_cpu": 8.23577224194395
+    },
+    {
+      "pipeline": "asof_compute",
+      "family": "asof",
+      "size": 1000000,
+      "path": "all_cpu",
+      "ms": 69.550292,
+      "vs_all_cpu": 1.0
+    },
+    {
+      "pipeline": "asof_compute",
+      "family": "asof",
+      "size": 1000000,
+      "path": "partial_naive",
+      "ms": 70.658417,
+      "vs_all_cpu": 0.9843171550248571
+    },
+    {
+      "pipeline": "asof_compute",
+      "family": "asof",
+      "size": 1000000,
+      "path": "partial_smart",
+      "ms": 70.683584,
+      "vs_all_cpu": 0.9839666873711441
+    },
+    {
+      "pipeline": "asof_compute",
+      "family": "asof",
+      "size": 10000000,
+      "path": "all_cpu",
+      "ms": 822.134375,
+      "vs_all_cpu": 1.0
+    },
+    {
+      "pipeline": "asof_compute",
+      "family": "asof",
+      "size": 10000000,
+      "path": "partial_naive",
+      "ms": 823.828916,
+      "vs_all_cpu": 0.9979430911356842
+    },
+    {
+      "pipeline": "asof_compute",
+      "family": "asof",
+      "size": 10000000,
+      "path": "partial_smart",
+      "ms": 820.902667,
+      "vs_all_cpu": 1.0015004312320013
+    },
+    {
+      "pipeline": "hashjoin_compute",
+      "family": "hash",
+      "size": 1000000,
+      "path": "all_cpu",
+      "ms": 83.1135,
+      "vs_all_cpu": 1.0
+    },
+    {
+      "pipeline": "hashjoin_compute",
+      "family": "hash",
+      "size": 1000000,
+      "path": "partial_naive",
+      "ms": 81.45825,
+      "vs_all_cpu": 1.0203202253915349
+    },
+    {
+      "pipeline": "hashjoin_compute",
+      "family": "hash",
+      "size": 1000000,
+      "path": "partial_smart",
+      "ms": 81.106291,
+      "vs_all_cpu": 1.0247478829971401
+    },
+    {
+      "pipeline": "hashjoin_compute",
+      "family": "hash",
+      "size": 10000000,
+      "path": "all_cpu",
+      "ms": 992.067958,
+      "vs_all_cpu": 1.0
+    },
+    {
+      "pipeline": "hashjoin_compute",
+      "family": "hash",
+      "size": 10000000,
+      "path": "partial_naive",
+      "ms": 998.097917,
+      "vs_all_cpu": 0.9939585496600128
+    },
+    {
+      "pipeline": "hashjoin_compute",
+      "family": "hash",
+      "size": 10000000,
+      "path": "partial_smart",
+      "ms": 1018.616459,
+      "vs_all_cpu": 0.9739367052579699
+    }
+  ]
+}

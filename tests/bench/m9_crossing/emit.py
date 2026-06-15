@@ -46,7 +46,7 @@ def to_markdown(rows, cost: CostModel, header: dict[str, str]) -> str:
     lines.append("")
     lines.append(
         f"- **alpha** = {cost.alpha_ms_per_byte:.3e} ms/byte "
-        f"(≈ {1.0 / (cost.alpha_ms_per_byte * 1e9):.1f} GB/s round-trip)"
+        f"(≈ {1.0 / (cost.alpha_ms_per_byte * 1e6):.1f} GB/s round-trip)"
     )
     lines.append(f"- **beta** = {cost.beta_ms_per_crossing:.4f} ms/crossing (fixed dispatch/sync)")
     lines.append("")
