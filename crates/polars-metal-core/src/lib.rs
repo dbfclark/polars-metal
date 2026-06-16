@@ -15,7 +15,7 @@ pub mod plan;
 pub mod router;
 mod router_udf;
 mod udf;
-mod vector_search;
+pub mod vector_search;
 
 pub use arena::{BumpArena, ScratchArena, StubArena};
 pub use error::EngineError;

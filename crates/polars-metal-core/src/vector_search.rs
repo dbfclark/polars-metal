@@ -7,11 +7,13 @@ use polars_metal_mlx_sys::array::{
     MlxArrayHandle, MlxDtype,
 };
 use polars_metal_mlx_sys::elementwise::{
-    mlx_add, mlx_cast, mlx_div, mlx_mul, mlx_neg, mlx_sqrt, mlx_sub,
+    mlx_add, mlx_cast, mlx_div, mlx_exp, mlx_mul, mlx_neg, mlx_sqrt, mlx_sub,
 };
 use polars_metal_mlx_sys::matmul::mlx_matmul;
 use polars_metal_mlx_sys::reduce::mlx_sum_axis;
-use polars_metal_mlx_sys::shape::{mlx_reshape, mlx_slice, mlx_take_along_axis, mlx_transpose};
+use polars_metal_mlx_sys::shape::{
+    mlx_reshape, mlx_slice, mlx_take, mlx_take_along_axis, mlx_transpose,
+};
 use polars_metal_mlx_sys::sort::mlx_argpartition_axis;
 use polars_metal_mlx_sys::FfiError;
 
@@ -30,6 +32,18 @@ fn view2d(data: &[f32], rows: i64, cols: i64) -> Result<MlxArrayHandle, FfiError
     mlx_array_view_metal_buffer(buf, &[rows, cols], MlxDtype::F32)
 }
 
+/// View a host F32 slice as a 1-D `(n,)` MLX array (e.g. the per-corpus-row rerank weight).
+fn view1d(data: &[f32], n: i64) -> Result<MlxArrayHandle, FfiError> {
+    let device = MetalDevice::system_default()
+        .map_err(|e| FfiError::Runtime(format!("metal device unavailable: {e}")))?;
+    // SAFETY: same invariant as `view2d` — `data` outlives every use of the returned handle
+    // within this call (callers eval + read back before returning). MetalBuffer borrows.
+    let buf = unsafe { MetalBuffer::from_borrowed_f32(&device, data.as_ptr(), data.len()) }
+        .map(Arc::new)
+        .map_err(|e| FfiError::Runtime(format!("metal buffer staging: {e}")))?;
+    mlx_array_view_metal_buffer(buf, &[n], MlxDtype::F32)
+}
+
 /// L2-normalize rows of `(rows, d)`: `x / sqrt(sum(x^2, axis=1))` (keepdim broadcast).
 fn l2_normalize_rows(x: &MlxArrayHandle, rows: i32, _d: i32) -> Result<MlxArrayHandle, FfiError> {
     let sq = mlx_mul(x, x)?;
@@ -40,6 +54,7 @@ fn l2_normalize_rows(x: &MlxArrayHandle, rows: i32, _d: i32) -> Result<MlxArrayH
 }
 
 /// Compute unordered top-k. Returns `(indices (Q*k, i32), values (Q*k, f32))` row-major.
+/// Delegates to [`vector_search_topk_rerank`] with no rerank weight.
 pub fn vector_search_topk(
     query: &[f32],
     q_rows: i64,
@@ -48,6 +63,27 @@ pub fn vector_search_topk(
     d: i64,
     k: i64,
     op: u32,
+) -> Result<(Vec<i32>, Vec<f32>), FfiError> {
+    vector_search_topk_rerank(query, q_rows, corpus, n_rows, d, k, op, None)
+}
+
+/// Compute unordered top-k with an optional resident exp-decay rerank.
+///
+/// When `weight` is `Some(w)` (one F32 per corpus row, indexed by GLOBAL row), the gathered
+/// top-k scores are reranked in the SAME MLX graph as `reranked = sim * exp(-w[hit])` before
+/// the single eval — the per-hit weight gather (`Take`), `exp`, and multiply never cross back
+/// to the host. When `weight` is `None`, the result is identical to a plain top-k.
+/// Returns `(indices (Q*k, i32), values (Q*k, f32))` row-major.
+#[allow(clippy::too_many_arguments)]
+pub fn vector_search_topk_rerank(
+    query: &[f32],
+    q_rows: i64,
+    corpus: &[f32],
+    n_rows: i64,
+    d: i64,
+    k: i64,
+    op: u32,
+    weight: Option<&[f32]>,
 ) -> Result<(Vec<i32>, Vec<f32>), FfiError> {
     let q = view2d(query, q_rows, d)?;
     let c = view2d(corpus, n_rows, d)?;
@@ -83,9 +119,23 @@ pub fn vector_search_topk(
     // gather the metric values at those indices.
     let val_k = mlx_take_along_axis(&metric, &idx_k_i, 1)?; // (Q,k)
 
-    mlx_array_eval(&[idx_k_i.clone(), val_k.clone()])?;
+    // Optional resident exp-decay rerank: reranked = sim * exp(-weight[hit]). Stays in-graph
+    // (gather weight by the flattened hit indices, exp, multiply) → one eval, only scores cross.
+    let final_val = match weight {
+        Some(w) => {
+            let wv = view1d(w, n_rows)?; // (N,)
+            let idx_flat = mlx_reshape(&idx_k_i, &[(q_rows * k) as i32])?; // (Q*k,)
+            let feat = mlx_take(&wv, &idx_flat)?; // (Q*k,)
+            let feat2d = mlx_reshape(&feat, &[q_rows as i32, k as i32])?; // (Q,k)
+            let decay = mlx_exp(&mlx_neg(&feat2d)?)?; // exp(-w[hit])
+            mlx_mul(&val_k, &decay)?
+        }
+        None => val_k.clone(),
+    };
+
+    mlx_array_eval(&[idx_k_i.clone(), final_val.clone()])?;
     let indices = mlx_array_to_i32_vec(&idx_k_i)?;
-    let values = mlx_array_to_f32_vec(&val_k)?;
+    let values = mlx_array_to_f32_vec(&final_val)?;
     Ok((indices, values))
 }
 
@@ -107,9 +157,10 @@ pub fn vector_search_topk_tiled(
     k: i64,
     op: u32,
     tile_rows: i64,
+    weight: Option<&[f32]>,
 ) -> Result<(Vec<i32>, Vec<f32>), FfiError> {
     if tile_rows >= n_rows {
-        return vector_search_topk(query, q_rows, corpus, n_rows, d, k, op);
+        return vector_search_topk_rerank(query, q_rows, corpus, n_rows, d, k, op, weight);
     }
     let kk = k.min(n_rows) as usize;
     // Per-query running top-k as (index, value); kept short (≤ k).
@@ -119,7 +170,9 @@ pub fn vector_search_topk_tiled(
         let rows = (n_rows - offset).min(tile_rows);
         let start = (offset * d) as usize;
         let end = ((offset + rows) * d) as usize;
-        let (idx, val) = vector_search_topk(
+        // Weight is indexed by GLOBAL corpus row → slice it to match this tile's rows.
+        let w_tile = weight.map(|w| &w[offset as usize..(offset + rows) as usize]);
+        let (idx, val) = vector_search_topk_rerank(
             query,
             q_rows,
             &corpus[start..end],
@@ -127,6 +180,7 @@ pub fn vector_search_topk_tiled(
             d,
             kk.min(rows as usize) as i64,
             op,
+            w_tile,
         )?;
         let per = kk.min(rows as usize);
         for qi in 0..q_rows as usize {
@@ -163,7 +217,7 @@ use pyo3::prelude::*;
 /// each length `q_rows*min(k,n_rows)`, row-major. `op`: 0=cosine, 1=knn(L2²). Values are raw
 /// metric (cosine sim / squared L2); the Python layer applies `sqrt` for knn and sorts each row.
 #[pyfunction]
-#[pyo3(signature = (query, q_rows, corpus, n_rows, d, k, op, tile_rows))]
+#[pyo3(signature = (query, q_rows, corpus, n_rows, d, k, op, tile_rows, weight=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn execute_vector_search(
     query: (usize, usize),
@@ -174,6 +228,7 @@ pub fn execute_vector_search(
     k: i64,
     op: u32,
     tile_rows: i64,
+    weight: Option<(usize, usize)>,
 ) -> PyResult<(Vec<u32>, Vec<f32>)> {
     let (qptr, qlen) = query;
     let (cptr, clen) = corpus;
@@ -183,8 +238,15 @@ pub fn execute_vector_search(
     // no invalid bit patterns. Mirrors the `(ptr,len)` idiom in `udf::execute_rolling`.
     let qslice = unsafe { std::slice::from_raw_parts(qptr as *const f32, qlen) };
     let cslice = unsafe { std::slice::from_raw_parts(cptr as *const f32, clen) };
-    let (idx, val) = vector_search_topk_tiled(qslice, q_rows, cslice, n_rows, d, k, op, tile_rows)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("vector search: {e}")))?;
+    // SAFETY: same contract as query/corpus — `(ptr,len)` of a contiguous F32 weight array
+    // (one per corpus row), kept alive by the caller for this synchronous call.
+    let wslice =
+        weight.map(|(wptr, wlen)| unsafe { std::slice::from_raw_parts(wptr as *const f32, wlen) });
+    let (idx, val) =
+        vector_search_topk_tiled(qslice, q_rows, cslice, n_rows, d, k, op, tile_rows, wslice)
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("vector search: {e}"))
+            })?;
     let idx_u32: Vec<u32> = idx.into_iter().map(|i| i as u32).collect();
     Ok((idx_u32, val))
 }
@@ -236,7 +298,8 @@ mod tests {
         ]; // (6,2)
         let (i_ref, s_ref) = vector_search_topk(&q, 1, &c, 6, 2, 3, OP_COSINE).unwrap();
         let (i_t, s_t) =
-            vector_search_topk_tiled(&q, 1, &c, 6, 2, 3, OP_COSINE, /*tile_rows=*/ 2).unwrap();
+            vector_search_topk_tiled(&q, 1, &c, 6, 2, 3, OP_COSINE, /*tile_rows=*/ 2, None)
+                .unwrap();
         // Compare as score-sorted sets.
         let norm = |idx: &[i32], sc: &[f32]| {
             let mut p: Vec<(i32, i32)> = idx
