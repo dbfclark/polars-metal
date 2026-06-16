@@ -85,6 +85,7 @@ from polars_metal._fusion_analyzer import (
     analyze_ir_reduction,
     analyze_ir_validity,
     analyze_ir_with_columns,
+    analyze_ir_with_columns_gather,
     has_structural_null_op,
     null_mode_ir,
 )
@@ -587,6 +588,11 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
     if len(inputs) != 1:
         return FallBack(reason=f"HStack expected 1 input, got {len(inputs)}")
 
+    # Capture the HStack OUTPUT schema (current node, before navigating to the
+    # input) as an ordered (name, dtype_str) list — the M10 resident-gather
+    # path uses it to select the result columns in the CPU-join's order.
+    hstack_out_schema = [(name, str(dt)) for name, dt in dict(nt.get_schema()).items()]
+
     # Resolve expression sub-trees against the *input* schema (the
     # appended columns aren't visible until after HStack runs).
     parent_id = nt.get_node()
@@ -669,6 +675,7 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
                 "_fused_scope": scope,
                 "_fused_columns": descriptors,
                 "_fused_out_dtype": fused_out_dtype,
+                "_expr_node": node_id,
             }
             binding_cols = {name for kind, name in descriptors if kind == "col"}
             fused_records.append(
@@ -773,7 +780,45 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
     # (join + this chain) — the UDF is installed at the HStack root.
     if inner.plan.get("kind") == "Join":
         inner.plan["_parent_chain"] = handled.plan
+        _attach_gather_scope(nt, inner.plan, out_exprs, in_schema, hstack_out_schema)
     return handled
+
+
+def _attach_gather_scope(
+    nt: Any,
+    join_plan: dict,
+    out_exprs: list[dict],
+    in_schema: dict[str, Any],
+    out_schema: list[tuple[str, str]],
+) -> None:
+    """Best-effort: stash a resident-gather scope on the Join plan when the
+    single-fused-binding + single-dim-value-column MVP shape holds. Any miss
+    just leaves the plan without `_gather` -> runtime uses CPU-lookup."""
+    if len(out_exprs) != 1 or "_fused_scope" not in out_exprs[0]:
+        return
+    dim_cols = join_plan.get("_dim_value_cols", [])
+    if len(dim_cols) != 1:
+        return
+    gather_col = dim_cols[0]
+    key_col = join_plan["key"]  # fact (left) key column name
+    expr_node = out_exprs[0].get("_expr_node")
+    if expr_node is None:
+        return
+    try:
+        res = analyze_ir_with_columns_gather(nt, expr_node, in_schema, gather_col, key_col)
+    except Exception:
+        return
+    if res is None:
+        return
+    join_plan["_gather"] = {
+        "scope": res[0],
+        "descriptors": res[1],
+        "out_dtype": res[2],
+        "gather_col": gather_col,
+        "key_col": key_col,
+        "out_name": out_exprs[0]["name"],
+    }
+    join_plan["_out_schema"] = out_schema
 
 
 def _column_expr_name(nt: Any, ir_expr: Any) -> str | None:
@@ -826,6 +871,9 @@ def _walk_join(nt: Any, node: Any) -> WalkResult:
     nt.set_node(inputs[0])
     left_schema = dict(nt.get_schema())
     nt.set_node(parent_id)
+    nt.set_node(inputs[1])
+    right_schema = dict(nt.get_schema())
+    nt.set_node(parent_id)
 
     lkey = _column_expr_name(nt, left_on[0])
     rkey = _column_expr_name(nt, right_on[0])
@@ -856,6 +904,7 @@ def _walk_join(nt: Any, node: Any) -> WalkResult:
             "key": lkey,
             "right_key": rkey,
             "how": how,
+            "_dim_value_cols": [c for c in right_schema if c != rkey],
         }
     )
 
