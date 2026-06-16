@@ -531,6 +531,14 @@ std::shared_ptr<MlxArray> mlx_op_take_along_axis(
     return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
 }
 
+std::shared_ptr<MlxArray> mlx_op_take(
+    const std::shared_ptr<MlxArray>& a,
+    const std::shared_ptr<MlxArray>& indices) {
+    auto base = std::make_shared<mlx::core::array>(
+        mlx::core::take(*a, *indices, /*axis=*/0));
+    return std::shared_ptr<MlxArray>(base, static_cast<MlxArray*>(base.get()));
+}
+
 std::shared_ptr<MlxArray> mlx_op_argpartition_axis(
     const std::shared_ptr<MlxArray>& a, int32_t kth, int32_t axis) {
     auto base = std::make_shared<mlx::core::array>(
