@@ -121,6 +121,10 @@ _PREDICATE_F64_WIDEN: set[str] = {"F32"}
 
 _EPOCH = _date(1970, 1, 1)
 
+# M10: integer key dtypes valid as gather indices (the dense-vs-CPU choice is
+# made at execution). UInt64 is excluded — it cannot be a lossless gather index.
+_JOIN_INT_KEY_DTYPES = {"Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32"}
+
 
 @dataclass(frozen=True)
 class Handled:
@@ -172,6 +176,8 @@ def _walk_at_current(nt: Any) -> WalkResult:
         return _walk_sort(nt, node)
     if cls == "HStack":
         return _walk_hstack(nt, node)
+    if cls == "Join":
+        return _walk_join(nt, node)
     return FallBack(reason=f"unsupported IR node: {cls}")
 
 
@@ -759,6 +765,90 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
             "kind": "HStack",
             "input": inner.plan,
             "exprs": out_exprs,
+        }
+    )
+
+
+def _column_expr_name(nt: Any, ir_expr: Any) -> str | None:
+    """Resolve a Join key expr-ref (has ``.node``) to a column name, or None if
+    it is not a plain ``Column`` expression."""
+    try:
+        inner = nt.view_expression(ir_expr.node)
+    except Exception:
+        return None
+    if type(inner).__name__ != "Column":
+        return None
+    name = getattr(inner, "name", None)
+    return str(name) if name is not None else None
+
+
+def _join_how(node: Any) -> str:
+    """Map ``node.options[0]`` (e.g. ``'Left'`` / ``'Inner'``) to a lowercase
+    how string. Returns ``'unsupported'`` if options is missing/empty."""
+    opts = getattr(node, "options", None)
+    if isinstance(opts, (tuple, list)) and opts:
+        return str(opts[0]).lower()
+    return "unsupported"
+
+
+def _walk_join(nt: Any, node: Any) -> WalkResult:
+    """Lower an equi-join on a single integer key (feeding an F32 chain in the
+    parent) into a Handled ``Join`` plan node. Execution is a later task; here
+    we only validate + lower the two scan inputs so the parent becomes
+    Handled.
+
+    The ``how`` comes from ``node.options[0]`` (a string, e.g. ``'Left'``);
+    keys come from ``left_on[0].node`` / ``right_on[0].node`` resolved to
+    ``Column`` names. Only single-key inner/left joins with an integer left
+    key over two plain Scan inputs are recognized; everything else falls back.
+    """
+    left_on = list(getattr(node, "left_on", []) or [])
+    right_on = list(getattr(node, "right_on", []) or [])
+    if len(left_on) != 1 or len(right_on) != 1:
+        return FallBack(reason="join: only single-key equi-join supported")
+
+    how = _join_how(node)
+    if how not in ("left", "inner"):
+        return FallBack(reason=f"join: how={how} not in (left, inner)")
+
+    inputs = nt.get_inputs()
+    if len(inputs) != 2:
+        return FallBack(reason=f"join expected 2 inputs, got {len(inputs)}")
+
+    parent_id = nt.get_node()
+    nt.set_node(inputs[0])
+    left_schema = dict(nt.get_schema())
+    nt.set_node(parent_id)
+
+    lkey = _column_expr_name(nt, left_on[0])
+    rkey = _column_expr_name(nt, right_on[0])
+    if lkey is None or rkey is None:
+        return FallBack(reason="join: non-Column key expression")
+    if str(left_schema.get(lkey)) not in _JOIN_INT_KEY_DTYPES:
+        return FallBack(
+            reason=f"join: key dtype {left_schema.get(lkey)} not an integer key"
+        )
+
+    nt.set_node(inputs[0])
+    left = _walk_at_current(nt)
+    nt.set_node(inputs[1])
+    right = _walk_at_current(nt)
+    nt.set_node(parent_id)
+    if isinstance(left, FallBack):
+        return left
+    if isinstance(right, FallBack):
+        return right
+    if left.plan.get("kind") != "Scan" or right.plan.get("kind") != "Scan":
+        return FallBack(reason="join: inputs are not plain scans")
+
+    return Handled(
+        plan={
+            "kind": "Join",
+            "left": left.plan,
+            "right": right.plan,
+            "key": lkey,
+            "right_key": rkey,
+            "how": how,
         }
     )
 
