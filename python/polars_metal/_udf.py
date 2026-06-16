@@ -62,6 +62,8 @@ def build_udf(plan: dict) -> Any:
     When ``should_time`` is true Polars expects a ``(df, timings)`` tuple.
     We don't measure kernel timings yet; emit an empty timing list.
     """
+    if plan["kind"] == "Join":
+        return _build_join(plan)
     if plan["kind"] == "GroupBy":
         return _build_groupby(plan)
     if plan["kind"] == "Sort":
@@ -132,6 +134,59 @@ def _dispatch(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
             return _dispatch_hstack_fused(df_pydf, wire_plan)
     result_pydf = _native.execute_plan(df_pydf, wire_plan)
     return pl.DataFrame._from_pydf(result_pydf)
+
+
+_M10_JOIN_DISPATCHES = 0  # test/observability counter
+
+
+def _build_join(plan: dict) -> Any:
+    """Whole-plan scan-source UDF rooted at a Join. Phase 1: CPU lookup +
+    existing fused-chain dispatch over the joined frame.
+
+    The UDF is installed at the ROOT (the HStack above the Join), so it must
+    reproduce the WHOLE plan's output (join + chain). The two scan dfs live on
+    the Join plan's left/right Scan sub-plans; the chain to apply sits on the
+    Join plan's ``_parent_chain`` back-reference (stamped by the walker).
+    """
+    left_df = plan["left"]["df"]
+    right_df = plan["right"]["df"]
+
+    def udf(
+        with_columns: list[str] | None,
+        predicate: Any,
+        n_rows: int | None,
+        should_time: bool,
+    ) -> Any:
+        df = _dispatch_join(left_df, right_df, plan)
+        if n_rows is not None:
+            df = df.slice(0, n_rows)
+        return (df, []) if should_time else df
+
+    return udf
+
+
+def _dispatch_join(left_pydf: Any, right_pydf: Any, plan: dict) -> pl.DataFrame:
+    """Phase 1 CPU-lookup branch: join on CPU (correct semantics), then run the
+    fused chain that sits ABOVE the join via the existing HStack-fused core."""
+    global _M10_JOIN_DISPATCHES
+    _M10_JOIN_DISPATCHES += 1
+    left = pl.DataFrame._from_pydf(left_pydf)
+    right = pl.DataFrame._from_pydf(right_pydf)
+    joined = left.join(
+        right, left_on=plan["key"], right_on=plan["right_key"], how=plan["how"]
+    )
+    parent = plan["_parent_chain"]
+    return _dispatch_chain_over_frame(joined, parent)
+
+
+def _dispatch_chain_over_frame(upstream: pl.DataFrame, parent: dict) -> pl.DataFrame:
+    """Apply the chain that sat above the Join to an already-joined frame."""
+    if parent["kind"] == "Project":
+        inner = _dispatch_chain_over_frame(upstream, parent["input"])
+        return pl.DataFrame._from_pydf(inner._df.select(list(parent["columns"])))
+    if parent["kind"] == "HStack":
+        return _hstack_fused_over_upstream(upstream, parent)
+    raise NotImplementedError(f"join parent chain kind {parent['kind']!r}")
 
 
 # B1: wire dtype string -> (numpy dtype name, MlxDtype u32 tag). Mirrors the
@@ -222,9 +277,21 @@ def _dispatch_hstack_fused(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
     pre-allocated at the binding's output width so the eval writes directly
     into it (output-zero-copy).
     """
+    upstream = _dispatch(df_pydf, wire_plan["input"])
+    return _hstack_fused_over_upstream(upstream, wire_plan)
+
+
+def _hstack_fused_over_upstream(upstream: pl.DataFrame, wire_plan: dict) -> pl.DataFrame:
+    """Run every fused binding in ``wire_plan["exprs"]`` over an already-resolved
+    ``upstream`` frame and return ``upstream`` with the new columns appended.
+
+    This is the binding-loop core of ``_dispatch_hstack_fused``, factored out so
+    callers that already hold the upstream frame (e.g. the M10 join path, which
+    joins on CPU then runs the chain that sat ABOVE the join) can reuse it
+    without re-dispatching the input subtree.
+    """
     import numpy as np
 
-    upstream = _dispatch(df_pydf, wire_plan["input"])
     n_rows = upstream.height
     new_columns: list[pl.Series] = []
     for binding in wire_plan["exprs"]:

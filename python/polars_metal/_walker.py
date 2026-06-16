@@ -760,13 +760,20 @@ def _walk_hstack(nt: Any, node: Any) -> WalkResult:
             "executable on the GPU path — CPU produces the correct result"
         )
 
-    return Handled(
+    handled = Handled(
         plan={
             "kind": "HStack",
             "input": inner.plan,
             "exprs": out_exprs,
         }
     )
+    # M10: when the HStack sits directly above a Join, give the Join plan a
+    # back-reference to this HStack so the join UDF (built from the Join node,
+    # which carries the two scan dfs) can reproduce the WHOLE plan's output
+    # (join + this chain) — the UDF is installed at the HStack root.
+    if inner.plan.get("kind") == "Join":
+        inner.plan["_parent_chain"] = handled.plan
+    return handled
 
 
 def _column_expr_name(nt: Any, ir_expr: Any) -> str | None:

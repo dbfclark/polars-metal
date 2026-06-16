@@ -46,6 +46,25 @@ def execute_with_metal(nt: Any, duration_since_start: int | None, *, config: Met
 
     assert isinstance(result, Handled)
     plan = result.plan
+
+    # M10: a Join-bearing plan can't cross the Rust router (`compute_lifting_plan`
+    # and `_strip_side_channels` don't model a Join node). Bypass the router and
+    # build the whole-plan scan-source UDF directly from the Join node (which
+    # carries both scan dfs + a `_parent_chain` back-ref to the chain above it).
+    # The UDF reproduces the full HStack output (join + chain).
+    if _plan_has_join(plan):
+        join_plan = _find_join_plan(plan)
+        try:
+            udf = build_udf(join_plan)
+        except Exception as e:
+            if config.debug:
+                log.debug("polars_metal: join UDF build failed %r; falling back", e)
+            return
+        nt.set_udf(udf)
+        if config.debug:
+            log.debug("polars_metal: installed join UDF (CPU-lookup branch)")
+        return
+
     wire_plan = _strip_side_channels(plan)
     try:
         lifting = _native.compute_lifting_plan(wire_plan)
@@ -110,6 +129,20 @@ def _plan_has_fused_binding(plan: dict) -> bool:
     if isinstance(inner, dict):
         return _plan_has_fused_binding(inner)
     return False
+
+
+def _plan_has_join(plan: dict) -> bool:
+    if plan.get("kind") == "Join":
+        return True
+    inner = plan.get("input")
+    return _plan_has_join(inner) if isinstance(inner, dict) else False
+
+
+def _find_join_plan(plan: dict) -> dict | None:
+    if plan.get("kind") == "Join":
+        return plan
+    inner = plan.get("input")
+    return _find_join_plan(inner) if isinstance(inner, dict) else None
 
 
 def _strip_side_channels(plan: dict) -> dict:
