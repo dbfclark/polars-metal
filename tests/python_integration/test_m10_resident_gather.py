@@ -36,7 +36,7 @@ def test_dense_resident_gather_matches_cpu():
     _udf._M10_DENSE_GATHERS = 0
     gpu = lf.collect(engine=MetalEngine())
     assert _udf._M10_DENSE_GATHERS == 1, "dense resident branch did not run"
-    assert_frame_equal(lf.collect(), gpu, check_dtypes=True, rtol=1e-3, atol=1e-3)
+    assert_frame_equal(lf.collect(), gpu, check_dtypes=True, rel_tol=1e-3, abs_tol=1e-3)
 
 
 def test_nondense_falls_back_to_cpu_lookup_correct():
@@ -53,4 +53,4 @@ def test_nondense_falls_back_to_cpu_lookup_correct():
     _udf._M10_DENSE_GATHERS = 0
     gpu = lf.collect(engine=MetalEngine())
     assert _udf._M10_DENSE_GATHERS == 0, "should NOT use resident branch for sparse keys"
-    assert_frame_equal(lf.collect(), gpu, check_dtypes=True, rtol=1e-3, atol=1e-3)
+    assert_frame_equal(lf.collect(), gpu, check_dtypes=True, rel_tol=1e-3, abs_tol=1e-3)

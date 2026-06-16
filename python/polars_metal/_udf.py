@@ -382,7 +382,17 @@ def _hstack_fused_over_upstream(upstream: pl.DataFrame, wire_plan: dict) -> pl.D
     import numpy as np
 
     n_rows = upstream.height
-    new_columns: list[pl.Series] = []
+    # Empty frame: skip the GPU dispatch (MTLBuffer allocation fails for 0
+    # bytes) and return empty Series of the correct dtype for each binding.
+    if n_rows == 0:
+        new_columns: list[pl.Series] = []
+        for binding in wire_plan["exprs"]:
+            out_dtype_str = binding.get("_fused_out_dtype", "F32")
+            out_np_dtype, _ = _np_dtype_and_tag(out_dtype_str)
+            new_columns.append(pl.Series(binding["name"], np.array([], dtype=out_np_dtype)))
+        return upstream.with_columns(new_columns)
+
+    new_columns = []
     for binding in wire_plan["exprs"]:
         scope = binding["_fused_scope"]
         descriptors: list[tuple[str, str | float]] = binding["_fused_columns"]
