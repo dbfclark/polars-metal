@@ -621,6 +621,68 @@ def analyze_ir_with_columns(
         return None
 
 
+def analyze_ir_with_columns_gather(
+    nt: Any,
+    node_id: int,
+    schema: dict[str, Any],
+    gather_col: str,
+    key_col: str,
+) -> tuple[PyFusionScope, list[tuple[str, str | float]], str] | None:
+    """Gather-aware variant of `analyze_ir_with_columns` (M10 resident gather).
+
+    Builds the same F32 fused subgraph EXCEPT the leaf ``Column(gather_col)`` is
+    replaced by a resident GPU gather: ``Take(dim_value, key)``. Instead of
+    staging the (CPU-materialized) joined dim-value column as a LONG input, the
+    analyzer adds TWO inputs at the gather leaf's first occurrence —
+
+      - the join KEY, ``("gather_key", key_col)``, staged I32 (LONG, length N);
+      - the dim VALUE, ``("gather_value", gather_col)``, staged F32 (SHORT,
+        length dim_n — the per-key dimension value indexed by the key);
+
+    and pass 2 pushes ``Take(value, key)`` (source = SHORT dim_value, index =
+    LONG key) so the gather happens on-GPU, producing an N-length array the rest
+    of the chain consumes exactly as if the column had been materialized.
+
+    Every OTHER leaf (any other Column, any Literal) stages as a normal LONG
+    input via the shared two-pass machinery. Output dtype is always ``"F32"``
+    (the gather is F32, the chain is F32).
+
+    Returns ``(scope, descriptors, "F32")`` with the two ``gather_*`` descriptor
+    kinds present, or ``None`` if the chain isn't fusable (same failure mode as
+    `analyze_ir_with_columns`) OR if ``gather_col`` never appears as a leaf (no
+    gather to splice → caller should use the base analyzer)."""
+    try:
+        scope = PyFusionScope()
+        descriptors: list[tuple[str, str | float]] = []
+        leaf_idx: dict[int, int] = {}
+        col_dedup: dict[str, int] = {}
+        lit_dedup: dict[float, int] = {}
+        gather_ctx: dict = {"gather_col": gather_col, "key_col": key_col, "idxs": {}}
+        # Gather chains stay on the F32 path: the dim-value gather is F32, and
+        # the surrounding compute chain is F32 (the M10 target shape). Literals
+        # stage at F32 to match.
+        _gather_leaves_ir(
+            nt,
+            node_id,
+            schema,
+            scope,
+            descriptors,
+            leaf_idx,
+            col_dedup,
+            lit_dedup,
+            "F32",
+            gather_ctx,
+        )
+        if not gather_ctx["idxs"]:
+            # gather_col never appeared as a leaf — nothing to splice.
+            return None
+        idx = _visit_ir_ops(nt, node_id, schema, scope, leaf_idx, gather_ctx)
+        scope.mark_output(idx)
+        return scope, descriptors, "F32"
+    except _Aborted:
+        return None
+
+
 # Lowercase Agg.name (IR form) -> reduction OpId string. Used only by the
 # select-reduction path (`analyze_ir_reduction`). argmin/argmax are excluded:
 # they return integer indices, not an F32 scalar.
@@ -1300,6 +1362,7 @@ def _gather_leaves_ir(
     col_dedup: dict[str, int],
     lit_dedup: dict[float, int],
     lit_dtype_str: str = "F32",
+    gather_ctx: dict | None = None,
 ) -> None:
     """Pass 1: DFS-walk the IR tree and `add_input` every Column/Literal,
     recording arena-id -> input-NodeIdx in `leaf_idx`.
@@ -1318,6 +1381,15 @@ def _gather_leaves_ir(
     literal in ``col + 1`` is staged at the column width — otherwise MLX would
     promote ``int_col + f32_literal`` to f32, producing the wrong output dtype.
 
+    `gather_ctx` (M10 resident gather, default None): when present, the leaf
+    ``Column(gather_ctx["gather_col"])`` is NOT staged as a column. Instead, on
+    its FIRST reference, two inputs are added in place — the gather KEY
+    (``("gather_key", key_col)``, I32) and the dim VALUE
+    (``("gather_value", gather_col)``, F32) — and their idxs recorded in
+    ``gather_ctx["idxs"]`` so pass 2 can push ``Take(value, key)``. The gather
+    leaf's own ``leaf_idx`` is left unset (pass 2 synthesizes the Take op, it is
+    not a plain input). Every OTHER leaf stages as a normal LONG input.
+
     Aborts on the same unsupported-node set as `_visit_ir_ops`."""
     try:
         node = nt.view_expression(node_id)
@@ -1329,10 +1401,26 @@ def _gather_leaves_ir(
         name = getattr(node, "name", None)
         if name is None:
             raise _Aborted
-        dtype = schema.get(str(name))
+        name_s = str(name)
+        # M10 resident gather: the dim-value column is replaced by a GPU Take.
+        # On first reference, add the KEY then the dim-VALUE input (in that
+        # order, so descriptor order is consistent with what pass 2 expects).
+        if gather_ctx is not None and name_s == gather_ctx["gather_col"]:
+            if not gather_ctx["idxs"]:
+                key_col = gather_ctx["key_col"]
+                key_dtype = schema.get(key_col)
+                if key_dtype is None:
+                    raise _Aborted
+                ki = scope.add_input(key_col, "I32")
+                descriptors.append(("gather_key", key_col))
+                vi = scope.add_input(name_s, "F32")
+                descriptors.append(("gather_value", name_s))
+                gather_ctx["idxs"] = {"key": ki, "value": vi}
+            # The gather leaf is not a plain input; pass 2 builds the Take op.
+            return
+        dtype = schema.get(name_s)
         if dtype is None:
             raise _Aborted
-        name_s = str(name)
         existing = col_dedup.get(name_s)
         if existing is None:
             idx = scope.add_input(name_s, _dtype_to_input_str(dtype))
@@ -1364,18 +1452,12 @@ def _gather_leaves_ir(
 
     if cls == "BinaryExpr":
         _gather_leaves_ir(
-            nt, node.left, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup, lit_dtype_str
+            nt, node.left, schema, scope, descriptors, leaf_idx,
+            col_dedup, lit_dedup, lit_dtype_str, gather_ctx,
         )
         _gather_leaves_ir(
-            nt,
-            node.right,
-            schema,
-            scope,
-            descriptors,
-            leaf_idx,
-            col_dedup,
-            lit_dedup,
-            lit_dtype_str,
+            nt, node.right, schema, scope, descriptors, leaf_idx,
+            col_dedup, lit_dedup, lit_dtype_str, gather_ctx,
         )
         return
 
@@ -1386,7 +1468,8 @@ def _gather_leaves_ir(
         if getattr(node, "dtype", None) != pl.Float32:
             raise _Aborted
         _gather_leaves_ir(
-            nt, node.expr, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup, lit_dtype_str
+            nt, node.expr, schema, scope, descriptors, leaf_idx,
+            col_dedup, lit_dedup, lit_dtype_str, gather_ctx,
         )
         return
 
@@ -1401,15 +1484,8 @@ def _gather_leaves_ir(
             # compile-time param (validated in pass 2), not an input leaf.
             _shift_offset(nt, fn_inputs)  # validate now so pass 1/2 agree
             _gather_leaves_ir(
-                nt,
-                fn_inputs[0],
-                schema,
-                scope,
-                descriptors,
-                leaf_idx,
-                col_dedup,
-                lit_dedup,
-                lit_dtype_str,
+                nt, fn_inputs[0], schema, scope, descriptors, leaf_idx,
+                col_dedup, lit_dedup, lit_dtype_str, gather_ctx,
             )
             return
         if fn_name == _INT_RANGE_FN:
@@ -1422,7 +1498,8 @@ def _gather_leaves_ir(
             raise _Aborted
         for cid in fn_inputs:
             _gather_leaves_ir(
-                nt, cid, schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup, lit_dtype_str
+                nt, cid, schema, scope, descriptors, leaf_idx,
+                col_dedup, lit_dedup, lit_dtype_str, gather_ctx,
             )
         return
 
@@ -1434,43 +1511,23 @@ def _gather_leaves_ir(
         if not args:
             raise _Aborted
         _gather_leaves_ir(
-            nt, args[0], schema, scope, descriptors, leaf_idx, col_dedup, lit_dedup, lit_dtype_str
+            nt, args[0], schema, scope, descriptors, leaf_idx,
+            col_dedup, lit_dedup, lit_dtype_str, gather_ctx,
         )
         return
 
     if cls == "Ternary":
         _gather_leaves_ir(
-            nt,
-            node.predicate,
-            schema,
-            scope,
-            descriptors,
-            leaf_idx,
-            col_dedup,
-            lit_dedup,
-            lit_dtype_str,
+            nt, node.predicate, schema, scope, descriptors, leaf_idx,
+            col_dedup, lit_dedup, lit_dtype_str, gather_ctx,
         )
         _gather_leaves_ir(
-            nt,
-            node.truthy,
-            schema,
-            scope,
-            descriptors,
-            leaf_idx,
-            col_dedup,
-            lit_dedup,
-            lit_dtype_str,
+            nt, node.truthy, schema, scope, descriptors, leaf_idx,
+            col_dedup, lit_dedup, lit_dtype_str, gather_ctx,
         )
         _gather_leaves_ir(
-            nt,
-            node.falsy,
-            schema,
-            scope,
-            descriptors,
-            leaf_idx,
-            col_dedup,
-            lit_dedup,
-            lit_dtype_str,
+            nt, node.falsy, schema, scope, descriptors, leaf_idx,
+            col_dedup, lit_dedup, lit_dtype_str, gather_ctx,
         )
         return
 
@@ -1483,16 +1540,34 @@ def _visit_ir_ops(
     schema: dict[str, Any],
     scope: PyFusionScope,
     leaf_idx: dict[int, int],
+    gather_ctx: dict | None = None,
 ) -> int:
     """Pass 2: DFS-walk the IR and push ops. Leaves return their precomputed
-    input NodeIdx from `leaf_idx`."""
+    input NodeIdx from `leaf_idx`.
+
+    `gather_ctx` (M10 resident gather, default None): when present, the leaf
+    ``Column(gather_ctx["gather_col"])`` does NOT resolve via ``leaf_idx``
+    (pass 1 added no plain input for it). Instead it pushes
+    ``Take(dim_value_idx, key_idx)`` — gather the SHORT dim-value array at the
+    LONG key array's positions — and returns that op idx. Downstream ops then
+    see an N-length array exactly as if the column had been materialized."""
     try:
         node = nt.view_expression(node_id)
     except Exception as e:
         raise _Aborted from e
     cls = type(node).__name__
 
-    if cls in ("Column", "Literal"):
+    if cls == "Column":
+        # M10 resident gather: the dim-value column is computed by a GPU Take.
+        if gather_ctx is not None:
+            name = getattr(node, "name", None)
+            if name is not None and str(name) == gather_ctx["gather_col"]:
+                idxs = gather_ctx["idxs"]
+                # Take(source=dim_value SHORT, index=key LONG) -> N-length array.
+                return scope.push_op("Take", [idxs["value"], idxs["key"]])
+        return leaf_idx[node_id]
+
+    if cls == "Literal":
         return leaf_idx[node_id]
 
     if cls == "BinaryExpr":
@@ -1501,8 +1576,8 @@ def _visit_ir_ops(
         op_id = _BINOP_MAP.get(op_name)
         if op_id is None:
             raise _Aborted
-        left = _visit_ir_ops(nt, node.left, schema, scope, leaf_idx)
-        right = _visit_ir_ops(nt, node.right, schema, scope, leaf_idx)
+        left = _visit_ir_ops(nt, node.left, schema, scope, leaf_idx, gather_ctx)
+        right = _visit_ir_ops(nt, node.right, schema, scope, leaf_idx, gather_ctx)
         return scope.push_op(op_id, [left, right])
 
     if cls == "Cast":
@@ -1514,7 +1589,7 @@ def _visit_ir_ops(
         # or Bool semantics through an F32-only kernel chain.
         if target != pl.Float32:
             raise _Aborted
-        child = _visit_ir_ops(nt, node.expr, schema, scope, leaf_idx)
+        child = _visit_ir_ops(nt, node.expr, schema, scope, leaf_idx, gather_ctx)
         return scope.push_op("CastF32", [child])
 
     if cls == "Function":
@@ -1529,23 +1604,25 @@ def _visit_ir_ops(
             # Forward shift with a non-negative integer offset param. Recurse
             # ONLY the value child; the offset Literal is the scalar param.
             w = _shift_offset(nt, fn_inputs)
-            child = _visit_ir_ops(nt, fn_inputs[0], schema, scope, leaf_idx)
+            child = _visit_ir_ops(nt, fn_inputs[0], schema, scope, leaf_idx, gather_ctx)
             return scope.push_op("Shift", [child], w)
         if fn_name == _INT_RANGE_FN:
             # 0-input iota generator (currently unreachable; opaque IR).
             return scope.push_op("RowIndex", [])
         if fn_name == "log":
-            return _visit_ir_log_ops(nt, fn_inputs, schema, scope, leaf_idx)
+            return _visit_ir_log_ops(nt, fn_inputs, schema, scope, leaf_idx, gather_ctx)
         if fn_name == "pow":
             if len(fn_inputs) != 2:
                 raise _Aborted
-            left = _visit_ir_ops(nt, fn_inputs[0], schema, scope, leaf_idx)
-            right = _visit_ir_ops(nt, fn_inputs[1], schema, scope, leaf_idx)
+            left = _visit_ir_ops(nt, fn_inputs[0], schema, scope, leaf_idx, gather_ctx)
+            right = _visit_ir_ops(nt, fn_inputs[1], schema, scope, leaf_idx, gather_ctx)
             return scope.push_op("Pow", [left, right])
         op_id = _IR_FUNCTION_MAP.get(fn_name)
         if op_id is None:
             raise _Aborted
-        child_idxs = [_visit_ir_ops(nt, cid, schema, scope, leaf_idx) for cid in fn_inputs]
+        child_idxs = [
+            _visit_ir_ops(nt, cid, schema, scope, leaf_idx, gather_ctx) for cid in fn_inputs
+        ]
         return scope.push_op(op_id, child_idxs)
 
     if cls == "Agg":
@@ -1556,13 +1633,13 @@ def _visit_ir_ops(
         args = list(getattr(node, "arguments", []))
         if not args:
             raise _Aborted
-        child = _visit_ir_ops(nt, args[0], schema, scope, leaf_idx)
+        child = _visit_ir_ops(nt, args[0], schema, scope, leaf_idx, gather_ctx)
         return scope.push_op(op_id, [child])
 
     if cls == "Ternary":
-        cond = _visit_ir_ops(nt, node.predicate, schema, scope, leaf_idx)
-        then_v = _visit_ir_ops(nt, node.truthy, schema, scope, leaf_idx)
-        else_v = _visit_ir_ops(nt, node.falsy, schema, scope, leaf_idx)
+        cond = _visit_ir_ops(nt, node.predicate, schema, scope, leaf_idx, gather_ctx)
+        then_v = _visit_ir_ops(nt, node.truthy, schema, scope, leaf_idx, gather_ctx)
+        else_v = _visit_ir_ops(nt, node.falsy, schema, scope, leaf_idx, gather_ctx)
         return scope.push_op("Where", [cond, then_v, else_v])
 
     raise _Aborted
@@ -1574,6 +1651,7 @@ def _visit_ir_log_ops(
     schema: dict[str, Any],
     scope: PyFusionScope,
     leaf_idx: dict[int, int],
+    gather_ctx: dict | None = None,
 ) -> int:
     """log() is 2-arg (x, base) in the IR too; map base to Log/Log2/Log10."""
     if len(fn_inputs) != 2:
@@ -1592,5 +1670,5 @@ def _visit_ir_log_ops(
         op_id = "Log10"
     else:
         raise _Aborted
-    child = _visit_ir_ops(nt, fn_inputs[0], schema, scope, leaf_idx)
+    child = _visit_ir_ops(nt, fn_inputs[0], schema, scope, leaf_idx, gather_ctx)
     return scope.push_op(op_id, [child])
