@@ -563,5 +563,10 @@ fn build_op(node: &OpNode, handles: &[MlxArrayHandle]) -> Result<MlxArrayHandle,
                 .ok_or(BuildError::UnsupportedOp(node.op))?;
             ffi(mlx_iota_f32(n_rows as i64))
         }
+
+        // Take (M10 gather): out[i] = source[index[i]].
+        // Task 2.3 wires the actual mlx_take FFI call; this stub lets Task 2.2
+        // (OpId registration) compile while keeping the match exhaustive.
+        Take => Err(BuildError::UnsupportedOp(node.op)),
     }
 }
