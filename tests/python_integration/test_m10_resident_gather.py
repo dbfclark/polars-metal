@@ -19,7 +19,9 @@ def _pipeline(fact, dim, how="left"):
 
 def test_dense_resident_gather_matches_cpu():
     rng = np.random.default_rng(11)
-    n, dim_n = 1_000_000, 20_000
+    # 2.5M rows clears the density gate (Task 5.1): the ~24-FLOPs/row chain needs
+    # ~2.1M rows to clear the 5e7 FLOPs floor; at 1M it routes CPU by default.
+    n, dim_n = 2_500_000, 20_000
     fact = pl.DataFrame(
         {
             "id": rng.integers(0, dim_n, n).astype(np.int64),

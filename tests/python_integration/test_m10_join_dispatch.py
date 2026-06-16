@@ -18,7 +18,9 @@ def _pipeline(fact, dim, how="left"):
 
 def test_join_chain_matches_cpu_dense_key():
     rng = np.random.default_rng(10)
-    n, dim_n = 1_000_000, 20_000
+    # 2.5M rows clears the density gate (Task 5.1): the ~24-FLOPs/row chain needs
+    # ~2.1M rows to clear the 5e7 FLOPs floor; at 1M it routes CPU by default.
+    n, dim_n = 2_500_000, 20_000
     fact = pl.DataFrame({"id": rng.integers(0, dim_n, n).astype(np.int64),
                          "value": rng.uniform(50, 150, n).astype(np.float32)})
     dim = pl.DataFrame({"id": np.arange(dim_n, dtype=np.int64),
