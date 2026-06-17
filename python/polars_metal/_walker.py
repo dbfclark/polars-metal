@@ -806,6 +806,11 @@ def _attach_gather_scope(
     key_col = join_plan["key"]
     # The dim columns the fused chain actually reads (a subset of dim_cols).
     binding_cols = {name for kind, name in out_exprs[0].get("_fused_columns", []) if kind == "col"}
+    # The resident gather can't also feed the join key column into the chain
+    # (key is length N as the gather index, but length dim_n on the dim side) —
+    # decline to CPU-lookup, which is byte-exact.
+    if key_col in binding_cols:
+        return
     gather_cols = [c for c in dim_cols if c in binding_cols]
     if not gather_cols:
         return  # chain reads no dim column -> nothing to gather
