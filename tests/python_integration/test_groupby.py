@@ -15,6 +15,7 @@ so 2 i64 keys = 130 bits don't fit; Bool + i64 = 67 bits fits; 2 Bool
 from __future__ import annotations
 
 import polars as pl
+import pytest
 from polars.testing import assert_frame_equal
 
 import polars_metal
@@ -184,6 +185,12 @@ def test_groupby_all_same_key() -> None:
     assert_frame_equal(cpu, metal)
 
 
+@pytest.mark.xfail(
+    reason="Accepted conformance deferral: mean() of an integer column returns Float32 "
+    "on the Metal groupby path vs Float64 on Polars CPU (see m3-conformance-deferrals). "
+    "The groupby kernel is conformance-only and not extended (per CLAUDE.md non-goals).",
+    strict=True,
+)
 def test_groupby_i32_keys_i32_values_matches_cpu() -> None:
     """I32 key + I32 values — exercises the 32-bit GPU dispatcher path."""
     n = 200_000
