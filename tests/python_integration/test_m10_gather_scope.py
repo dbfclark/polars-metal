@@ -26,9 +26,7 @@ def _capture_binding(lf):
                 schema = dict(nt.get_schema())
                 nt.set_node(parent)
                 e = node.exprs[0]
-                out["res"] = analyze_ir_with_columns_gather(
-                    nt, e.node, schema, gather_col="vol", key_col="id"
-                )
+                out["res"] = analyze_ir_with_columns_gather(nt, e.node, schema, ["vol"], "id")
                 return True
             return any(visit(i) for i in nt.get_inputs())
 
