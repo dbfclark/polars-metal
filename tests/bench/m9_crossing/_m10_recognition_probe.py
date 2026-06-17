@@ -16,7 +16,6 @@ from typing import Any
 import numpy as np
 import polars as pl
 
-
 _EXPR_CHILD_ATTRS = (
     "expr",
     "input",
@@ -55,14 +54,12 @@ def _probe_callback(report: dict[str, Any]):
             pad = "  " * depth
             try:
                 inner = nt.view_expression(node_id)
-            except Exception as ex:  # noqa: BLE001
+            except Exception as ex:
                 expr_results.append(f"{pad}[{node_id}] RAISES -> {ex}")
                 return
             label = type(inner).__name__
             # surface a function-name hint when present (Gather/Take live here)
-            fdata = getattr(inner, "function_data", None) or getattr(
-                inner, "function", None
-            )
+            fdata = getattr(inner, "function_data", None) or getattr(inner, "function", None)
             extra = f" function={fdata!r}" if fdata is not None else ""
             expr_results.append(f"{pad}[{node_id}] {label} OK{extra}")
             for cid in _child_node_ids(inner):
@@ -88,7 +85,7 @@ def _probe_callback(report: dict[str, Any]):
 
         try:
             walk(nt.get_node())
-        except Exception as ex:  # noqa: BLE001
+        except Exception as ex:
             report["walk_error"] = f"{ex}\n{traceback.format_exc()}"
         report["nodes"] = seen_nodes
         report["exprs"] = expr_results
@@ -100,7 +97,7 @@ def run_shape(name: str, lf: pl.LazyFrame) -> None:
     report: dict[str, Any] = {}
     try:
         lf.collect(engine="cpu", post_opt_callback=_probe_callback(report))
-    except Exception as ex:  # noqa: BLE001
+    except Exception as ex:
         report["collect_error"] = str(ex)
     print(f"\n===== {name} =====")
     if "collect_error" in report:
@@ -132,9 +129,7 @@ def main() -> None:
 
     # Shape A: explicit gather expr — gather a dim column by an id column, then chain.
     shape_a = fact.lazy().select(
-        (
-            pl.lit(dim_vol).gather(pl.col("id")).tanh() * pl.col("value")
-        ).alias("out")
+        (pl.lit(dim_vol).gather(pl.col("id")).tanh() * pl.col("value")).alias("out")
     )
 
     # Shape B: join then with_columns compute chain (the natural "fact->dim lookup").
@@ -145,16 +140,14 @@ def main() -> None:
     )
 
     # Shape C: gather on a column already in the frame (self-gather by index).
-    shape_c = fact.lazy().select(
-        pl.col("value").gather(pl.col("id") % n).sqrt().alias("out")
-    )
+    shape_c = fact.lazy().select(pl.col("value").gather(pl.col("id") % n).sqrt().alias("out"))
 
     # Shape D: Expr.take alias (older name) if present.
     try:
         shape_d = fact.lazy().select(
             pl.col("value").take(pl.col("id") % n).alias("out")  # type: ignore[attr-defined]
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         shape_d = None
 
     run_shape("A: lit(dim).gather(id) -> tanh*value", shape_a)

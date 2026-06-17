@@ -16,9 +16,7 @@ def _check_cpu_parity(lf):
 
 
 def test_f64_chain_falls_back():
-    f = pl.DataFrame(
-        {"id": np.arange(100, dtype=np.int64), "v": np.arange(100, dtype=np.float64)}
-    )
+    f = pl.DataFrame({"id": np.arange(100, dtype=np.int64), "v": np.arange(100, dtype=np.float64)})
     d = pl.DataFrame(
         {
             "id": np.arange(100, dtype=np.int64),
@@ -26,9 +24,7 @@ def test_f64_chain_falls_back():
         }
     )
     _check_cpu_parity(
-        f.lazy()
-        .join(d.lazy(), on="id")
-        .with_columns((pl.col("vol") * pl.col("v")).alias("o"))
+        f.lazy().join(d.lazy(), on="id").with_columns((pl.col("vol") * pl.col("v")).alias("o"))
     )
 
 
@@ -36,9 +32,7 @@ def test_string_key_falls_back():
     f = pl.DataFrame({"id": ["a", "b"], "v": np.float32([1, 2])})
     d = pl.DataFrame({"id": ["a", "b"], "vol": np.float32([3, 4])})
     _check_cpu_parity(
-        f.lazy()
-        .join(d.lazy(), on="id")
-        .with_columns((pl.col("vol") * pl.col("v")).alias("o"))
+        f.lazy().join(d.lazy(), on="id").with_columns((pl.col("vol") * pl.col("v")).alias("o"))
     )
 
 

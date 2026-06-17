@@ -1,5 +1,6 @@
 """Isolated validation of analyze_ir_with_columns_gather: the spliced scope
 (Take(dim_value,key) feeding an F32 chain) must match numpy gather+chain."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -50,11 +51,9 @@ def test_gather_scope_matches_numpy():
         fact.lazy()
         .join(dim.lazy(), on="id", how="left")
         .with_columns(
-            (
-                pl.col("value")
-                * 0.5
-                * (1.0 + (0.7978845608 * pl.col("vol").log()).tanh())
-            ).alias("out")
+            (pl.col("value") * 0.5 * (1.0 + (0.7978845608 * pl.col("vol").log()).tanh())).alias(
+                "out"
+            )
         )
     )
 

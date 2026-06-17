@@ -1452,12 +1452,28 @@ def _gather_leaves_ir(
 
     if cls == "BinaryExpr":
         _gather_leaves_ir(
-            nt, node.left, schema, scope, descriptors, leaf_idx,
-            col_dedup, lit_dedup, lit_dtype_str, gather_ctx,
+            nt,
+            node.left,
+            schema,
+            scope,
+            descriptors,
+            leaf_idx,
+            col_dedup,
+            lit_dedup,
+            lit_dtype_str,
+            gather_ctx,
         )
         _gather_leaves_ir(
-            nt, node.right, schema, scope, descriptors, leaf_idx,
-            col_dedup, lit_dedup, lit_dtype_str, gather_ctx,
+            nt,
+            node.right,
+            schema,
+            scope,
+            descriptors,
+            leaf_idx,
+            col_dedup,
+            lit_dedup,
+            lit_dtype_str,
+            gather_ctx,
         )
         return
 
@@ -1468,8 +1484,16 @@ def _gather_leaves_ir(
         if getattr(node, "dtype", None) != pl.Float32:
             raise _Aborted
         _gather_leaves_ir(
-            nt, node.expr, schema, scope, descriptors, leaf_idx,
-            col_dedup, lit_dedup, lit_dtype_str, gather_ctx,
+            nt,
+            node.expr,
+            schema,
+            scope,
+            descriptors,
+            leaf_idx,
+            col_dedup,
+            lit_dedup,
+            lit_dtype_str,
+            gather_ctx,
         )
         return
 
@@ -1484,8 +1508,16 @@ def _gather_leaves_ir(
             # compile-time param (validated in pass 2), not an input leaf.
             _shift_offset(nt, fn_inputs)  # validate now so pass 1/2 agree
             _gather_leaves_ir(
-                nt, fn_inputs[0], schema, scope, descriptors, leaf_idx,
-                col_dedup, lit_dedup, lit_dtype_str, gather_ctx,
+                nt,
+                fn_inputs[0],
+                schema,
+                scope,
+                descriptors,
+                leaf_idx,
+                col_dedup,
+                lit_dedup,
+                lit_dtype_str,
+                gather_ctx,
             )
             return
         if fn_name == _INT_RANGE_FN:
@@ -1498,8 +1530,16 @@ def _gather_leaves_ir(
             raise _Aborted
         for cid in fn_inputs:
             _gather_leaves_ir(
-                nt, cid, schema, scope, descriptors, leaf_idx,
-                col_dedup, lit_dedup, lit_dtype_str, gather_ctx,
+                nt,
+                cid,
+                schema,
+                scope,
+                descriptors,
+                leaf_idx,
+                col_dedup,
+                lit_dedup,
+                lit_dtype_str,
+                gather_ctx,
             )
         return
 
@@ -1511,23 +1551,55 @@ def _gather_leaves_ir(
         if not args:
             raise _Aborted
         _gather_leaves_ir(
-            nt, args[0], schema, scope, descriptors, leaf_idx,
-            col_dedup, lit_dedup, lit_dtype_str, gather_ctx,
+            nt,
+            args[0],
+            schema,
+            scope,
+            descriptors,
+            leaf_idx,
+            col_dedup,
+            lit_dedup,
+            lit_dtype_str,
+            gather_ctx,
         )
         return
 
     if cls == "Ternary":
         _gather_leaves_ir(
-            nt, node.predicate, schema, scope, descriptors, leaf_idx,
-            col_dedup, lit_dedup, lit_dtype_str, gather_ctx,
+            nt,
+            node.predicate,
+            schema,
+            scope,
+            descriptors,
+            leaf_idx,
+            col_dedup,
+            lit_dedup,
+            lit_dtype_str,
+            gather_ctx,
         )
         _gather_leaves_ir(
-            nt, node.truthy, schema, scope, descriptors, leaf_idx,
-            col_dedup, lit_dedup, lit_dtype_str, gather_ctx,
+            nt,
+            node.truthy,
+            schema,
+            scope,
+            descriptors,
+            leaf_idx,
+            col_dedup,
+            lit_dedup,
+            lit_dtype_str,
+            gather_ctx,
         )
         _gather_leaves_ir(
-            nt, node.falsy, schema, scope, descriptors, leaf_idx,
-            col_dedup, lit_dedup, lit_dtype_str, gather_ctx,
+            nt,
+            node.falsy,
+            schema,
+            scope,
+            descriptors,
+            leaf_idx,
+            col_dedup,
+            lit_dedup,
+            lit_dtype_str,
+            gather_ctx,
         )
         return
 

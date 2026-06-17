@@ -181,9 +181,7 @@ def _dispatch_join(left_pydf: Any, right_pydf: Any, plan: dict) -> pl.DataFrame:
         if resident is not None:
             _M10_DENSE_GATHERS += 1
             return resident
-    joined = left.join(
-        right, left_on=plan["key"], right_on=plan["right_key"], how=plan["how"]
-    )
+    joined = left.join(right, left_on=plan["key"], right_on=plan["right_key"], how=plan["how"])
     parent = plan["_parent_chain"]
     return _dispatch_chain_over_frame(joined, parent)
 

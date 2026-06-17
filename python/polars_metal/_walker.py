@@ -880,9 +880,7 @@ def _walk_join(nt: Any, node: Any) -> WalkResult:
     if lkey is None or rkey is None:
         return FallBack(reason="join: non-Column key expression")
     if str(left_schema.get(lkey)) not in _JOIN_INT_KEY_DTYPES:
-        return FallBack(
-            reason=f"join: key dtype {left_schema.get(lkey)} not an integer key"
-        )
+        return FallBack(reason=f"join: key dtype {left_schema.get(lkey)} not an integer key")
 
     nt.set_node(inputs[0])
     left = _walk_at_current(nt)

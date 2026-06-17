@@ -13,7 +13,8 @@ fn cosine_topk_with_exp_decay_rerank() {
     let q = vec![1.0f32, 0.0];
     let c = vec![1.0f32, 0.0, 0.6, 0.8, 0.0, 1.0];
     let w = vec![2.0f32, 0.0, 0.0];
-    let (idx, val) = vector_search_topk_rerank(&q, 1, &c, 3, 2, 2, OP_COSINE, Some(&w)).unwrap();
+    let (idx, val) =
+        vector_search_topk_rerank(&q, 1, &c, 3, 2, 2, OP_COSINE, Some(&w)).expect("rerank search");
     // returns flattened (Q*k) idx + reranked val. Recompute expected per returned index.
     assert_eq!(idx.len(), 2);
     assert_eq!(val.len(), 2);
@@ -45,8 +46,9 @@ fn rerank_none_matches_plain_topk() {
     use polars_metal_native::vector_search::{vector_search_topk, vector_search_topk_rerank};
     let q = vec![1.0f32, 0.0, 0.0, 1.0];
     let c = vec![1.0f32, 0.0, 0.0, 1.0, 0.7, 0.7];
-    let (i0, v0) = vector_search_topk(&q, 2, &c, 3, 2, 2, OP_COSINE).unwrap();
-    let (i1, v1) = vector_search_topk_rerank(&q, 2, &c, 3, 2, 2, OP_COSINE, None).unwrap();
+    let (i0, v0) = vector_search_topk(&q, 2, &c, 3, 2, 2, OP_COSINE).expect("plain search");
+    let (i1, v1) =
+        vector_search_topk_rerank(&q, 2, &c, 3, 2, 2, OP_COSINE, None).expect("rerank none");
     assert_eq!(i0, i1);
     for (a, b) in v0.iter().zip(v1.iter()) {
         assert!((a - b).abs() < 1e-5);

@@ -816,9 +816,7 @@ def _make_rerank_queries(q: int, seed: int = 0xB3) -> pl.DataFrame:
     """Return a DataFrame of q query embeddings (Array[Float32, D])."""
     rng = np.random.default_rng(seed)
     emb = rng.standard_normal((q, _RERANK_D)).astype(np.float32)
-    return pl.DataFrame(
-        {"emb": emb.tolist()}, schema={"emb": pl.Array(pl.Float32, _RERANK_D)}
-    )
+    return pl.DataFrame({"emb": emb.tolist()}, schema={"emb": pl.Array(pl.Float32, _RERANK_D)})
 
 
 def _engine_rerank(qdf: pl.DataFrame) -> pl.DataFrame:
@@ -894,10 +892,16 @@ def _check_rerank(engine_out: pl.DataFrame, cpu_out: pl.DataFrame) -> None:
         cpu_idx = {int(x) for x in cpu_out["indices"][i]}
         assert eng_idx == cpu_idx, f"row {i}: engine={sorted(eng_idx)} cpu={sorted(cpu_idx)}"
     eng_scores = np.array(
-        [sorted((float(x) for x in hit_col[i]["scores"]), reverse=True) for i in range(len(hit_col))]
+        [
+            sorted((float(x) for x in hit_col[i]["scores"]), reverse=True)
+            for i in range(len(hit_col))
+        ]
     )
     cpu_scores = np.array(
-        [sorted((float(x) for x in cpu_out["scores"][i]), reverse=True) for i in range(len(hit_col))]
+        [
+            sorted((float(x) for x in cpu_out["scores"][i]), reverse=True)
+            for i in range(len(hit_col))
+        ]
     )
     np.testing.assert_allclose(eng_scores, cpu_scores, rtol=1e-3, atol=1e-3)
 

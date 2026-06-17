@@ -7,6 +7,7 @@ produces silently wrong results.
 Note: this helper assumes the caller has already verified null_count()==0 on the
 key column before converting to a numpy int array. A numpy int64 array cannot
 carry Polars nulls, so no null-in-key check is needed here."""
+
 from __future__ import annotations
 
 import numpy as np

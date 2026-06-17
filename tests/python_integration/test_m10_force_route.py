@@ -60,14 +60,18 @@ def test_midsize_dense_routes_gpu_by_default():
             "vol": rng.uniform(0.1, 0.5, dim_n).astype(np.float32),
         }
     )
-    lf = fact.lazy().join(dim.lazy(), on="id").with_columns(
-        (pl.col("value") * 0.5 * (1.0 + (0.7978845608 * pl.col("vol").log()).tanh())).alias("out")
+    lf = (
+        fact.lazy()
+        .join(dim.lazy(), on="id")
+        .with_columns(
+            (pl.col("value") * 0.5 * (1.0 + (0.7978845608 * pl.col("vol").log()).tanh())).alias(
+                "out"
+            )
+        )
     )
     _udf._M10_DENSE_GATHERS = 0
     out = lf.collect(engine=MetalEngine())
-    assert _udf._M10_DENSE_GATHERS == 1, (
-        "600k dense compute chain should route GPU by default now"
-    )
+    assert _udf._M10_DENSE_GATHERS == 1, "600k dense compute chain should route GPU by default now"
     assert_frame_equal(lf.collect(), out, check_dtypes=True, rel_tol=1e-3, abs_tol=1e-3)
 
 

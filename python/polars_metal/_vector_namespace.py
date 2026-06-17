@@ -121,15 +121,16 @@ class MetalExprNamespace:
         # rerank and rerank_weight must be supplied together (both or neither).
         if (rerank is None) != (rerank_weight is None):
             raise ValueError(
-                "polars_metal: cosine_topk requires both `rerank` and `rerank_weight` "
-                "or neither."
+                "polars_metal: cosine_topk requires both `rerank` and `rerank_weight` or neither."
             )
         rw = None
         if rerank is not None:
             if rerank != "exp_decay":
                 raise ValueError(f"unsupported rerank: {rerank!r} (expected 'exp_decay')")
             # Accept a pl.Series, numpy array, or list → contiguous float32.
-            src = rerank_weight.to_numpy() if isinstance(rerank_weight, pl.Series) else rerank_weight
+            src = (
+                rerank_weight.to_numpy() if isinstance(rerank_weight, pl.Series) else rerank_weight
+            )
             rw = np.ascontiguousarray(src, dtype=np.float32)
         qcol = self._query_col_name()
         handle = _capture_corpus(corpus, corpus_col, k, "cosine", qcol, rw, rerank)
