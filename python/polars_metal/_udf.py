@@ -132,6 +132,12 @@ def _dispatch(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
         exprs = wire_plan.get("exprs", [])
         if exprs and all("_fused_scope" in e for e in exprs):
             return _dispatch_hstack_fused(df_pydf, wire_plan)
+    if wire_plan["kind"] == "Scan":
+        # A bare Scan reconstruction is just the embedded df — the Rust Scan
+        # handler returns it unchanged. Short-circuit here so a Scan carrying an
+        # OPAQUE-tagged (Struct/List/non-F32-Array) column never reaches Rust's
+        # parse_dtype("OPAQUE"), which raises. (M11: OPAQUE-scan crash fix.)
+        return pl.DataFrame._from_pydf(df_pydf)
     result_pydf = _native.execute_plan(df_pydf, wire_plan)
     return pl.DataFrame._from_pydf(result_pydf)
 
