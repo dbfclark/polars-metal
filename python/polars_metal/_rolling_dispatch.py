@@ -13,6 +13,7 @@ import numpy as np
 import polars as pl
 
 from polars_metal import _native
+from polars_metal._detect_common import collect_stitch_base
 from polars_metal._rolling_detect import RollingBinding
 
 _OP_CODE = {"sum": 0, "mean": 1, "var": 2, "std": 3}
@@ -83,11 +84,11 @@ def apply_rolling(
     order = lf.collect_schema().names()
     # Drop rolling output columns; projection pushdown eliminates their
     # computation from the CPU plan (verified via explain()).
-    rest_lf = lf.drop(out_names)
-    df = collect_fn(rest_lf)
+    df = collect_stitch_base(lf, out_names, [b.column for b in bindings], collect_fn)
 
     # Build a dict from column name → Series so we can stitch in order.
-    cols: dict[str, pl.Series] = {c: df.get_column(c) for c in df.columns}
+    order_set = set(order)
+    cols: dict[str, pl.Series] = {c: df.get_column(c) for c in df.columns if c in order_set}
 
     for b in bindings:
         cols[b.out_name] = _rolling_series(df.get_column(b.column), b)

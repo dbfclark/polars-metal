@@ -70,6 +70,22 @@ def _literal_int(node) -> int | None:
     return None
 
 
+# id(select-result lf) -> weakref(parent lf, pre-select). Lets the stitch
+# dispatch recover a verb's SOURCE column when the `.select` projected only the
+# sentinel output (so the source column is absent from the post-select frame but
+# still resolvable from its parent). Keyed/evicted exactly like the expr cache.
+_select_parents: dict[int, Any] = {}
+
+
+def _parent_lf(lf) -> Any | None:
+    """Return the pre-select parent of `lf` if `.select` capture recorded one,
+    else None. The parent is held by a STRONG reference (the `df.lazy()` in a
+    `df.lazy().select(...)` chain is a temporary with no other referent, so a
+    weakref would die immediately); its lifetime is tied to the result lf via the
+    same weakref evictor as the expr cache."""
+    return _select_parents.get(id(lf))
+
+
 def _make_evictor(cache: dict, key: int):
     """Return a weakref finalizer that removes `key` from `cache` when the
     referent is garbage-collected.  Keeps cache growth bounded and prevents
@@ -119,6 +135,37 @@ def install_with_columns_capture(attr: str, cache: dict) -> None:
         return result
 
     _plf.LazyFrame.with_columns = _patched  # type: ignore[method-assign]
+
+    # Also capture `.select(...)` exprs so the .metal verbs are detected under
+    # the projection idiom, not only with_columns. Same cache, keyed by id(result).
+    sel_attr = attr + "_select"
+    if not hasattr(_plf.LazyFrame, sel_attr):
+        orig_select = _plf.LazyFrame.select
+        setattr(_plf.LazyFrame, sel_attr, orig_select)
+
+        def _patched_select(self, *exprs, **named):  # type: ignore[no-untyped-def]
+            result = orig_select(self, *exprs, **named)
+            try:
+                flat = [e for e in exprs if isinstance(e, pl.Expr)]
+                for e in exprs:
+                    if isinstance(e, (list, tuple)):
+                        flat += [x for x in e if isinstance(x, pl.Expr)]
+                flat += [e.alias(n) for n, e in named.items() if isinstance(e, pl.Expr)]
+                if flat:
+                    key = id(result)
+                    cache[key] = (weakref.ref(result, _make_evictor(cache, key)), flat)
+                    # Remember the pre-select parent (STRONG ref — the parent is
+                    # typically a temporary) so the stitch dispatch can recover
+                    # source columns the select projected away. Evicted when the
+                    # RESULT lf is GC'd. weakref.finalize keeps itself alive (a
+                    # bare weakref.ref callback would be collected before firing).
+                    _select_parents[key] = self
+                    weakref.finalize(result, _select_parents.pop, key, None)
+            except Exception:
+                pass
+            return result
+
+        _plf.LazyFrame.select = _patched_select  # type: ignore[method-assign]
 
 
 # --------------------------------------------------------------------------
@@ -198,6 +245,124 @@ def make_sentinel_parser(
     return parse
 
 
+def _balanced_bracket_slice(s: str, start: int) -> str | None:
+    """Return ``s[start:end]`` where ``s[start] == '['`` and ``end`` is one past
+    the matching ``']'``, tracking bracket depth and skipping bracket chars that
+    fall inside JSON string literals (with backslash escapes). Returns None if no
+    balanced close is found. Used to extract a Select node's ``"expr":[...]`` list,
+    whose tail is the scanned-subtree ``"input"`` rather than ``"options"``."""
+    depth = 0
+    in_str = False
+    esc = False
+    for k in range(start, len(s)):
+        ch = s[k]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return s[start : k + 1]
+    return None
+
+
+def _reconstruct_parent(lf: pl.LazyFrame):
+    """Recover the pre-select parent LazyFrame from *lf*'s serialized plan when
+    no parent was captured (slow serialize path). The top node is a ``Select``
+    whose ``input`` subtree is exactly the parent; deserialize that subtree back
+    into a LazyFrame. Returns None on any error (caller degrades to the
+    with_columns path)."""
+    try:
+        import io
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            plan = json.loads(lf.serialize(format="json"))
+        # The plan may be the bare DSL ({"Select": ...}) or wrapped in an IR
+        # envelope ({"IR": {"dsl": {"Select": ...}, "version": ...}}) depending on
+        # where in the collect path we serialize. Unwrap to the DSL node.
+        if isinstance(plan, dict) and "IR" in plan:
+            ir = plan["IR"]
+            dsl = ir.get("dsl") if isinstance(ir, dict) else None
+            node = dsl if isinstance(dsl, dict) else plan
+        else:
+            node = plan
+        sel = node.get("Select") if isinstance(node, dict) else None
+        if not isinstance(sel, dict) or "input" not in sel:
+            return None
+        sub = json.dumps(sel["input"])
+        return pl.LazyFrame.deserialize(io.StringIO(sub), format="json")
+    except Exception:
+        return None
+
+
+def collect_stitch_base(lf: pl.LazyFrame, out_names, src_cols, collect_fn) -> pl.DataFrame:
+    """Collect the base DataFrame the .metal stitch dispatch stitches its GPU
+    outputs onto. Handles both detection idioms:
+
+    * ``with_columns`` (no recorded parent): ``lf.drop(out_names)`` — projection
+      pushdown elides the sentinel computation (incl. the opaque ``_raise``
+      map_batches) from the CPU path; the source columns survive in the result.
+
+    * ``select`` (parent recorded by the capture patch): ``lf.drop(out_names)``
+      would NOT elide ``_raise`` (the sentinel select DEFINES the frame), so we
+      instead collect the non-sentinel OUTPUT columns directly from ``lf`` (those
+      are ordinary, non-raising exprs) and recover any binding SOURCE columns from
+      the pre-select parent.
+
+    The returned frame contains every non-sentinel output column plus every needed
+    source column (the latter dropped from the final result by the caller, which
+    reorders to the schema's ``order``)."""
+    parent = _parent_lf(lf)
+    needed_src = [c for c in dict.fromkeys(src_cols) if c]
+    if parent is None:
+        # No captured parent. Distinguish the with_columns idiom (source columns
+        # survive in lf's schema) from a select reached via the slow serialize
+        # path (source columns absent → reconstruct the parent from the plan).
+        try:
+            lf_cols = set(lf.collect_schema().names())
+        except Exception:
+            lf_cols = set()
+        if needed_src and not all(c in lf_cols for c in needed_src):
+            recovered = _reconstruct_parent(lf)
+            if recovered is not None:
+                parent = recovered
+    if parent is None:
+        # with_columns idiom: drop sentinel outputs, source columns ride along.
+        df = collect_fn(lf.drop(out_names))
+        present = set(df.columns)
+        missing = [c for c in needed_src if c not in present]
+        if missing:
+            src_df = collect_fn(lf.select([pl.col(c) for c in missing]))
+            df = df.hstack([src_df.get_column(c) for c in missing])
+        return df
+    # select idiom: the sentinel select defines lf, so collect the non-sentinel
+    # outputs from lf (safe — they don't raise) and the sources from the parent.
+    out_set = set(out_names)
+    rest_outputs = [c for c in lf.collect_schema().names() if c not in out_set]
+    if rest_outputs:
+        df = collect_fn(lf.select([pl.col(c) for c in rest_outputs]))
+    else:
+        # No non-sentinel outputs: an empty frame; the recovered source columns
+        # below supply the row count.
+        df = pl.DataFrame()
+    present = set(df.columns)
+    missing = [c for c in needed_src if c not in present]
+    if missing:
+        src_df = collect_fn(parent.select([pl.col(c) for c in missing]))
+        df = src_df if df.width == 0 else df.hstack([src_df.get_column(c) for c in missing])
+    return df
+
+
 def iter_candidate_nodes(
     lf: pl.LazyFrame, *, cache: dict, explain_tags: tuple[str, ...]
 ) -> Iterator[tuple[dict, str]]:
@@ -225,11 +390,24 @@ def iter_candidate_nodes(
             plan = lf.serialize(format="json")
         key = '"exprs":['
         i = plan.rfind(key)
-        if i == -1:
-            return
-        start = i + len(key) - 1
-        j = plan.rfind(',"options":', start)
-        frag = plan[start:j] if j != -1 else plan[start:]
+        if i != -1:
+            # HStack/with_columns: the expr list is immediately followed by
+            # ',"options":' — slice up to it (proven, kept unchanged).
+            start = i + len(key) - 1
+            j = plan.rfind(',"options":', start)
+            frag = plan[start:j] if j != -1 else plan[start:]
+        else:
+            # Select node (projection idiom): the expr list is followed by
+            # ',"input":{...}' (the scanned subtree), NOT ',"options":', so the
+            # ',"options":' shortcut over-captures. Walk to the balanced ']'.
+            key = '"expr":['
+            i = plan.rfind(key)
+            if i == -1:
+                return
+            start = i + len(key) - 1
+            frag = _balanced_bracket_slice(plan, start)
+            if frag is None:
+                return
         nodes = json.loads(frag)
         for node in nodes if isinstance(nodes, list) else []:
             name = _alias_name(node)
