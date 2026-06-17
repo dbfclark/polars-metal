@@ -136,36 +136,15 @@ def install_with_columns_capture(attr: str, cache: dict) -> None:
 
     _plf.LazyFrame.with_columns = _patched  # type: ignore[method-assign]
 
-    # Also capture `.select(...)` exprs so the .metal verbs are detected under
-    # the projection idiom, not only with_columns. Same cache, keyed by id(result).
-    sel_attr = attr + "_select"
-    if not hasattr(_plf.LazyFrame, sel_attr):
-        orig_select = _plf.LazyFrame.select
-        setattr(_plf.LazyFrame, sel_attr, orig_select)
-
-        def _patched_select(self, *exprs, **named):  # type: ignore[no-untyped-def]
-            result = orig_select(self, *exprs, **named)
-            try:
-                flat = [e for e in exprs if isinstance(e, pl.Expr)]
-                for e in exprs:
-                    if isinstance(e, (list, tuple)):
-                        flat += [x for x in e if isinstance(x, pl.Expr)]
-                flat += [e.alias(n) for n, e in named.items() if isinstance(e, pl.Expr)]
-                if flat:
-                    key = id(result)
-                    cache[key] = (weakref.ref(result, _make_evictor(cache, key)), flat)
-                    # Remember the pre-select parent (STRONG ref — the parent is
-                    # typically a temporary) so the stitch dispatch can recover
-                    # source columns the select projected away. Evicted when the
-                    # RESULT lf is GC'd. weakref.finalize keeps itself alive (a
-                    # bare weakref.ref callback would be collected before firing).
-                    _select_parents[key] = self
-                    weakref.finalize(result, _select_parents.pop, key, None)
-            except Exception:
-                pass
-            return result
-
-        _plf.LazyFrame.select = _patched_select  # type: ignore[method-assign]
+    # NOTE: `.select(...)` is intentionally NOT captured here. Polars implements
+    # eager `DataFrame.select` (and much internal machinery) as
+    # `self.lazy().select(...).collect()`, so a global `LazyFrame.select`
+    # monkey-patch fires on every internal select and pollutes the detection
+    # cache (id(result)-keyed; transient lfs cause nondeterministic stale hits
+    # — it flaked the `as_struct`/`value_counts` CSE conformance tests). The
+    # `.metal` verbs are detected under `.select` purely via the serialize
+    # slow path in `iter_candidate_nodes` (the `'"expr":['` Select fragment) +
+    # `_reconstruct_parent`, which needs no global patch. See M11.
 
 
 # --------------------------------------------------------------------------
