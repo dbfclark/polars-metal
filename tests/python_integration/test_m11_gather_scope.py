@@ -3,8 +3,10 @@ The spliced scope (Take(price,key), Take(rating,key) feeding an F32 chain) must
 match a numpy gather+chain."""
 
 from __future__ import annotations
+
 import numpy as np
 import polars as pl
+
 from polars_metal import _native
 from polars_metal._fusion_analyzer import analyze_ir_with_columns_gather
 
@@ -27,10 +29,7 @@ def _capture(lf, gather_cols, key_col):
                     nt, e.node, schema, gather_cols, key_col
                 )
                 return True
-            for i in nt.get_inputs():
-                if visit(i):
-                    return True
-            return False
+            return any(visit(i) for i in nt.get_inputs())
 
         visit(nt.get_node())
 
@@ -84,7 +83,10 @@ def test_multi_col_gather_scope_matches_numpy():
         arrays.append(a)
         tags.append(t)
     out = np.empty(n, dtype=np.float32)
-    inputs = [(int(a.__array_interface__["data"][0]), int(a.size), t) for a, t in zip(arrays, tags)]
+    inputs = [
+        (int(a.__array_interface__["data"][0]), int(a.size), t)
+        for a, t in zip(arrays, tags, strict=True)
+    ]
     assert (
         _native.execute_fused_expr(
             scope=scope,

@@ -1,6 +1,9 @@
-import numpy as np, polars as pl, pytest
-from polars_metal import MetalEngine
+import numpy as np
+import polars as pl
+import pytest
 from polars.testing import assert_frame_equal
+
+from polars_metal import MetalEngine
 
 
 def _run(fact, dim, chain, how="left"):

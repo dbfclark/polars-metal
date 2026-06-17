@@ -1,7 +1,8 @@
-import numpy as np, polars as pl
-from polars_metal import MetalEngine
-from polars_metal import _udf
+import numpy as np
+import polars as pl
 from polars.testing import assert_frame_equal
+
+from polars_metal import MetalEngine, _udf
 
 
 def _pipeline(fact, dim, how="left"):
