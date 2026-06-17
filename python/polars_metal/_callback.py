@@ -149,6 +149,14 @@ def _find_join_plan(plan: dict) -> dict | None:
     return _find_join_plan(inner) if isinstance(inner, dict) else None
 
 
+# The join->gather path wins at lower compute density than the bare-fusion path
+# (it also eliminates the CPU join/scatter), so it uses a lower FLOPs floor than
+# density.rs's 5e7. Measured crossover: ~2.4x at 500k rows / 12M flops; the engine
+# wins from ~500k up. 1e7 captures >=~420k-row chains while keeping sub-200k on CPU.
+_GATHER_MIN_FLOPS = 10_000_000  # 1e7
+_GATHER_MIN_ROWS = 100_000  # 1e5 (same as bare-fusion rows floor)
+
+
 def _is_gpu_decision(decision: Any) -> bool:
     """True iff a ``PyFusionScope.route_decision`` result indicates GPU routing.
 
@@ -159,42 +167,34 @@ def _is_gpu_decision(decision: Any) -> bool:
 
 
 def _join_routes_gpu(plan: dict, join_plan: dict | None) -> bool:
-    """Density+size gate for the M10 join path. Returns True iff the fused chain
-    above the join clears the GPU routing threshold (FLOPs>=5e7 AND rows>=1e5).
+    """Density+size gate for the M10 join→gather path.
+
+    Returns True iff the fused chain above the join clears the gather-specific
+    GPU routing threshold (FLOPs >= _GATHER_MIN_FLOPS AND rows >= _GATHER_MIN_ROWS).
+
+    Uses a lower FLOPs floor than the bare-fusion path (1e7 vs 5e7) because the
+    join->gather dispatch also eliminates the CPU join/scatter cost.
 
     Defensive: if the fused scope or the fact df can't be located, return True so
     a join path we can't assess isn't wrongly blocked (the M10 join path always
     carries a fused binding, so a miss is unexpected)."""
-    if join_plan is None:
+    parent = join_plan.get("_parent_chain") if join_plan is not None else None
+    if not parent:
         return True
-    parent_chain = join_plan.get("_parent_chain")
-    if not isinstance(parent_chain, dict):
-        return True
-    exprs = parent_chain.get("exprs") or []
-    if not exprs:
-        return True
-    scope = exprs[0].get("_fused_scope")
+    exprs = parent.get("exprs") or []
+    scope = exprs[0].get("_fused_scope") if exprs else None
     if scope is None:
         return True
-
-    fact_df = join_plan.get("left", {}).get("df")
-    if fact_df is None:
-        return True
     try:
-        n_rows = fact_df.height()
-    except Exception:
-        try:
-            import polars as pl
-
-            n_rows = pl.DataFrame._from_pydf(fact_df).height
-        except Exception:
-            return True
-
-    try:
-        decision = scope.route_decision(n_rows)
+        n_rows = join_plan["left"]["df"].height()
     except Exception:
         return True
-    return _is_gpu_decision(decision)
+    if n_rows < _GATHER_MIN_ROWS:
+        return False
+    try:
+        return scope.est_flops(n_rows) >= _GATHER_MIN_FLOPS
+    except Exception:
+        return True
 
 
 def _strip_side_channels(plan: dict) -> dict:

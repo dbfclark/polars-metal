@@ -43,6 +43,34 @@ def test_force_fusion_overrides():
     assert_frame_equal(lf.collect(), out, check_dtypes=True, rel_tol=1e-3, abs_tol=1e-3)
 
 
+def test_midsize_dense_routes_gpu_by_default():
+    # ~600k rows * ~24 flops/row = ~14M flops > 1e7 gather floor, and > 1e5 rows
+    # -> routes GPU by DEFAULT (no force_fusion needed), capturing the ~2.5x win.
+    rng = np.random.default_rng(42)
+    n, dim_n = 600_000, 10_000
+    fact = pl.DataFrame(
+        {
+            "id": rng.integers(0, dim_n, n).astype(np.int64),
+            "value": rng.uniform(50, 150, n).astype(np.float32),
+        }
+    )
+    dim = pl.DataFrame(
+        {
+            "id": rng.permutation(dim_n).astype(np.int64),
+            "vol": rng.uniform(0.1, 0.5, dim_n).astype(np.float32),
+        }
+    )
+    lf = fact.lazy().join(dim.lazy(), on="id").with_columns(
+        (pl.col("value") * 0.5 * (1.0 + (0.7978845608 * pl.col("vol").log()).tanh())).alias("out")
+    )
+    _udf._M10_DENSE_GATHERS = 0
+    out = lf.collect(engine=MetalEngine())
+    assert _udf._M10_DENSE_GATHERS == 1, (
+        "600k dense compute chain should route GPU by default now"
+    )
+    assert_frame_equal(lf.collect(), out, check_dtypes=True, rel_tol=1e-3, abs_tol=1e-3)
+
+
 def test_large_dense_routes_gpu_by_default():
     # n above threshold + dense + compute chain -> GPU by default (no force needed).
     # 2.5M rows clears BOTH gates: rows>=1e5 and FLOPs>=5e7 (the 2-transcendental
