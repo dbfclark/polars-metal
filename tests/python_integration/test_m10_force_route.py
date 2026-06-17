@@ -7,7 +7,7 @@ from polars_metal import MetalEngine, _udf
 
 def _small_dense_pipeline():
     rng = np.random.default_rng(40)
-    n, dim_n = 2000, 100  # n < MIN_ROWS_THRESHOLD (1e5) -> below density gate
+    n, dim_n = 2000, 100  # n < gather gate (1e7 flops / 1e5 rows) -> below density gate
     fact = pl.DataFrame(
         {
             "id": rng.integers(0, dim_n, n).astype(np.int64),
@@ -77,8 +77,8 @@ def test_midsize_dense_routes_gpu_by_default():
 
 def test_large_dense_routes_gpu_by_default():
     # n above threshold + dense + compute chain -> GPU by default (no force needed).
-    # 2.5M rows clears BOTH gates: rows>=1e5 and FLOPs>=5e7 (the 2-transcendental
-    # chain is ~24 FLOPs/row, so it needs ~2.1M rows to clear the 5e7 FLOPs floor).
+    # 2.5M rows clears BOTH gather gates (rows>=1e5 and FLOPs>=1e7); the
+    # ~24-FLOPs/row chain clears the 1e7 floor from ~420k rows up.
     rng = np.random.default_rng(41)
     n, dim_n = 2_500_000, 5000
     fact = pl.DataFrame(

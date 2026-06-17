@@ -27,5 +27,6 @@ class MetalEngine:
 
     force_fusion: bool = False
     """Force recognized fused/gather subtrees onto the GPU past the density+size
-    gate (FLOPs>=5e7 AND rows>=1e5). For benchmarking/power users; default keeps
-    routing honest."""
+    gate (the join->gather path gates at FLOPs>=1e7 AND rows>=1e5; the bare-fusion
+    path at FLOPs>=5e7). For benchmarking/power users; default keeps routing
+    honest."""
