@@ -919,3 +919,148 @@ ENTRIES += [
         check=_check_rerank,
     ),
 ]
+
+# ---- M11 two-phase retrieval flagship ---------------------------------------
+#
+# The end-to-end retrieval pipeline that runs resident on GPU:
+#   1. cosine_topk over a corpus  -> top-k hit indices+scores (GPU)
+#   2. explode the hits eagerly   -> a MATERIALIZED fact frame (a Scan, which
+#      is what fires M10/M11's resident gather on the join below)
+#   3. left-join metadata by hit index + rerank chain (reads two dim columns,
+#      price & rating) -> the metadata gather + rerank run RESIDENT (M11
+#      multi-col gather) under force_fusion.
+#
+# `sizes` drives Q (query count); corpus N, D, k are module constants. The
+# headline Q is sized so the exploded fact (Q*k rows) clears the gather gate
+# (>= ~500k rows): Q=60_000 * k=10 = 600k. The smoke size (Q=100 -> 1k exploded
+# rows) routes the gather to CPU by default, but engine_fn forces fusion so the
+# dense path runs and the correctness check still holds. Report-only: no perf
+# gate (the controller measures medians separately).
+
+_RET_N = 20_000  # corpus size
+_RET_D = 64  # embedding dim
+_RET_K = 10  # top-k
+
+
+def _ret_corpus(seed: int = 0xE1) -> pl.DataFrame:
+    rng = np.random.default_rng(seed)
+    emb = rng.standard_normal((_RET_N, _RET_D)).astype(np.float32)
+    return pl.DataFrame({"emb": emb.tolist()}, schema={"emb": pl.Array(pl.Float32, _RET_D)})
+
+
+def _ret_metadata(seed: int = 0xE2) -> pl.DataFrame:
+    rng = np.random.default_rng(seed)
+    return pl.DataFrame(
+        {
+            "id": rng.permutation(_RET_N).astype(np.int64),  # dense 0..N-1 permutation
+            "price": rng.uniform(0.1, 2.0, _RET_N).astype(np.float32),
+            "rating": rng.uniform(1.0, 5.0, _RET_N).astype(np.float32),
+        }
+    )
+
+
+# Corpus + metadata are fixed across benchmark sizes (Q is the scale lever).
+_RET_CORPUS_DF = _ret_corpus()
+_RET_METADATA_DF = _ret_metadata()
+_RET_CORPUS_NP = np.asarray(_RET_CORPUS_DF["emb"].to_list(), dtype=np.float32)
+_RET_CORPUS_NP_N = _RET_CORPUS_NP / np.maximum(
+    np.linalg.norm(_RET_CORPUS_NP, axis=1, keepdims=True), 1e-12
+)
+
+# Phase 1 (cosine_topk) is a `.metal` verb with no CPU path, so it always runs
+# on the metal engine -- even for the CPU baseline, whose CPU half is the
+# explode + metadata-join rerank (phases 2-3). Only the rerank engine varies.
+_RET_TOPK_ENGINE = _ENGINE
+_RET_RERANK_ENGINE = pm.MetalEngine(force_fusion=True)
+
+
+def _make_retrieval_queries(q: int, seed: int = 0xE3) -> pl.DataFrame:
+    rng = np.random.default_rng(seed)
+    emb = rng.standard_normal((q, _RET_D)).astype(np.float32)
+    return pl.DataFrame({"emb": emb.tolist()}, schema={"emb": pl.Array(pl.Float32, _RET_D)})
+
+
+def _retrieval_fact(queries: pl.DataFrame) -> pl.DataFrame:
+    """Phase 1 (GPU top-k) + phase 2 (eager explode -> a materialized Scan)."""
+    hits = (
+        queries.lazy()
+        .with_columns(hit=pl.col("emb").metal.cosine_topk(_RET_CORPUS_DF, _RET_K))
+        .collect(engine=_RET_TOPK_ENGINE)
+    )
+    return (
+        hits.lazy()
+        .with_columns(
+            idx=pl.col("hit").struct.field("indices"),
+            sc=pl.col("hit").struct.field("scores"),
+        )
+        .explode(["idx", "sc"])
+        .with_columns(idx=pl.col("idx").cast(pl.Int64))
+        .collect()  # eager -> fact is a Scan (fires the resident gather)
+    )
+
+
+def _retrieval_rerank(fact: pl.DataFrame, engine) -> pl.DataFrame:
+    """Phase 3: left-join metadata by hit index + rerank chain."""
+    return (
+        fact.lazy()
+        .join(_RET_METADATA_DF.lazy(), left_on="idx", right_on="id", how="left")
+        .with_columns(rr=(pl.col("sc") * pl.col("price").exp() * pl.col("rating").log()))
+        .collect(engine=engine)
+    )
+
+
+def _engine_retrieval(queries: pl.DataFrame) -> pl.DataFrame:
+    fact = _retrieval_fact(queries)
+    return _retrieval_rerank(fact, _RET_RERANK_ENGINE)  # resident multi-col gather
+
+
+def _cpu_retrieval(queries: pl.DataFrame) -> pl.DataFrame:
+    fact = _retrieval_fact(queries)  # phase 1 is GPU-only either way
+    return _retrieval_rerank(fact, "cpu")
+
+
+def _ceil_retrieval(queries: pl.DataFrame) -> np.ndarray:
+    """Raw numpy ceiling: cosine top-k (argpartition) + metadata gather + rerank
+    chain. No engine overhead. Returns the reranked scores (sorted per row)."""
+    q = np.asarray(queries["emb"].to_list(), dtype=np.float32)
+    qn = q / np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-12)
+    # Metadata gather table: price/rating indexed by corpus id (dense 0..N-1).
+    meta = _RET_METADATA_DF.sort("id")
+    price = meta["price"].to_numpy()
+    rating = meta["rating"].to_numpy()
+    chunk = 64
+    out_rows: list[np.ndarray] = []
+    for start in range(0, len(qn), chunk):
+        block = qn[start : start + chunk]
+        sims = block @ _RET_CORPUS_NP_N.T  # (chunk, N)
+        hits = np.argpartition(-sims, kth=_RET_K - 1, axis=1)[:, :_RET_K]
+        hit_sims = np.take_along_axis(sims, hits, axis=1)
+        rr = hit_sims * np.exp(price[hits]) * np.log(rating[hits])
+        out_rows.append(np.sort(rr, axis=1))
+    return np.concatenate(out_rows, axis=0)
+
+
+def _check_retrieval(engine_out: pl.DataFrame, cpu_out: pl.DataFrame) -> None:
+    # Explode/join row order differs between paths; sort before comparing.
+    sort_cols = ["idx", "rr"]
+    e = engine_out.sort(sort_cols)
+    c = cpu_out.sort(sort_cols)
+    _frame_allclose(e, c, rtol=1e-3, atol=1e-3)
+
+
+ENTRIES += [
+    BenchEntry(
+        name="m11_retrieval_rerank",
+        category="join-gather",
+        # `size` = Q (query count). Headline Q=60_000 -> 600k exploded fact rows
+        # (clears the >=~500k gather gate). Smoke Q=100 -> 1k rows (gather gate
+        # routes to CPU by default, but engine_fn force_fusion runs the dense
+        # path; correctness still holds). Corpus/metadata fixed at _RET_N.
+        sizes=[100, 60_000],
+        make_input=_make_retrieval_queries,
+        engine_fn=_engine_retrieval,
+        cpu_fn=_cpu_retrieval,
+        ceiling_fn=_ceil_retrieval,
+        check=_check_retrieval,
+    ),
+]

@@ -205,7 +205,17 @@ def _walk_dataframe_scan(nt: Any, node: Any) -> WalkResult:
     for name, dtype in schema.items():
         mapped = _map_dtype(dtype)
         if mapped is None:
-            return FallBack(reason=f"unsupported dtype {dtype!s} on column {name!r}")
+            # M11: an unsupported-dtype column (e.g. an Array embedding or a
+            # Struct of top-k hits carried alongside a retrieval fact) does not
+            # disqualify the Scan — it is opaque PASSTHROUGH, never read on the
+            # GPU path. The fusion analyzer, agg, and predicate walks all reject
+            # an unmapped dtype before it can become a fused `col` input, so a
+            # passthrough column can never reach a kernel; and the only consumer
+            # of the Scan's column tags is the non-join wire path (the join
+            # path reads the raw `node.df` directly). Tagging it OPAQUE keeps
+            # the Scan Handled so a downstream join->gather can still fire.
+            columns.append((str(name), "OPAQUE"))
+            continue
         columns.append((str(name), mapped))
 
     projection = getattr(node, "projection", None)
