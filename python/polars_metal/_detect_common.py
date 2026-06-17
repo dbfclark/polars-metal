@@ -78,11 +78,12 @@ _select_parents: dict[int, Any] = {}
 
 
 def _parent_lf(lf) -> Any | None:
-    """Return the pre-select parent of `lf` if `.select` capture recorded one,
-    else None. The parent is held by a STRONG reference (the `df.lazy()` in a
-    `df.lazy().select(...)` chain is a temporary with no other referent, so a
-    weakref would die immediately); its lifetime is tied to the result lf via the
-    same weakref evictor as the expr cache."""
+    """Return a recorded pre-select parent of `lf`, else None. `_select_parents`
+    is currently never populated (M11 removed the global `.select` capture patch
+    because it polluted detection state via Polars' eager-select-via-lazy
+    internals — see `install_with_columns_capture`); the `.select` idiom recovers
+    its parent via `_reconstruct_parent` (the slow serialize path) instead. Kept
+    as a hook in case a safe, scoped parent capture is reintroduced."""
     return _select_parents.get(id(lf))
 
 
@@ -292,11 +293,11 @@ def collect_stitch_base(lf: pl.LazyFrame, out_names, src_cols, collect_fn) -> pl
       pushdown elides the sentinel computation (incl. the opaque ``_raise``
       map_batches) from the CPU path; the source columns survive in the result.
 
-    * ``select`` (parent recorded by the capture patch): ``lf.drop(out_names)``
+    * ``select`` (parent recovered via ``_reconstruct_parent``): ``lf.drop(out_names)``
       would NOT elide ``_raise`` (the sentinel select DEFINES the frame), so we
       instead collect the non-sentinel OUTPUT columns directly from ``lf`` (those
       are ordinary, non-raising exprs) and recover any binding SOURCE columns from
-      the pre-select parent.
+      the pre-select parent reconstructed from the serialized plan.
 
     The returned frame contains every non-sentinel output column plus every needed
     source column (the latter dropped from the final result by the caller, which
