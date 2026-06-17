@@ -92,6 +92,9 @@ pub enum OpId {
     Shift,
     // RowIndex (0-arg iota: [0,1,…,n-1] as F32) — for rolling off-by-one fix (M5)
     RowIndex,
+    // Gather: out[i] = source[index[i]] (binary: source, index). Output length =
+    // index length (may differ from source length — the only mixed-length op).
+    Take,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -366,6 +369,16 @@ pub fn op_spec(op: OpId) -> OpSpec {
             dynamic_flops: false,
             allows_null: false,
         },
+        // Gather — bandwidth-bound, ~0 compute per row. Output length = index
+        // length (may differ from source length).
+        Take => OpSpec {
+            n_args: 2,
+            flops_per_row: 1,
+            input_dtype: I::Numeric,
+            output_dtype: O::SameAsInput,
+            dynamic_flops: false,
+            allows_null: false,
+        },
     }
 }
 
@@ -435,6 +448,19 @@ pub fn all_op_ids() -> impl Iterator<Item = OpId> {
         Ifft,
         Shift,
         RowIndex,
+        Take,
     ]
     .into_iter()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn take_op_spec_is_binary_low_flops() {
+        let spec = op_spec(OpId::Take);
+        assert_eq!(spec.n_args, 2); // (source, index)
+        assert!(spec.flops_per_row <= 1); // gather is bandwidth, ~0 compute
+    }
 }

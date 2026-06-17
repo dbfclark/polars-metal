@@ -304,6 +304,11 @@ mod ffi {
             indices: &SharedPtr<MlxArray>,
             axis: i32,
         ) -> Result<SharedPtr<MlxArray>>;
+
+        fn mlx_op_take(
+            a: &SharedPtr<MlxArray>,
+            indices: &SharedPtr<MlxArray>,
+        ) -> Result<SharedPtr<MlxArray>>;
     }
 }
 

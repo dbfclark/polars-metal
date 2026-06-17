@@ -32,6 +32,7 @@ use polars_metal_mlx_sys::reduce::{
 use polars_metal_mlx_sys::scan::{
     mlx_cummax, mlx_cummin, mlx_cumprod, mlx_cumsum, mlx_iota_f32, mlx_shift,
 };
+use polars_metal_mlx_sys::shape::mlx_take;
 use polars_metal_mlx_sys::sort::mlx_sort;
 use thiserror::Error;
 
@@ -562,6 +563,21 @@ fn build_op(node: &OpNode, handles: &[MlxArrayHandle]) -> Result<MlxArrayHandle,
                 .and_then(|h| h.shape().first().copied())
                 .ok_or(BuildError::UnsupportedOp(node.op))?;
             ffi(mlx_iota_f32(n_rows as i64))
+        }
+
+        // Take (M10 gather): out[i] = source[index[i]].
+        // args[0] = source (may be SHORT, e.g. a dim table of length dim_n);
+        // args[1] = index (length N, the output length). MLX `take` requires
+        // INTEGER indices, so cast args[1] to I32 first. The mixed-length
+        // contract is what makes resident gather work: source and index are
+        // viewed at their own lengths, and the gather output is index-length.
+        Take => {
+            arg_count(node.op, 2, &args)?;
+            let idx = ffi(polars_metal_mlx_sys::elementwise::mlx_cast(
+                args[1],
+                MlxDtype::I32,
+            ))?;
+            ffi(mlx_take(args[0], &idx))
         }
     }
 }

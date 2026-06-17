@@ -49,3 +49,14 @@ pub fn mlx_take_along_axis(
         _input_refs: refs,
     })
 }
+
+/// 1-D gather over axis 0: `out[i] = a[indices[i]]`.
+pub fn mlx_take(a: &MlxArrayHandle, indices: &MlxArrayHandle) -> Result<MlxArrayHandle, FfiError> {
+    let ptr = ffi::mlx_op_take(&a.ptr, &indices.ptr).map_err(FfiError::from)?;
+    let mut refs = a._input_refs.clone();
+    refs.extend(indices._input_refs.iter().cloned());
+    Ok(MlxArrayHandle {
+        ptr,
+        _input_refs: refs,
+    })
+}

@@ -641,3 +641,281 @@ ENTRIES += [
         check=lambda e, c: _frame_allclose(e, c, rtol=1e-2, atol=1.0),
     ),
 ]
+
+# ---- M10 join->gather helpers -----------------------------------------------
+#
+# These cases measure the engine's join->gather->compute pipeline:
+#   fact.join(dim, on="id").with_columns(<Black-Scholes chain>)
+#
+# Two variants:
+#   - dense: dim keys = shuffled 0..dim_n-1 (contiguous) -> resident GPU path.
+#     engine_fn uses force_fusion=True so the GPU branch runs at all sizes
+#     (the density gate routes rows<~2.1M to CPU by default; force bypasses it).
+#   - nondense: dim keys = sparse subset of a wide range -> CPU-lookup + GPU chain.
+
+_M10_DIM_N = 20_000  # dim table size (both variants)
+_M10_CHAIN_EXPR = (
+    pl.col("value") * 0.5 * (1.0 + (0.7978845608 * pl.col("vol").log()).tanh())
+).alias("out")
+_M10_ENGINE_FORCE = pm.MetalEngine(force_fusion=True)
+
+
+def _m10_make_dense(n: int, seed: int = 0xA1) -> dict[str, pl.DataFrame]:
+    """fact (n rows, dense keys 0.._M10_DIM_N-1) + dim (_M10_DIM_N rows, shuffled key)."""
+    rng = np.random.default_rng(seed)
+    fact = pl.DataFrame(
+        {
+            "id": rng.integers(0, _M10_DIM_N, size=n).astype(np.int64),
+            "value": rng.uniform(50, 150, size=n).astype(np.float32),
+        }
+    )
+    dim = pl.DataFrame(
+        {
+            "id": rng.permutation(_M10_DIM_N).astype(np.int64),
+            "vol": rng.uniform(0.1, 0.5, size=_M10_DIM_N).astype(np.float32),
+        }
+    )
+    return {"fact": fact, "dim": dim}
+
+
+def _m10_make_nondense(n: int, seed: int = 0xA2) -> dict[str, pl.DataFrame]:
+    """fact (n rows) + dim with sparse keys (subset of a wide key range)."""
+    rng = np.random.default_rng(seed)
+    # Wide key range makes the dim keys non-contiguous -> nondense branch.
+    wide = max(_M10_DIM_N * 5, 100_000)
+    dim_keys = rng.choice(wide, _M10_DIM_N, replace=False).astype(np.int64)
+    fact = pl.DataFrame(
+        {
+            "id": rng.choice(dim_keys, size=n).astype(np.int64),
+            "value": rng.uniform(50, 150, size=n).astype(np.float32),
+        }
+    )
+    dim = pl.DataFrame(
+        {"id": dim_keys, "vol": rng.uniform(0.1, 0.5, size=_M10_DIM_N).astype(np.float32)}
+    )
+    return {"fact": fact, "dim": dim}
+
+
+def _m10_lf(inp: dict[str, pl.DataFrame]) -> pl.LazyFrame:
+    return inp["fact"].lazy().join(inp["dim"].lazy(), on="id").with_columns(_M10_CHAIN_EXPR)
+
+
+def _ceil_m10_dense(inp: dict[str, pl.DataFrame]) -> mx.array:
+    """Raw MLX resident gather + BS chain (ceiling for dense path, no engine overhead)."""
+
+    def _build(data: dict[str, pl.DataFrame]) -> tuple[mx.array, mx.array, mx.array]:
+        f, d = data["fact"], data["dim"]
+        # Sort dim by key to build a dense 0-indexed lookup (key == position after sort).
+        d_sorted = d.sort("id")
+        dim_vol = mx.array(d_sorted["vol"].to_numpy())
+        fact_id = mx.array(f["id"].to_numpy())
+        fact_val = mx.array(f["value"].to_numpy())
+        return dim_vol, fact_id, fact_val
+
+    dim_vol, fact_id, fact_val = _ceil_inputs(inp, _build)
+    gvol = mx.take(dim_vol, fact_id, axis=0)  # resident gather
+    out = fact_val * 0.5 * (1.0 + mx.tanh(0.7978845608 * mx.log(gvol)))
+    mx.eval(out)
+    return out
+
+
+def _ceil_m10_nondense(inp: dict[str, pl.DataFrame]) -> mx.array:
+    """CPU gather + raw MLX chain (ceiling for nondense: gather is cheap CPU indexing)."""
+
+    def _build(data: dict[str, pl.DataFrame]) -> tuple[mx.array, mx.array]:
+        # Join on CPU (what the engine's CPU-lookup branch does), then GPU chain.
+        joined = data["fact"].join(data["dim"], on="id")
+        gs = mx.array(joined["value"].to_numpy())
+        gvol = mx.array(joined["vol"].to_numpy())
+        return gs, gvol
+
+    gs, gvol = _ceil_inputs(inp, _build)
+    out = gs * 0.5 * (1.0 + mx.tanh(0.7978845608 * mx.log(gvol)))
+    mx.eval(out)
+    return out
+
+
+def _check_m10(engine_out: pl.DataFrame, cpu_out: pl.DataFrame) -> None:
+    # Join output row order may differ between engine and CPU paths; sort by (id, value)
+    # before comparing so the numeric check is stable.
+    sort_cols = ["id", "value"]
+    e = engine_out.sort(sort_cols)
+    c = cpu_out.sort(sort_cols)
+    _frame_allclose(e, c, rtol=1e-3, atol=1e-3)
+
+
+ENTRIES += [
+    BenchEntry(
+        name="m10_join_gather_dense",
+        category="join-gather",
+        # Headline: 10M rows. Smoke runs at 1_000 (force_fusion bypasses density gate).
+        sizes=[1_000, 10_000_000],
+        make_input=_m10_make_dense,
+        # force_fusion so the GPU resident-gather branch runs at all sizes; default routing
+        # gates rows < ~2.1M to CPU (the FLOPs floor). Comment kept for report readers.
+        engine_fn=lambda inp: _m10_lf(inp).collect(engine=_M10_ENGINE_FORCE),
+        cpu_fn=lambda inp: _m10_lf(inp).collect(),
+        ceiling_fn=_ceil_m10_dense,
+        check=_check_m10,
+    ),
+    BenchEntry(
+        name="m10_join_gather_nondense",
+        category="join-gather",
+        # Nondense: sparse keys -> CPU-lookup + GPU chain. No force needed.
+        sizes=[1_000, 10_000_000],
+        make_input=_m10_make_nondense,
+        engine_fn=lambda inp: _m10_lf(inp).collect(engine=_ENGINE),
+        cpu_fn=lambda inp: _m10_lf(inp).collect(),
+        ceiling_fn=_ceil_m10_nondense,
+        check=_check_m10,
+    ),
+]
+
+# ---- M10 vector rerank helpers -----------------------------------------------
+#
+# Measures the resident vector rerank path: cosine top-k retrieval followed by
+# exp_decay reranking, all on GPU with no fold-back between the two phases.
+#
+# Corpus is fixed at _RERANK_N rows (module-level constant, pre-resident on GPU
+# for the ceiling). `sizes` drives Q (query count); corpus size is always _RERANK_N.
+
+_RERANK_D = 256
+_RERANK_K = 10
+_RERANK_N = 200_000  # corpus size (fixed; benchmark scale lever is Q)
+
+
+def _rerank_corpus_arr(seed: int = 0xB1) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return rng.standard_normal((_RERANK_N, _RERANK_D)).astype(np.float32)
+
+
+def _rerank_weights_arr(seed: int = 0xB2) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return rng.uniform(0.0, 1.0, _RERANK_N).astype(np.float32)
+
+
+_RERANK_CORPUS = _rerank_corpus_arr()
+_RERANK_WEIGHTS = _rerank_weights_arr()
+_RERANK_CORPUS_N = _RERANK_CORPUS / np.maximum(
+    np.linalg.norm(_RERANK_CORPUS, axis=1, keepdims=True), 1e-12
+)
+
+# Pre-build the Polars corpus DataFrame (needed by cosine_topk engine_fn).
+_RERANK_CORPUS_DF = pl.DataFrame(
+    {"emb": _RERANK_CORPUS.tolist()},
+    schema={"emb": pl.Array(pl.Float32, _RERANK_D)},
+)
+_RERANK_WEIGHTS_SERIES = pl.Series(_RERANK_WEIGHTS)
+
+# Pre-resident MLX arrays for the ceiling (transferred once at import).
+_RERANK_CORPUS_N_MX: mx.array = mx.array(_RERANK_CORPUS_N)
+mx.eval(_RERANK_CORPUS_N_MX)
+
+
+def _make_rerank_queries(q: int, seed: int = 0xB3) -> pl.DataFrame:
+    """Return a DataFrame of q query embeddings (Array[Float32, D])."""
+    rng = np.random.default_rng(seed)
+    emb = rng.standard_normal((q, _RERANK_D)).astype(np.float32)
+    return pl.DataFrame({"emb": emb.tolist()}, schema={"emb": pl.Array(pl.Float32, _RERANK_D)})
+
+
+def _engine_rerank(qdf: pl.DataFrame) -> pl.DataFrame:
+    return (
+        qdf.lazy()
+        .with_columns(
+            pl.col("emb")
+            .metal.cosine_topk(
+                _RERANK_CORPUS_DF,
+                _RERANK_K,
+                rerank_weight=_RERANK_WEIGHTS_SERIES,
+                rerank="exp_decay",
+            )
+            .alias("hit")
+        )
+        .collect(engine=_ENGINE)
+    )
+
+
+def _cpu_rerank(qdf: pl.DataFrame) -> pl.DataFrame:
+    """Numpy oracle: cosine top-k by similarity, then rerank sim*exp(-weight[hit])."""
+    q_np = np.asarray(qdf["emb"].to_list(), dtype=np.float32)
+    qn = q_np / np.maximum(np.linalg.norm(q_np, axis=1, keepdims=True), 1e-12)
+    # Chunked to cap peak memory at ~64 * N floats per block.
+    chunk = 64
+    rows_idx: list[np.ndarray] = []
+    rows_scores: list[np.ndarray] = []
+    for start in range(0, len(qn), chunk):
+        block = qn[start : start + chunk]
+        sims = block @ _RERANK_CORPUS_N.T  # (chunk, N)
+        hits = np.argpartition(-sims, kth=_RERANK_K - 1, axis=1)[:, :_RERANK_K]
+        hit_sims = np.take_along_axis(sims, hits, axis=1)
+        reranked = hit_sims * np.exp(-_RERANK_WEIGHTS[hits])
+        rows_idx.append(hits)
+        rows_scores.append(reranked)
+    idx_all = np.concatenate(rows_idx, axis=0)
+    scores_all = np.concatenate(rows_scores, axis=0)
+    # Return as a DataFrame parallel to the engine's "hit" struct output.
+    return pl.DataFrame(
+        {
+            "indices": [row.tolist() for row in idx_all],
+            "scores": [row.tolist() for row in scores_all],
+        }
+    )
+
+
+def _ceil_rerank(qdf: pl.DataFrame) -> mx.array:
+    """Raw MLX rerank: normalize queries on GPU, matmul w/ pre-resident corpus,
+    argpartition top-k, gather weights, exp_decay. Query transfer is memoized."""
+
+    def _build(data: pl.DataFrame) -> mx.array:
+        q_np = np.asarray(data["emb"].to_list(), dtype=np.float32)
+        qn = q_np / np.maximum(np.linalg.norm(q_np, axis=1, keepdims=True), 1e-12)
+        return mx.array(qn)
+
+    w_mx = mx.array(_RERANK_WEIGHTS)
+    mx.eval(w_mx)
+    q_mx = _ceil_inputs(qdf, _build)
+    sims = q_mx @ _RERANK_CORPUS_N_MX.T  # (Q, N)
+    hits = mx.argpartition(-sims, kth=_RERANK_K - 1, axis=1)[:, :_RERANK_K]
+    hit_sims = mx.take_along_axis(sims, hits, axis=1)
+    feat = mx.take(w_mx, hits.reshape(-1), axis=0).reshape(hits.shape)
+    reranked = hit_sims * mx.exp(-feat)
+    mx.eval(hits, reranked)
+    return hits  # ceiling = how fast top-k indices land on GPU
+
+
+def _check_rerank(engine_out: pl.DataFrame, cpu_out: pl.DataFrame) -> None:
+    """Set-compare top-k indices per row; allclose on reranked scores (sorted desc)."""
+    hit_col = engine_out["hit"]
+    for i in range(len(hit_col)):
+        eng_idx = {int(x) for x in hit_col[i]["indices"]}
+        cpu_idx = {int(x) for x in cpu_out["indices"][i]}
+        assert eng_idx == cpu_idx, f"row {i}: engine={sorted(eng_idx)} cpu={sorted(cpu_idx)}"
+    eng_scores = np.array(
+        [
+            sorted((float(x) for x in hit_col[i]["scores"]), reverse=True)
+            for i in range(len(hit_col))
+        ]
+    )
+    cpu_scores = np.array(
+        [
+            sorted((float(x) for x in cpu_out["scores"][i]), reverse=True)
+            for i in range(len(hit_col))
+        ]
+    )
+    np.testing.assert_allclose(eng_scores, cpu_scores, rtol=1e-3, atol=1e-3)
+
+
+ENTRIES += [
+    BenchEntry(
+        name="m10_vector_rerank",
+        category="join-gather",
+        # Q=100 headline. Smoke runs at Q=10. Corpus is always _RERANK_N=200_000.
+        sizes=[10, 100],
+        make_input=_make_rerank_queries,
+        engine_fn=_engine_rerank,
+        cpu_fn=_cpu_rerank,
+        ceiling_fn=_ceil_rerank,
+        check=_check_rerank,
+    ),
+]

@@ -98,6 +98,13 @@ def _run_binding(qframe: pl.DataFrame, b: SentinelBinding) -> pl.Series:
             spec.metric,
         ).rename(b.out_name)
     k = min(spec.k, n_rows)
+    weight = None
+    w = None  # keep the float32 weight buffer alive across the native call
+    if getattr(spec, "rerank", None) == "exp_decay":
+        w = np.ascontiguousarray(spec.rerank_weight, dtype=np.float32)
+        if w.shape[0] != n_rows:
+            raise ValueError(f"rerank_weight length {w.shape[0]} != corpus rows {n_rows}")
+        weight = (w.ctypes.data, w.size)
     idx, val = _native.execute_vector_search(
         (qmat.ctypes.data, qmat.size),
         q_rows,
@@ -107,6 +114,7 @@ def _run_binding(qframe: pl.DataFrame, b: SentinelBinding) -> pl.Series:
         k,
         _OP_CODE[spec.metric],
         _TILE_ROWS_DEFAULT,
+        weight,
     )
     idx = np.asarray(idx, dtype=np.uint32)
     val = np.asarray(val, dtype=np.float32)

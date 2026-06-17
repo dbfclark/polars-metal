@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import polars as pl
 
 from polars_metal import _dtw_namespace, _fft_namespace
@@ -32,6 +33,8 @@ class CorpusSpec:
     k: int
     metric: str  # "cosine" | "knn"
     query_col: str
+    rerank_weight: Any = None  # contiguous float32 ndarray (one per corpus row) | None
+    rerank: str | None = None  # "exp_decay" | None
 
 
 # Magic prefix embedded in the sentinel's Int64-literal field alias so the
@@ -41,8 +44,18 @@ SENTINEL_TAG = "__pm_vsearch__"
 _CACHE = CaptureCache()
 
 
-def _capture_corpus(corpus: Any, corpus_col: str, k: int, metric: str, query_col: str = "") -> int:
-    return _CACHE.capture(CorpusSpec(corpus, corpus_col, k, metric, query_col))
+def _capture_corpus(
+    corpus: Any,
+    corpus_col: str,
+    k: int,
+    metric: str,
+    query_col: str = "",
+    rerank_weight: Any = None,
+    rerank: str | None = None,
+) -> int:
+    return _CACHE.capture(
+        CorpusSpec(corpus, corpus_col, k, metric, query_col, rerank_weight, rerank)
+    )
 
 
 get_capture = _CACHE.get
@@ -95,11 +108,32 @@ class MetalExprNamespace:
             )
         return roots[0]
 
-    def cosine_topk(self, corpus: Any, k: int, corpus_col: str = "emb") -> pl.Expr:
+    def cosine_topk(
+        self,
+        corpus: Any,
+        k: int,
+        corpus_col: str = "emb",
+        rerank_weight: Any = None,
+        rerank: str | None = None,
+    ) -> pl.Expr:
         if k < 1:
             raise ValueError("k must be >= 1")
+        # rerank and rerank_weight must be supplied together (both or neither).
+        if (rerank is None) != (rerank_weight is None):
+            raise ValueError(
+                "polars_metal: cosine_topk requires both `rerank` and `rerank_weight` or neither."
+            )
+        rw = None
+        if rerank is not None:
+            if rerank != "exp_decay":
+                raise ValueError(f"unsupported rerank: {rerank!r} (expected 'exp_decay')")
+            # Accept a pl.Series, numpy array, or list → contiguous float32.
+            src = (
+                rerank_weight.to_numpy() if isinstance(rerank_weight, pl.Series) else rerank_weight
+            )
+            rw = np.ascontiguousarray(src, dtype=np.float32)
         qcol = self._query_col_name()
-        handle = _capture_corpus(corpus, corpus_col, k, "cosine", qcol)
+        handle = _capture_corpus(corpus, corpus_col, k, "cosine", qcol, rw, rerank)
         return build_sentinel(self._expr, qcol, handle)
 
     def knn(self, corpus: Any, k: int, corpus_col: str = "emb") -> pl.Expr:

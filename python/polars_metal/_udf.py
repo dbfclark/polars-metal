@@ -62,6 +62,8 @@ def build_udf(plan: dict) -> Any:
     When ``should_time`` is true Polars expects a ``(df, timings)`` tuple.
     We don't measure kernel timings yet; emit an empty timing list.
     """
+    if plan["kind"] == "Join":
+        return _build_join(plan)
     if plan["kind"] == "GroupBy":
         return _build_groupby(plan)
     if plan["kind"] == "Sort":
@@ -132,6 +134,146 @@ def _dispatch(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
             return _dispatch_hstack_fused(df_pydf, wire_plan)
     result_pydf = _native.execute_plan(df_pydf, wire_plan)
     return pl.DataFrame._from_pydf(result_pydf)
+
+
+_M10_JOIN_DISPATCHES = 0  # test/observability counter
+_M10_DENSE_GATHERS = 0  # resident dense-gather branch counter
+
+
+def _build_join(plan: dict) -> Any:
+    """Whole-plan scan-source UDF rooted at a Join. Phase 1: CPU lookup +
+    existing fused-chain dispatch over the joined frame.
+
+    The UDF is installed at the ROOT (the HStack above the Join), so it must
+    reproduce the WHOLE plan's output (join + chain). The two scan dfs live on
+    the Join plan's left/right Scan sub-plans; the chain to apply sits on the
+    Join plan's ``_parent_chain`` back-reference (stamped by the walker).
+    """
+    left_df = plan["left"]["df"]
+    right_df = plan["right"]["df"]
+
+    def udf(
+        with_columns: list[str] | None,
+        predicate: Any,
+        n_rows: int | None,
+        should_time: bool,
+    ) -> Any:
+        df = _dispatch_join(left_df, right_df, plan)
+        if n_rows is not None:
+            df = df.slice(0, n_rows)
+        return (df, []) if should_time else df
+
+    return udf
+
+
+def _dispatch_join(left_pydf: Any, right_pydf: Any, plan: dict) -> pl.DataFrame:
+    """Join dispatch. Tries the M10 resident dense-key gather branch first (when
+    the walker stashed a ``_gather`` scope and the runtime guards all hold); on
+    any miss falls through to the Phase-1 CPU-lookup branch (join on CPU with
+    correct semantics, then run the fused chain that sits ABOVE the join)."""
+    global _M10_JOIN_DISPATCHES, _M10_DENSE_GATHERS
+    _M10_JOIN_DISPATCHES += 1
+    left = pl.DataFrame._from_pydf(left_pydf)
+    right = pl.DataFrame._from_pydf(right_pydf)
+    gather = plan.get("_gather")
+    if gather is not None:
+        resident = _try_resident_gather(left, right, plan, gather)
+        if resident is not None:
+            _M10_DENSE_GATHERS += 1
+            return resident
+    joined = left.join(right, left_on=plan["key"], right_on=plan["right_key"], how=plan["how"])
+    parent = plan["_parent_chain"]
+    return _dispatch_chain_over_frame(joined, parent)
+
+
+def _try_resident_gather(
+    left: pl.DataFrame, right: pl.DataFrame, plan: dict, gather: dict
+) -> pl.DataFrame | None:
+    """M10 resident dense-key gather. Returns a result DataFrame when ALL guards
+    hold (left/inner; both keys null-free; dim key a dense 0..dim_n-1
+    permutation; every fact key in range), else ``None`` so the caller takes the
+    CPU-lookup branch. The gather + transcendental chain run resident on GPU in
+    one MLX eval; only the F32 result crosses back."""
+    import numpy as np
+
+    from polars_metal._join_gather import dense_positions
+
+    how = plan["how"]
+    lkey = plan["key"]
+    rkey = plan["right_key"]
+    gather_col = gather["gather_col"]
+    if how not in ("left", "inner"):
+        return None
+    if left.height == 0 or right.height == 0:
+        return None
+    if left.get_column(lkey).null_count() or right.get_column(rkey).null_count():
+        return None
+    dim_n = right.height
+    rkey_np = np.asarray(right.get_column(rkey).to_numpy())
+    val_np = np.asarray(right.get_column(gather_col).to_numpy())
+    is_dense, reordered = dense_positions(rkey_np, val_np, dim_n)
+    if not is_dense:
+        return None
+    key_np = np.asarray(left.get_column(lkey).to_numpy())
+    # Critical: an out-of-range fact key would gather out of bounds (and, for a
+    # left join, change row count vs the CPU result). Guard before any gather.
+    if int(key_np.min()) < 0 or int(key_np.max()) >= dim_n:
+        return None
+
+    n = left.height
+    arrays: list[np.ndarray] = []
+    tags: list[int] = []
+    for kind, payload in gather["descriptors"]:
+        if kind == "gather_key":
+            a = np.ascontiguousarray(key_np, dtype=np.int32)
+            tag = 2
+        elif kind == "gather_value":
+            a = np.ascontiguousarray(reordered, dtype=np.float32)
+            tag = 0
+        elif kind == "col":
+            a = np.ascontiguousarray(left.get_column(payload).to_numpy(), dtype=np.float32)
+            tag = 0
+        elif kind == "lit":
+            a = np.asarray([payload], dtype=np.float32)
+            tag = 0
+        else:
+            return None
+        arrays.append(a)
+        tags.append(tag)
+
+    out_arr = np.empty(n, dtype=np.float32)
+    inputs = [
+        (int(a.__array_interface__["data"][0]), int(a.size), t)
+        for a, t in zip(arrays, tags, strict=True)
+    ]
+    written = _native.execute_fused_expr(
+        scope=gather["scope"],
+        inputs=inputs,
+        out=(int(out_arr.__array_interface__["data"][0]), int(out_arr.size), 0),
+    )
+    if written != n:
+        return None
+
+    out_series = pl.Series(gather["out_name"], out_arr)
+    # The joined dim-value column: a cheap dense index (NOT a hash join). For a
+    # left/inner join with every fact key in range, every fact row matches, so
+    # this equals the CPU join's value column exactly.
+    vol_series = pl.Series(gather_col, reordered[key_np])
+    result = left.with_columns([vol_series, out_series])
+    out_schema = plan.get("_out_schema")
+    if out_schema is not None:
+        result = result.select([name for name, _ in out_schema])
+    return result
+
+
+def _dispatch_chain_over_frame(upstream: pl.DataFrame, parent: dict) -> pl.DataFrame:
+    """Apply the chain that sat above the Join to an already-joined frame."""
+    if parent["kind"] == "Project":
+        inner = _dispatch_chain_over_frame(upstream, parent["input"])
+        return pl.DataFrame._from_pydf(inner._df.select(list(parent["columns"])))
+    if parent["kind"] == "HStack":
+        return _hstack_fused_over_upstream(upstream, parent)
+    raise NotImplementedError(f"join parent chain kind {parent['kind']!r}")
 
 
 # B1: wire dtype string -> (numpy dtype name, MlxDtype u32 tag). Mirrors the
@@ -222,11 +364,33 @@ def _dispatch_hstack_fused(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
     pre-allocated at the binding's output width so the eval writes directly
     into it (output-zero-copy).
     """
+    upstream = _dispatch(df_pydf, wire_plan["input"])
+    return _hstack_fused_over_upstream(upstream, wire_plan)
+
+
+def _hstack_fused_over_upstream(upstream: pl.DataFrame, wire_plan: dict) -> pl.DataFrame:
+    """Run every fused binding in ``wire_plan["exprs"]`` over an already-resolved
+    ``upstream`` frame and return ``upstream`` with the new columns appended.
+
+    This is the binding-loop core of ``_dispatch_hstack_fused``, factored out so
+    callers that already hold the upstream frame (e.g. the M10 join path, which
+    joins on CPU then runs the chain that sat ABOVE the join) can reuse it
+    without re-dispatching the input subtree.
+    """
     import numpy as np
 
-    upstream = _dispatch(df_pydf, wire_plan["input"])
     n_rows = upstream.height
-    new_columns: list[pl.Series] = []
+    # Empty frame: skip the GPU dispatch (MTLBuffer allocation fails for 0
+    # bytes) and return empty Series of the correct dtype for each binding.
+    if n_rows == 0:
+        new_columns: list[pl.Series] = []
+        for binding in wire_plan["exprs"]:
+            out_dtype_str = binding.get("_fused_out_dtype", "F32")
+            out_np_dtype, _ = _np_dtype_and_tag(out_dtype_str)
+            new_columns.append(pl.Series(binding["name"], np.array([], dtype=out_np_dtype)))
+        return upstream.with_columns(new_columns)
+
+    new_columns = []
     for binding in wire_plan["exprs"]:
         scope = binding["_fused_scope"]
         descriptors: list[tuple[str, str | float]] = binding["_fused_columns"]

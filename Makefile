@@ -1,5 +1,5 @@
 # Makefile — single entry point per gate. See docs/superpowers/specs/2026-05-19-m0-skeleton-design.md.
-.PHONY: build wheel test-unit test-kernel test-conformance test-diff bench perf-report crossing-report lint gate refresh-refs help
+.PHONY: build wheel test-unit test-kernel test-integration test-conformance test-diff bench perf-report crossing-report lint gate refresh-refs help
 
 help:
 	@grep '^[a-zA-Z][a-zA-Z-]*:' $(MAKEFILE_LIST) | grep -v '^help:' | awk -F: '{print $$1}' | sort
@@ -18,6 +18,11 @@ test-unit:
 test-kernel:
 	# kernel correctness suite (proptest + differential, --test-threads=1 for Metal queue safety)
 	cargo test -p polars-metal-kernels -- --test-threads=1
+
+test-integration:
+	# engine=metal integration tests (walker recognition, fused/gather dispatch,
+	# differential vs CPU). Needs the built wheel (run after `make wheel`).
+	pytest tests/python_integration -q
 
 test-conformance:
 	pytest tests/conformance -k "not skip_metal"
@@ -45,7 +50,7 @@ lint:
 	ruff check .
 	ruff format --check .
 
-gate: lint test-unit test-kernel wheel test-conformance test-diff
+gate: lint test-unit test-kernel wheel test-integration test-conformance test-diff
 	@echo "M0 gate passed."
 
 refresh-refs:

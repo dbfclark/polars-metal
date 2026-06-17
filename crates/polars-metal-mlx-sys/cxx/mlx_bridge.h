@@ -284,6 +284,9 @@ std::shared_ptr<MlxArray> mlx_op_take_along_axis(
     const std::shared_ptr<MlxArray>& a,
     const std::shared_ptr<MlxArray>& indices,
     int32_t axis);
+std::shared_ptr<MlxArray> mlx_op_take(
+    const std::shared_ptr<MlxArray>& a,
+    const std::shared_ptr<MlxArray>& indices);
 std::shared_ptr<MlxArray> mlx_op_argpartition_axis(
     const std::shared_ptr<MlxArray>& a, int32_t kth, int32_t axis);
 

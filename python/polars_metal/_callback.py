@@ -46,6 +46,38 @@ def execute_with_metal(nt: Any, duration_since_start: int | None, *, config: Met
 
     assert isinstance(result, Handled)
     plan = result.plan
+
+    # M10: a Join-bearing plan can't cross the Rust router (`compute_lifting_plan`
+    # and `_strip_side_channels` don't model a Join node). Bypass the router and
+    # build the whole-plan scan-source UDF directly from the Join node (which
+    # carries both scan dfs + a `_parent_chain` back-ref to the chain above it).
+    # The UDF reproduces the full HStack output (join + chain).
+    if _plan_has_join(plan):
+        join_plan = _find_join_plan(plan)
+        if join_plan is None or join_plan.get("_parent_chain") is None:
+            # The join was recognized by `_walk_join`, but no fused F32 compute
+            # chain consumes it (a bare join, a join under filter/group_by, a
+            # bad-input join, etc.). There is no resident-gather win to capture,
+            # so run it on CPU exactly as pre-M10 — not installing a UDF makes
+            # Polars execute the optimized plan on its own engine.
+            if config.debug:
+                log.debug("polars_metal: join without fused chain; routing CPU")
+            return
+        if not config.force_fusion and not _join_routes_gpu(plan, join_plan):
+            if config.debug:
+                log.debug("polars_metal: join below density gate; routing CPU")
+            return  # full CPU
+        try:
+            udf = build_udf(join_plan)
+        except Exception as e:
+            if config.debug:
+                log.debug("polars_metal: join UDF build failed %r; falling back", e)
+            return
+        nt.set_udf(udf)
+        if config.debug:
+            log.debug("polars_metal: installed join UDF (CPU-lookup branch)")
+        return
+
     wire_plan = _strip_side_channels(plan)
     try:
         lifting = _native.compute_lifting_plan(wire_plan)
@@ -110,6 +142,68 @@ def _plan_has_fused_binding(plan: dict) -> bool:
     if isinstance(inner, dict):
         return _plan_has_fused_binding(inner)
     return False
+
+
+def _plan_has_join(plan: dict) -> bool:
+    if plan.get("kind") == "Join":
+        return True
+    inner = plan.get("input")
+    return _plan_has_join(inner) if isinstance(inner, dict) else False
+
+
+def _find_join_plan(plan: dict) -> dict | None:
+    if plan.get("kind") == "Join":
+        return plan
+    inner = plan.get("input")
+    return _find_join_plan(inner) if isinstance(inner, dict) else None
+
+
+# The join->gather path wins at lower compute density than the bare-fusion path
+# (it also eliminates the CPU join/scatter), so it uses a lower FLOPs floor than
+# density.rs's 5e7. Measured crossover: ~2.4x at 500k rows / 12M flops; the engine
+# wins from ~500k up. 1e7 captures >=~420k-row chains while keeping sub-200k on CPU.
+_GATHER_MIN_FLOPS = 10_000_000  # 1e7
+_GATHER_MIN_ROWS = 100_000  # 1e5 (same as bare-fusion rows floor)
+
+
+def _is_gpu_decision(decision: Any) -> bool:
+    """True iff a ``PyFusionScope.route_decision`` result indicates GPU routing.
+
+    The Rust side stringifies the decision as ``"Gpu"`` or ``"Cpu(<reason>)"``
+    (see `fusion/py.rs` / `fusion/density.rs`). Match defensively on the repr."""
+    s = str(decision).lower()
+    return "gpu" in s and "cpu" not in s
+
+
+def _join_routes_gpu(plan: dict, join_plan: dict | None) -> bool:
+    """Density+size gate for the M10 join→gather path.
+
+    Returns True iff the fused chain above the join clears the gather-specific
+    GPU routing threshold (FLOPs >= _GATHER_MIN_FLOPS AND rows >= _GATHER_MIN_ROWS).
+
+    Uses a lower FLOPs floor than the bare-fusion path (1e7 vs 5e7) because the
+    join->gather dispatch also eliminates the CPU join/scatter cost.
+
+    Defensive: if the fused scope or the fact df can't be located, return True so
+    a join path we can't assess isn't wrongly blocked (the M10 join path always
+    carries a fused binding, so a miss is unexpected)."""
+    parent = join_plan.get("_parent_chain") if join_plan is not None else None
+    if not parent:
+        return True
+    exprs = parent.get("exprs") or []
+    scope = exprs[0].get("_fused_scope") if exprs else None
+    if scope is None:
+        return True
+    try:
+        n_rows = join_plan["left"]["df"].height()
+    except Exception:
+        return True
+    if n_rows < _GATHER_MIN_ROWS:
+        return False
+    try:
+        return scope.est_flops(n_rows) >= _GATHER_MIN_FLOPS
+    except Exception:
+        return True
 
 
 def _strip_side_channels(plan: dict) -> dict:
