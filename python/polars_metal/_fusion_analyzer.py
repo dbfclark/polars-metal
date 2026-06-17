@@ -654,6 +654,10 @@ def analyze_ir_with_columns_gather(
     kinds present, or ``None`` if the chain isn't fusable (same failure mode as
     `analyze_ir_with_columns`) OR if none of ``gather_cols`` appears as a leaf
     (no gather to splice → caller should use the base analyzer)."""
+    if isinstance(gather_cols, str):
+        raise TypeError(
+            "analyze_ir_with_columns_gather: gather_cols must be an iterable of names, not a str"
+        )
     try:
         scope = PyFusionScope()
         descriptors: list[tuple[str, str | float]] = []
@@ -1388,14 +1392,16 @@ def _gather_leaves_ir(
     literal in ``col + 1`` is staged at the column width — otherwise MLX would
     promote ``int_col + f32_literal`` to f32, producing the wrong output dtype.
 
-    `gather_ctx` (M10 resident gather, default None): when present, the leaf
-    ``Column(gather_ctx["gather_col"])`` is NOT staged as a column. Instead, on
-    its FIRST reference, two inputs are added in place — the gather KEY
-    (``("gather_key", key_col)``, I32) and the dim VALUE
-    (``("gather_value", gather_col)``, F32) — and their idxs recorded in
-    ``gather_ctx["idxs"]`` so pass 2 can push ``Take(value, key)``. The gather
-    leaf's own ``leaf_idx`` is left unset (pass 2 synthesizes the Take op, it is
-    not a plain input). Every OTHER leaf stages as a normal LONG input.
+    `gather_ctx` (M10 resident gather, default None): when present, any leaf
+    ``Column(c)`` for ``c`` in ``gather_ctx["gather_cols"]`` (a set) is NOT staged
+    as a column. Instead, the shared gather KEY input
+    (``("gather_key", key_col)``, I32) is added once on the first gather leaf of
+    any gather column, and a dim VALUE input (``("gather_value", c)``, F32) is
+    added per distinct gather column — their idxs recorded in
+    ``gather_ctx["idxs"]`` (``["key"]`` and ``["values"][name]``) so pass 2 can
+    push ``Take(value, key)``. Each gather leaf's own ``leaf_idx`` is left unset
+    (pass 2 synthesizes the Take op, it is not a plain input). Every OTHER leaf
+    stages as a normal LONG input.
 
     Aborts on the same unsupported-node set as `_visit_ir_ops`."""
     try:
@@ -1625,12 +1631,13 @@ def _visit_ir_ops(
     """Pass 2: DFS-walk the IR and push ops. Leaves return their precomputed
     input NodeIdx from `leaf_idx`.
 
-    `gather_ctx` (M10 resident gather, default None): when present, the leaf
-    ``Column(gather_ctx["gather_col"])`` does NOT resolve via ``leaf_idx``
-    (pass 1 added no plain input for it). Instead it pushes
-    ``Take(dim_value_idx, key_idx)`` — gather the SHORT dim-value array at the
-    LONG key array's positions — and returns that op idx. Downstream ops then
-    see an N-length array exactly as if the column had been materialized."""
+    `gather_ctx` (M10 resident gather, default None): when present, a leaf
+    ``Column(c)`` for ``c`` in ``gather_ctx["gather_cols"]`` (a set) does NOT
+    resolve via ``leaf_idx`` (pass 1 added no plain input for it). Instead it
+    pushes ``Take(gather_ctx["idxs"]["values"][c], gather_ctx["idxs"]["key"])`` —
+    gather the SHORT dim-value array at the LONG key array's positions — and
+    returns that op idx. Downstream ops then see an N-length array exactly as if
+    the column had been materialized."""
     try:
         node = nt.view_expression(node_id)
     except Exception as e:
