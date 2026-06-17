@@ -54,6 +54,15 @@ def execute_with_metal(nt: Any, duration_since_start: int | None, *, config: Met
     # The UDF reproduces the full HStack output (join + chain).
     if _plan_has_join(plan):
         join_plan = _find_join_plan(plan)
+        if join_plan is None or join_plan.get("_parent_chain") is None:
+            # The join was recognized by `_walk_join`, but no fused F32 compute
+            # chain consumes it (a bare join, a join under filter/group_by, a
+            # bad-input join, etc.). There is no resident-gather win to capture,
+            # so run it on CPU exactly as pre-M10 — not installing a UDF makes
+            # Polars execute the optimized plan on its own engine.
+            if config.debug:
+                log.debug("polars_metal: join without fused chain; routing CPU")
+            return
         if not config.force_fusion and not _join_routes_gpu(plan, join_plan):
             if config.debug:
                 log.debug("polars_metal: join below density gate; routing CPU")
