@@ -132,6 +132,12 @@ def _dispatch(df_pydf: Any, wire_plan: dict) -> pl.DataFrame:
         exprs = wire_plan.get("exprs", [])
         if exprs and all("_fused_scope" in e for e in exprs):
             return _dispatch_hstack_fused(df_pydf, wire_plan)
+    if wire_plan["kind"] == "Scan":
+        # A bare Scan reconstruction is just the embedded df — the Rust Scan
+        # handler returns it unchanged. Short-circuit here so a Scan carrying an
+        # OPAQUE-tagged (Struct/List/non-F32-Array) column never reaches Rust's
+        # parse_dtype("OPAQUE"), which raises. (M11: OPAQUE-scan crash fix.)
+        return pl.DataFrame._from_pydf(df_pydf)
     result_pydf = _native.execute_plan(df_pydf, wire_plan)
     return pl.DataFrame._from_pydf(result_pydf)
 
@@ -196,12 +202,11 @@ def _try_resident_gather(
     one MLX eval; only the F32 result crosses back."""
     import numpy as np
 
-    from polars_metal._join_gather import dense_positions
+    from polars_metal._join_gather import is_dense_key, reorder_by_key
 
     how = plan["how"]
     lkey = plan["key"]
     rkey = plan["right_key"]
-    gather_col = gather["gather_col"]
     if how not in ("left", "inner"):
         return None
     if left.height == 0 or right.height == 0:
@@ -210,15 +215,22 @@ def _try_resident_gather(
         return None
     dim_n = right.height
     rkey_np = np.asarray(right.get_column(rkey).to_numpy())
-    val_np = np.asarray(right.get_column(gather_col).to_numpy())
-    is_dense, reordered = dense_positions(rkey_np, val_np, dim_n)
-    if not is_dense:
+    if not is_dense_key(rkey_np, dim_n):
         return None
     key_np = np.asarray(left.get_column(lkey).to_numpy())
-    # Critical: an out-of-range fact key would gather out of bounds (and, for a
-    # left join, change row count vs the CPU result). Guard before any gather.
     if int(key_np.min()) < 0 or int(key_np.max()) >= dim_n:
         return None
+
+    out_dim_cols = gather["out_dim_cols"]
+    needed = set(gather["gather_cols"]) | set(out_dim_cols)
+    reordered = {
+        c: reorder_by_key(
+            rkey_np,
+            np.ascontiguousarray(right.get_column(c).to_numpy(), dtype=np.float32),
+            dim_n,
+        )
+        for c in needed
+    }
 
     n = left.height
     arrays: list[np.ndarray] = []
@@ -228,7 +240,7 @@ def _try_resident_gather(
             a = np.ascontiguousarray(key_np, dtype=np.int32)
             tag = 2
         elif kind == "gather_value":
-            a = np.ascontiguousarray(reordered, dtype=np.float32)
+            a = np.ascontiguousarray(reordered[payload], dtype=np.float32)
             tag = 0
         elif kind == "col":
             a = np.ascontiguousarray(left.get_column(payload).to_numpy(), dtype=np.float32)
@@ -254,12 +266,12 @@ def _try_resident_gather(
     if written != n:
         return None
 
-    out_series = pl.Series(gather["out_name"], out_arr)
-    # The joined dim-value column: a cheap dense index (NOT a hash join). For a
+    # Each joined dim-value column: a cheap dense index (NOT a hash join). For a
     # left/inner join with every fact key in range, every fact row matches, so
     # this equals the CPU join's value column exactly.
-    vol_series = pl.Series(gather_col, reordered[key_np])
-    result = left.with_columns([vol_series, out_series])
+    dim_series = [pl.Series(c, reordered[c][key_np]) for c in out_dim_cols]
+    out_series = pl.Series(gather["out_name"], out_arr)
+    result = left.with_columns([*dim_series, out_series])
     out_schema = plan.get("_out_schema")
     if out_schema is not None:
         result = result.select([name for name, _ in out_schema])

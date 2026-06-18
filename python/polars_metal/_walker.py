@@ -205,7 +205,17 @@ def _walk_dataframe_scan(nt: Any, node: Any) -> WalkResult:
     for name, dtype in schema.items():
         mapped = _map_dtype(dtype)
         if mapped is None:
-            return FallBack(reason=f"unsupported dtype {dtype!s} on column {name!r}")
+            # M11: an unsupported-dtype column (e.g. an Array embedding or a
+            # Struct of top-k hits carried alongside a retrieval fact) does not
+            # disqualify the Scan — it is opaque PASSTHROUGH, never read on the
+            # GPU path. The fusion analyzer, agg, and predicate walks all reject
+            # an unmapped dtype before it can become a fused `col` input, so a
+            # passthrough column can never reach a kernel; and the only consumer
+            # of the Scan's column tags is the non-join wire path (the join
+            # path reads the raw `node.df` directly). Tagging it OPAQUE keeps
+            # the Scan Handled so a downstream join->gather can still fire.
+            columns.append((str(name), "OPAQUE"))
+            continue
         columns.append((str(name), mapped))
 
     projection = getattr(node, "projection", None)
@@ -797,15 +807,28 @@ def _attach_gather_scope(
     if len(out_exprs) != 1 or "_fused_scope" not in out_exprs[0]:
         return
     dim_cols = join_plan.get("_dim_value_cols", [])
-    if len(dim_cols) != 1:
+    if not dim_cols:
         return
-    gather_col = dim_cols[0]
-    key_col = join_plan["key"]  # fact (left) key column name
+    # The resident gather reproduces every non-key dim column at F32; a non-F32
+    # dim column in the output would mismatch the CPU dtype -> decline (CPU-lookup).
+    if any(str(in_schema.get(c)) != "Float32" for c in dim_cols):
+        return
+    key_col = join_plan["key"]
+    # The dim columns the fused chain actually reads (a subset of dim_cols).
+    binding_cols = {name for kind, name in out_exprs[0].get("_fused_columns", []) if kind == "col"}
+    # The resident gather can't also feed the join key column into the chain
+    # (key is length N as the gather index, but length dim_n on the dim side) —
+    # decline to CPU-lookup, which is byte-exact.
+    if key_col in binding_cols:
+        return
+    gather_cols = [c for c in dim_cols if c in binding_cols]
+    if not gather_cols:
+        return  # chain reads no dim column -> nothing to gather
     expr_node = out_exprs[0].get("_expr_node")
     if expr_node is None:
         return
     try:
-        res = analyze_ir_with_columns_gather(nt, expr_node, in_schema, gather_col, key_col)
+        res = analyze_ir_with_columns_gather(nt, expr_node, in_schema, gather_cols, key_col)
     except Exception:
         return
     if res is None:
@@ -814,7 +837,8 @@ def _attach_gather_scope(
         "scope": res[0],
         "descriptors": res[1],
         "out_dtype": res[2],
-        "gather_col": gather_col,
+        "gather_cols": gather_cols,
+        "out_dim_cols": list(dim_cols),
         "key_col": key_col,
         "out_name": out_exprs[0]["name"],
     }

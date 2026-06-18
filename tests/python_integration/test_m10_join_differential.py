@@ -111,7 +111,8 @@ def test_single_row():
 
 
 def test_multi_dim_value_columns_routes_correctly():
-    # dim has TWO non-key columns -> MVP resident requires exactly one -> CPU-lookup branch.
+    # dim has TWO non-key columns -> under M11 the resident gather generalizes to
+    # N dim value columns, so this case now routes RESIDENT (M10 required exactly one).
     # Chain only uses vol; output keeps both vol and sector. Must still be byte-exact.
     rng = np.random.default_rng(22)
     dim_n, n = 100, 3000

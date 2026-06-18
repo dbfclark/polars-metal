@@ -39,3 +39,23 @@ def dense_positions(
     reordered = np.empty(dim_height, dtype=value.dtype)
     reordered[key] = value
     return True, reordered
+
+
+def is_dense_key(key: np.ndarray, dim_height: int) -> bool:
+    """True iff `key` is a permutation of 0..dim_height-1 (unique, contiguous,
+    in range, no nulls)."""
+    if dim_height <= 0 or key.shape[0] != dim_height:
+        return False
+    if int(key.min()) != 0 or int(key.max()) != dim_height - 1:
+        return False
+    seen = np.zeros(dim_height, dtype=bool)
+    seen[key] = True
+    return bool(seen.all())
+
+
+def reorder_by_key(key: np.ndarray, value: np.ndarray, dim_height: int) -> np.ndarray:
+    """Return `value` reordered so position == key: out[key[i]] = value[i].
+    Assumes `is_dense_key(key, dim_height)` already passed."""
+    out = np.empty(dim_height, dtype=value.dtype)
+    out[key] = value
+    return out

@@ -85,8 +85,8 @@ def test_walker_actually_routes_supported_query_via_router(caplog) -> None:
 
 
 def test_walker_falls_back_for_unsupported_dtype(caplog) -> None:
-    """Mirror of the previous test: with an unsupported dtype (Time, which is
-    outside the closed set) we must FallBack — no UDF install line in the log.
+    """With an unsupported dtype (Time, outside the closed set) the query must
+    run on CPU — no UDF install line in the log.
 
     Note: String/Utf8 was unsupported in M2/early-M3 but moved into the
     closed set as a key-only dtype in M3 Phase 7 (Task 34). UInt64 was the
@@ -94,6 +94,14 @@ def test_walker_falls_back_for_unsupported_dtype(caplog) -> None:
     UInt64 arm to ``_map_dtype`` (completing the 8 integer widths so UInt64
     reaches the fused GPU path), so it is now *supported*. ``pl.Time`` takes
     over as the canonical unsupported-dtype sentinel.
+
+    M11: a bare ``Scan`` no longer *walker-fallbacks* on an unsupported dtype —
+    it tags the column OPAQUE (passthrough) and lets the router decide, so a
+    Scan carrying an Array/Struct column alongside an int join key can still
+    feed a resident gather. The CPU outcome is unchanged: with no fused/GPU
+    binding the router routes the whole query to CPU. The invariant this test
+    guards (no GPU UDF installed for an unsupported-dtype query) still holds —
+    accept either the walker fallback OR the router CPU route, but never a UDF.
     """
     caplog.set_level(logging.DEBUG, logger="polars_metal")
     df = pl.DataFrame(
@@ -102,7 +110,7 @@ def test_walker_falls_back_for_unsupported_dtype(caplog) -> None:
     )
     _ = df.lazy().select(["t", "a"]).collect(engine=polars_metal.MetalEngine(debug=True))
     msgs = [r.getMessage() for r in caplog.records if r.name == "polars_metal"]
-    assert any("walker fallback" in m for m in msgs), msgs
+    assert any("walker fallback" in m or "routes entire query to CPU" in m for m in msgs), msgs
     assert not any("installed UDF" in m for m in msgs), msgs
 
 

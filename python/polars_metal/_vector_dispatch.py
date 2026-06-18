@@ -16,7 +16,7 @@ import numpy as np
 import polars as pl
 
 from polars_metal import _native
-from polars_metal._detect_common import SentinelBinding
+from polars_metal._detect_common import SentinelBinding, collect_stitch_base
 from polars_metal._vector_namespace import evict_capture, get_capture
 
 _OP_CODE = {"cosine": 0, "knn": 1}
@@ -137,9 +137,9 @@ def apply_vector_search(
     # harmless — both do an idempotent dict.pop.
     for b in bindings:
         weakref.finalize(lf, evict_capture, b.payload)
-    rest_lf = lf.drop(out_names)
-    df = collect_fn(rest_lf)
-    cols: dict[str, pl.Series] = {c: df.get_column(c) for c in df.columns}
+    df = collect_stitch_base(lf, out_names, [b.col for b in bindings], collect_fn)
+    order_set = set(order)
+    cols: dict[str, pl.Series] = {c: df.get_column(c) for c in df.columns if c in order_set}
     for b in bindings:
         cols[b.out_name] = _run_binding(df, b)
     return pl.DataFrame([cols[c] for c in order])
